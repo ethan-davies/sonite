@@ -1,0 +1,16 @@
+export enum Direction {
+  Up,
+  Down
+}
+
+export struct Point {
+  x: i32;
+  y: i32;
+}
+
+export function origin(): Point {
+  return Point {
+    x: 0,
+    y: 0
+  };
+}

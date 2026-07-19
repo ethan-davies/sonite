@@ -2,10 +2,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { compile } from "../src/compiler.js";
+import { compile, compileFile } from "../src/compiler.js";
 import { encodeLlvmString } from "../src/codegen/llvm.js";
 
 const examplesDir = join(dirname(fileURLToPath(import.meta.url)), "../../../examples");
+const modulesDir = join(examplesDir, "modules");
 
 const helloSource = `
 function main(): void {
@@ -23,7 +24,10 @@ describe("compile pipeline", () => {
       expect(result.ir).toContain("call i32 (ptr, ...) @printf");
       expect(result.ir).toContain(encodeLlvmString("Hello, world!"));
       expect(result.ir).toContain("%s\\0A");
-      expect(result.ast.body[0]?.name.name).toBe("main");
+      expect(result.ast.body[0]?.kind).toBe("FunctionDeclaration");
+      if (result.ast.body[0]?.kind === "FunctionDeclaration") {
+        expect(result.ast.body[0].name.name).toBe("main");
+      }
     });
 
     it("allows changing the printed string", () => {
@@ -914,6 +918,74 @@ describe("compile pipeline", () => {
       expect(result.success).toBe(false);
       expect(result.diagnostics.some((d) => d.code === "E0330")).toBe(true);
     });
+
+    it("rejects imports in compile(source)", () => {
+      const result = compile(`
+        import "math";
+        function main(): void {}
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0400")).toBe(true);
+    });
+  });
+});
+
+describe("modules / compileFile", () => {
+  it("compiles import math and emits mangled calls", () => {
+    const result = compileFile(join(modulesDir, "main.tsn"));
+    expect(result.success).toBe(true);
+    expect(result.modules).toHaveLength(2);
+    expect(result.ir).toContain("define i32 @math__add(i32 %arg0, i32 %arg1)");
+    expect(result.ir).toContain("define i32 @math__mul(i32 %arg0, i32 %arg1)");
+    expect(result.ir).toContain("call i32 @math__add(i32 5, i32 10)");
+    expect(result.ir).toContain("call i32 @math__mul(i32 3, i32 4)");
+    expect(result.ir).toContain("define i32 @main()");
+  });
+
+  it("compiles aliased nested imports", () => {
+    const result = compileFile(join(modulesDir, "alias.tsn"));
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("define i32 @vector__add(i32 %arg0, i32 %arg1)");
+    expect(result.ir).toContain("call i32 @vector__add(i32 5, i32 10)");
+  });
+
+  it("compiles exported structs and enums via namespaces", () => {
+    const result = compileFile(join(modulesDir, "types-main.tsn"));
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("%types__Point = type { i32, i32 }");
+    expect(result.ir).toContain("define %types__Point @types__origin()");
+    expect(result.ir).toContain("call %types__Point @types__origin()");
+  });
+
+  it("errors when calling a non-exported function", () => {
+    const files = new Map<string, string>([
+      [
+        "/virt/main.tsn",
+        `import "lib";
+function main(): void {
+  print(lib.secret());
+}
+`,
+      ],
+      [
+        "/virt/lib.tsn",
+        `function secret(): i32 {
+  return 1;
+}
+`,
+      ],
+    ]);
+    const result = compileFile("/virt/main.tsn", {
+      readFile: (path) => {
+        const source = files.get(path);
+        if (source === undefined) {
+          throw new Error(`ENOENT: ${path}`);
+        }
+        return source;
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.diagnostics.some((d) => d.code === "E0307")).toBe(true);
   });
 });
 

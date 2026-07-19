@@ -19,6 +19,7 @@ import type {
   FunctionDeclaration,
   Identifier,
   IfStatement,
+  ImportDeclaration,
   IndexExpression,
   IntegerLiteral,
   MemberExpression,
@@ -64,39 +65,13 @@ const UPDATE_OPS = new Set<TokenKind>([TokenKind.PlusPlus, TokenKind.MinusMinus]
 /**
  * Recursive-descent parser:
  *
- *   program      = (functionDecl | structDecl | enumDecl)*
- *   functionDecl = "function" Ident "(" params? ")" ":" type block
- *   structDecl   = "struct" Ident "{" structField* "}"
- *   structField  = Ident ":" type ";"
- *   enumDecl     = "enum" Ident "{" (Ident ("," Ident)* ","?)? "}"
- *   params       = param ("," param)*
- *   param        = Ident ":" type
- *   statement    = varDecl | assignment | updateStmt | returnStmt
- *                | ifStmt | whileStmt | forStmt | breakStmt | continueStmt | exprStmt
- *   varDecl      = ("let"|"const") Ident (":" type)? "=" expression ";"
- *   assignment   = assignable ("=" | "+=" | "-=") expression ";"
- *   assignable   = Ident | Ident "[" expression "]" | Ident ("." Ident)+
- *   updateStmt   = Ident ("++" | "--") ";"
- *   returnStmt   = "return" expression? ";"
- *   ifStmt       = "if" "(" expression ")" block
- *                  ("elseif" "(" expression ")" block)*
- *                  ("else" block)?
- *   whileStmt    = "while" "(" expression ")" block
- *   forStmt      = forCStyle | forIn
- *   forCStyle    = "for" "(" forInit condition? ";" forUpdate? ")" block
- *   forIn        = "for" "(" (("let"|"const")? Ident) "in" expression ")" block
- *   forInit      = varDecl | assignment | ";"
- *   forUpdate    = updateStmtNoSemi | assignmentNoSemi
- *   breakStmt    = "break" ";"
- *   continueStmt = "continue" ";"
- *   block        = "{" statement* "}"
- *   exprStmt     = callExpr ";"
- *   expression   = or
- *   primary      = "(" expression ")" | arrayLiteral | structLiteral | literal | Ident | callExpr
- *   postfix      = primary ("[" expression "]" | "." Ident ("(" args? ")")?)*
- *   arrayLiteral = "[" (expression ("," expression)*)? "]"
- *   structLiteral = Ident "{" (Ident ":" expression ("," Ident ":" expression)*)? "}"
- *   type         = Ident ("[" "]")*
+ *   program      = importDecl* (functionDecl | structDecl | enumDecl)*
+ *   importDecl   = "import" String ("as" Ident)? ";"
+ *   functionDecl = "export"? "function" Ident "(" params? ")" ":" type block
+ *   structDecl   = "export"? "struct" Ident "{" structField* "}"
+ *   enumDecl     = "export"? "enum" Ident "{" (Ident ("," Ident)* ","?)? "}"
+ *   structLiteral = (Ident | Ident "." Ident) "{" fields? "}"
+ *   type         = Ident ("." Ident)? ("[" "]")*
  */
 export class Parser {
   private readonly tokens: Token[];
@@ -111,35 +86,64 @@ export class Parser {
   parse(): Program {
     const start = this.peek().span.start;
     const body: TopLevelDeclaration[] = [];
+    let sawNonImport = false;
 
     while (!this.check(TokenKind.Eof)) {
+      if (this.check(TokenKind.Import)) {
+        if (sawNonImport) {
+          this.diagnostics.error(
+            "Import declarations must appear before other top-level declarations",
+            this.peek().span,
+            "E0105",
+          );
+        }
+        const decl = this.parseImportDeclaration();
+        if (decl) {
+          body.push(decl);
+        } else {
+          break;
+        }
+        continue;
+      }
+
+      sawNonImport = true;
+      const exported = this.match(TokenKind.Export);
+
       if (this.check(TokenKind.Struct)) {
-        const decl = this.parseStructDeclaration();
+        const decl = this.parseStructDeclaration(exported);
         if (decl) {
           body.push(decl);
         } else {
           break;
         }
       } else if (this.check(TokenKind.Enum)) {
-        const decl = this.parseEnumDeclaration();
+        const decl = this.parseEnumDeclaration(exported);
         if (decl) {
           body.push(decl);
         } else {
           break;
         }
       } else if (this.check(TokenKind.Function)) {
-        const fn = this.parseFunctionDeclaration();
+        const fn = this.parseFunctionDeclaration(exported);
         if (fn) {
           body.push(fn);
         } else {
           break;
         }
       } else {
-        this.diagnostics.error(
-          `Expected 'function', 'struct', or 'enum', found '${this.peek().lexeme}'`,
-          this.peek().span,
-          "E0103",
-        );
+        if (exported) {
+          this.diagnostics.error(
+            `Expected 'function', 'struct', or 'enum' after 'export', found '${this.peek().lexeme}'`,
+            this.peek().span,
+            "E0103",
+          );
+        } else {
+          this.diagnostics.error(
+            `Expected 'function', 'struct', 'enum', or 'import', found '${this.peek().lexeme}'`,
+            this.peek().span,
+            "E0103",
+          );
+        }
         this.synchronizeToTopLevel();
         if (this.check(TokenKind.Eof)) {
           break;
@@ -155,7 +159,57 @@ export class Parser {
     };
   }
 
-  private parseStructDeclaration(): StructDeclaration | null {
+  private parseImportDeclaration(): ImportDeclaration | null {
+    const start = this.peek().span.start;
+
+    if (!this.expect(TokenKind.Import, "Expected 'import'")) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const sourceToken = this.expect(TokenKind.String, "Expected a string module path after 'import'");
+    if (!sourceToken) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const source: StringLiteral = {
+      kind: "StringLiteral",
+      value: sourceToken.value ?? "",
+      raw: sourceToken.lexeme,
+      span: sourceToken.span,
+    };
+
+    let alias: Identifier | null = null;
+    if (this.check(TokenKind.As)) {
+      this.advance();
+      const aliasToken = this.expect(TokenKind.Identifier, "Expected identifier after 'as'");
+      if (!aliasToken) {
+        this.synchronizeToTopLevel();
+        return null;
+      }
+      alias = {
+        kind: "Identifier",
+        name: aliasToken.lexeme,
+        span: aliasToken.span,
+      };
+    }
+
+    const semicolon = this.expect(TokenKind.Semicolon, "Expected ';' after import");
+    if (!semicolon) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    return {
+      kind: "ImportDeclaration",
+      source,
+      alias,
+      span: { start, end: semicolon.span.end },
+    };
+  }
+
+  private parseStructDeclaration(exported: boolean): StructDeclaration | null {
     const start = this.peek().span.start;
 
     if (!this.expect(TokenKind.Struct, "Expected 'struct'")) {
@@ -198,6 +252,7 @@ export class Parser {
 
     return {
       kind: "StructDeclaration",
+      exported,
       name,
       fields,
       span: { start, end: rbrace.span.end },
@@ -237,7 +292,7 @@ export class Parser {
     };
   }
 
-  private parseEnumDeclaration(): EnumDeclaration | null {
+  private parseEnumDeclaration(exported: boolean): EnumDeclaration | null {
     const start = this.peek().span.start;
 
     if (!this.expect(TokenKind.Enum, "Expected 'enum'")) {
@@ -293,6 +348,7 @@ export class Parser {
 
     return {
       kind: "EnumDeclaration",
+      exported,
       name,
       variants,
       span: { start, end: rbrace.span.end },
@@ -316,7 +372,7 @@ export class Parser {
     };
   }
 
-  private parseFunctionDeclaration(): FunctionDeclaration | null {
+  private parseFunctionDeclaration(exported: boolean): FunctionDeclaration | null {
     const start = this.peek().span.start;
 
     if (!this.expect(TokenKind.Function, "Expected 'function'")) {
@@ -371,6 +427,7 @@ export class Parser {
 
     return {
       kind: "FunctionDeclaration",
+      exported,
       name,
       params,
       returnType,
@@ -1318,6 +1375,13 @@ export class Parser {
       expr = this.parseArrayLiteral();
     } else if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.LParen)) {
       expr = this.parseCallExpression();
+    } else if (
+      this.check(TokenKind.Identifier) &&
+      this.checkNext(TokenKind.Dot) &&
+      this.checkAhead(2, TokenKind.Identifier) &&
+      this.checkAhead(3, TokenKind.LBrace)
+    ) {
+      expr = this.parseStructLiteral();
     } else if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.LBrace)) {
       expr = this.parseStructLiteral();
     } else if (this.check(TokenKind.Identifier)) {
@@ -1479,12 +1543,33 @@ export class Parser {
 
   private parseStructLiteral(): StructLiteral | null {
     const start = this.peek().span.start;
-    const nameToken = this.advance();
-    const name: Identifier = {
-      kind: "Identifier",
-      name: nameToken.lexeme,
-      span: nameToken.span,
-    };
+    const firstToken = this.advance();
+    let namespace: Identifier | null = null;
+    let name: Identifier;
+
+    if (this.check(TokenKind.Dot)) {
+      this.advance();
+      const nameToken = this.expect(TokenKind.Identifier, "Expected struct name after '.'");
+      if (!nameToken) {
+        return null;
+      }
+      namespace = {
+        kind: "Identifier",
+        name: firstToken.lexeme,
+        span: firstToken.span,
+      };
+      name = {
+        kind: "Identifier",
+        name: nameToken.lexeme,
+        span: nameToken.span,
+      };
+    } else {
+      name = {
+        kind: "Identifier",
+        name: firstToken.lexeme,
+        span: firstToken.span,
+      };
+    }
 
     if (!this.expect(TokenKind.LBrace, "Expected '{' after struct name")) {
       return null;
@@ -1516,6 +1601,7 @@ export class Parser {
 
     return {
       kind: "StructLiteral",
+      namespace,
       name,
       fields,
       span: { start, end },
@@ -1618,9 +1704,22 @@ export class Parser {
         name: token.lexeme as PrimitiveTypeName,
         span: token.span,
       };
+    } else if (this.check(TokenKind.Dot)) {
+      this.advance();
+      const nameToken = this.expect(TokenKind.Identifier, "Expected type name after '.'");
+      if (!nameToken) {
+        return null;
+      }
+      type = {
+        kind: "NamedType",
+        namespace: token.lexeme,
+        name: nameToken.lexeme,
+        span: { start: token.span.start, end: nameToken.span.end },
+      };
     } else {
       type = {
         kind: "NamedType",
+        namespace: null,
         name: token.lexeme,
         span: token.span,
       };
@@ -1640,6 +1739,14 @@ export class Parser {
     }
 
     return type;
+  }
+
+  private match(kind: TokenKind): boolean {
+    if (this.check(kind)) {
+      this.advance();
+      return true;
+    }
+    return false;
   }
 
   private expect(kind: TokenKind, message: string): Token | null {
@@ -1666,6 +1773,8 @@ export class Parser {
   private synchronizeToTopLevel(): void {
     while (!this.isAtEnd()) {
       if (
+        this.check(TokenKind.Import) ||
+        this.check(TokenKind.Export) ||
         this.check(TokenKind.Function) ||
         this.check(TokenKind.Struct) ||
         this.check(TokenKind.Enum)
@@ -1681,8 +1790,12 @@ export class Parser {
   }
 
   private checkNext(kind: TokenKind): boolean {
-    const next = this.tokens[this.current + 1];
-    return next?.kind === kind;
+    return this.checkAhead(1, kind);
+  }
+
+  private checkAhead(offset: number, kind: TokenKind): boolean {
+    const token = this.tokens[this.current + offset];
+    return token?.kind === kind;
   }
 
   private peek(): Token {

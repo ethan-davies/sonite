@@ -21,6 +21,8 @@ import type {
   VariableDeclaration,
   WhileStatement,
 } from "../ast/nodes.js";
+import { mangleSymbol } from "../modules/mangle.js";
+import type { ResolvedModule } from "../modules/resolve.js";
 import {
   annotationToValueType,
   isArrayType,
@@ -43,6 +45,7 @@ interface EmittedValue {
 
 interface FunctionSig {
   readonly name: string;
+  readonly mangledName: string;
   readonly params: ValueType[];
   readonly returnType: ValueType | "void";
 }
@@ -59,12 +62,20 @@ interface StructFieldInfo {
 
 interface StructInfo {
   readonly name: string;
+  readonly localName: string;
   readonly fields: StructFieldInfo[];
 }
 
 interface EnumInfo {
   readonly name: string;
+  readonly localName: string;
   readonly variants: ReadonlyMap<string, number>;
+}
+
+interface NamespaceInfo {
+  readonly functions: ReadonlyMap<string, FunctionSig>;
+  readonly structs: ReadonlyMap<string, StructInfo>;
+  readonly enums: ReadonlyMap<string, EnumInfo>;
 }
 
 const COMPARISON_OPS = new Set(["==", "!=", "<", "<=", ">", ">="]);
@@ -82,9 +93,15 @@ export class LlvmCodegen {
   private labelCounter = 0;
   private readonly stringGlobals = new Map<string, { name: string; length: number }>();
   private locals = new Map<string, LocalBinding>();
+  /** All functions keyed by mangled LLVM name. */
   private functions = new Map<string, FunctionSig>();
+  /** Current module: local name → mangled function. */
+  private localFunctions = new Map<string, FunctionSig>();
   private structs = new Map<string, StructInfo>();
+  private localStructs = new Map<string, StructInfo>();
   private enums = new Map<string, EnumInfo>();
+  private localEnums = new Map<string, EnumInfo>();
+  private namespaces = new Map<string, NamespaceInfo>();
   private needsPrintf = false;
   private needsStringRuntime = false;
   private needsArrayRuntime = false;
@@ -94,14 +111,31 @@ export class LlvmCodegen {
   private readonly loopStack: LoopContext[] = [];
 
   emit(program: Program): string {
+    return this.emitModules([
+      {
+        path: "<source>",
+        source: "",
+        ast: program,
+        moduleId: "",
+        isEntry: true,
+        imports: [],
+      },
+    ]);
+  }
+
+  emitModules(modules: readonly ResolvedModule[]): string {
     this.stringCounter = 0;
     this.tempCounter = 0;
     this.labelCounter = 0;
     this.stringGlobals.clear();
     this.locals = new Map();
     this.functions.clear();
+    this.localFunctions.clear();
     this.structs.clear();
+    this.localStructs.clear();
     this.enums.clear();
+    this.localEnums.clear();
+    this.namespaces.clear();
     this.needsPrintf = false;
     this.needsStringRuntime = false;
     this.needsArrayRuntime = false;
@@ -110,47 +144,157 @@ export class LlvmCodegen {
     this.functionBodies.length = 0;
     this.loopStack.length = 0;
 
-    for (const decl of program.body) {
-      if (decl.kind === "EnumDeclaration") {
-        this.registerEnum(decl);
+    const moduleSymbols = new Map<
+      string,
+      {
+        functions: Map<string, FunctionSig>;
+        structs: Map<string, StructInfo>;
+        enums: Map<string, EnumInfo>;
       }
-    }
+    >();
 
-    for (const decl of program.body) {
-      if (decl.kind === "StructDeclaration") {
-        this.registerStruct(decl);
-      }
-    }
+    // Register all types and function signatures first.
+    for (const mod of modules) {
+      const localEnums = new Map<string, EnumInfo>();
+      const localStructs = new Map<string, StructInfo>();
+      const localFns = new Map<string, FunctionSig>();
 
-    for (const decl of program.body) {
-      if (decl.kind !== "FunctionDeclaration") {
-        continue;
-      }
-      const fn = decl;
-      const params = fn.params.map((p) => {
-        const t = this.resolveAnnotation(p.typeAnnotation);
-        if (!t) {
-          throw new Error(`Codegen: invalid parameter type for '${p.name.name}'`);
+      for (const decl of mod.ast.body) {
+        if (decl.kind === "EnumDeclaration") {
+          const info = this.registerEnum(decl, mod.moduleId);
+          localEnums.set(decl.name.name, info);
         }
-        return t;
-      });
-      const returnType =
-        fn.returnType.kind === "PrimitiveType" && fn.returnType.name === "void"
-          ? ("void" as const)
-          : this.resolveAnnotation(fn.returnType);
-      if (returnType === null) {
-        throw new Error(`Codegen: invalid return type for '${fn.name.name}'`);
       }
-      this.functions.set(fn.name.name, {
-        name: fn.name.name,
-        params,
-        returnType,
+
+      for (const decl of mod.ast.body) {
+        if (decl.kind === "StructDeclaration") {
+          const info = this.registerStruct(decl, mod.moduleId);
+          localStructs.set(decl.name.name, info);
+        }
+      }
+
+      // Resolve struct field types now that all structs in this module are registered.
+      for (const decl of mod.ast.body) {
+        if (decl.kind !== "StructDeclaration") {
+          continue;
+        }
+        const info = localStructs.get(decl.name.name)!;
+        const fields = decl.fields.map((field) => {
+          const type = this.resolveAnnotationInModule(
+            field.typeAnnotation,
+            localStructs,
+            localEnums,
+            new Map(),
+          );
+          if (!type) {
+            throw new Error(`Codegen: invalid field type in struct '${decl.name.name}'`);
+          }
+          return { name: field.name.name, type };
+        });
+        const updated: StructInfo = { name: info.name, localName: info.localName, fields };
+        localStructs.set(decl.name.name, updated);
+        this.structs.set(updated.name, updated);
+      }
+
+      for (const decl of mod.ast.body) {
+        if (decl.kind !== "FunctionDeclaration") {
+          continue;
+        }
+        const fn = decl;
+        const params = fn.params.map((p) => {
+          const t = this.resolveAnnotationInModule(
+            p.typeAnnotation,
+            localStructs,
+            localEnums,
+            new Map(),
+          );
+          if (!t) {
+            throw new Error(`Codegen: invalid parameter type for '${p.name.name}'`);
+          }
+          return t;
+        });
+        const returnType =
+          fn.returnType.kind === "PrimitiveType" && fn.returnType.name === "void"
+            ? ("void" as const)
+            : this.resolveAnnotationInModule(fn.returnType, localStructs, localEnums, new Map());
+        if (returnType === null) {
+          throw new Error(`Codegen: invalid return type for '${fn.name.name}'`);
+        }
+        const mangledName =
+          fn.name.name === "main" ? "main" : mangleSymbol(mod.moduleId, fn.name.name);
+        const sig: FunctionSig = {
+          name: fn.name.name,
+          mangledName,
+          params,
+          returnType,
+        };
+        localFns.set(fn.name.name, sig);
+        this.functions.set(mangledName, sig);
+      }
+
+      moduleSymbols.set(mod.path, {
+        functions: localFns,
+        structs: localStructs,
+        enums: localEnums,
       });
     }
 
-    for (const decl of program.body) {
-      if (decl.kind === "FunctionDeclaration") {
-        this.emitFunction(decl);
+    // Emit function bodies with per-module local/namespace context.
+    for (const mod of modules) {
+      const symbols = moduleSymbols.get(mod.path)!;
+      this.localFunctions = symbols.functions;
+      this.localStructs = symbols.structs;
+      this.localEnums = symbols.enums;
+
+      const namespaces = new Map<string, NamespaceInfo>();
+      for (const binding of mod.imports) {
+        const imported = moduleSymbols.get(binding.modulePath);
+        if (!imported) {
+          continue;
+        }
+        const exportedFns = new Map<string, FunctionSig>();
+        const importedMod = modules.find((m) => m.path === binding.modulePath);
+        if (!importedMod) {
+          continue;
+        }
+        for (const [name, sig] of imported.functions) {
+          const fnDecl = importedMod.ast.body.find(
+            (d) => d.kind === "FunctionDeclaration" && d.name.name === name,
+          );
+          if (fnDecl && fnDecl.kind === "FunctionDeclaration" && fnDecl.exported) {
+            exportedFns.set(name, sig);
+          }
+        }
+        const exportedStructs = new Map<string, StructInfo>();
+        for (const [name, info] of imported.structs) {
+          const sDecl = importedMod.ast.body.find(
+            (d) => d.kind === "StructDeclaration" && d.name.name === name,
+          );
+          if (sDecl && sDecl.kind === "StructDeclaration" && sDecl.exported) {
+            exportedStructs.set(name, info);
+          }
+        }
+        const exportedEnums = new Map<string, EnumInfo>();
+        for (const [name, info] of imported.enums) {
+          const eDecl = importedMod.ast.body.find(
+            (d) => d.kind === "EnumDeclaration" && d.name.name === name,
+          );
+          if (eDecl && eDecl.kind === "EnumDeclaration" && eDecl.exported) {
+            exportedEnums.set(name, info);
+          }
+        }
+        namespaces.set(binding.alias, {
+          functions: exportedFns,
+          structs: exportedStructs,
+          enums: exportedEnums,
+        });
+      }
+      this.namespaces = namespaces;
+
+      for (const decl of mod.ast.body) {
+        if (decl.kind === "FunctionDeclaration") {
+          this.emitFunction(decl);
+        }
       }
     }
 
@@ -195,44 +339,123 @@ export class LlvmCodegen {
       .join("\n");
   }
 
-  private registerEnum(decl: EnumDeclaration): void {
+  private registerEnum(decl: EnumDeclaration, moduleId: string): EnumInfo {
     const variants = new Map<string, number>();
     for (let i = 0; i < decl.variants.length; i += 1) {
       variants.set(decl.variants[i]!.name.name, i);
     }
-    this.enums.set(decl.name.name, {
-      name: decl.name.name,
+    const info: EnumInfo = {
+      name: mangleSymbol(moduleId, decl.name.name),
+      localName: decl.name.name,
       variants,
-    });
+    };
+    this.enums.set(info.name, info);
+    return info;
   }
 
-  private registerStruct(decl: StructDeclaration): void {
-    const fields = decl.fields.map((field) => {
-      const type = this.resolveAnnotation(field.typeAnnotation);
-      if (!type) {
-        throw new Error(`Codegen: invalid field type in struct '${decl.name.name}'`);
-      }
-      return { name: field.name.name, type };
-    });
-    this.structs.set(decl.name.name, {
-      name: decl.name.name,
-      fields,
-    });
+  private registerStruct(decl: StructDeclaration, moduleId: string): StructInfo {
+    const info: StructInfo = {
+      name: mangleSymbol(moduleId, decl.name.name),
+      localName: decl.name.name,
+      fields: [],
+    };
+    this.structs.set(info.name, info);
+    return info;
   }
 
   private namedKinds(): Map<string, "struct" | "enum"> {
     const named = new Map<string, "struct" | "enum">();
-    for (const name of this.structs.keys()) {
-      named.set(name, "struct");
+    for (const info of this.localStructs.values()) {
+      named.set(info.localName, "struct");
+      named.set(info.name, "struct");
     }
-    for (const name of this.enums.keys()) {
-      named.set(name, "enum");
+    for (const info of this.localEnums.values()) {
+      named.set(info.localName, "enum");
+      named.set(info.name, "enum");
+    }
+    for (const [alias, ns] of this.namespaces) {
+      for (const [name, info] of ns.structs) {
+        named.set(`${alias}.${name}`, "struct");
+        named.set(info.name, "struct");
+      }
+      for (const [name, info] of ns.enums) {
+        named.set(`${alias}.${name}`, "enum");
+        named.set(info.name, "enum");
+      }
     }
     return named;
   }
 
   private resolveAnnotation(ann: TypeAnnotation): ValueType | null {
-    return annotationToValueType(ann, this.namedKinds());
+    return this.resolveAnnotationInModule(
+      ann,
+      this.localStructs,
+      this.localEnums,
+      this.namespaces,
+    );
+  }
+
+  private resolveAnnotationInModule(
+    ann: TypeAnnotation,
+    localStructs: Map<string, StructInfo>,
+    localEnums: Map<string, EnumInfo>,
+    namespaces: Map<string, NamespaceInfo>,
+  ): ValueType | null {
+    if (ann.kind === "PrimitiveType") {
+      if (ann.name === "void") {
+        return null;
+      }
+      return ann.name;
+    }
+    if (ann.kind === "NamedType") {
+      if (ann.namespace) {
+        const ns = namespaces.get(ann.namespace);
+        if (!ns) {
+          return null;
+        }
+        const enumInfo = ns.enums.get(ann.name);
+        if (enumInfo) {
+          return { kind: "enum", name: enumInfo.name };
+        }
+        const structInfo = ns.structs.get(ann.name);
+        if (structInfo) {
+          return { kind: "struct", name: structInfo.name };
+        }
+        return null;
+      }
+      const enumInfo = localEnums.get(ann.name);
+      if (enumInfo) {
+        return { kind: "enum", name: enumInfo.name };
+      }
+      const structInfo = localStructs.get(ann.name);
+      if (structInfo) {
+        return { kind: "struct", name: structInfo.name };
+      }
+      // Fall back for annotationToValueType-style lookups during early register
+      const named = annotationToValueType(ann, this.namedKinds());
+      if (named && typeof named === "object" && (named.kind === "struct" || named.kind === "enum")) {
+        // Map local/qualified key to mangled if possible
+        const localS = localStructs.get(ann.name);
+        if (localS) {
+          return { kind: "struct", name: localS.name };
+        }
+        const localE = localEnums.get(ann.name);
+        if (localE) {
+          return { kind: "enum", name: localE.name };
+        }
+      }
+      return null;
+    }
+    const element = this.resolveAnnotationInModule(
+      ann.element,
+      localStructs,
+      localEnums,
+      namespaces,
+    );
+    if (element === null) {
+      return null;
+    }
+    return { kind: "array", element };
   }
 
   private emitStructTypeDefs(): string[] {
@@ -286,10 +509,10 @@ export class LlvmCodegen {
   }
 
   private emitFunctionHeader(fn: FunctionDeclaration): string {
-    const sig = this.functions.get(fn.name.name)!;
+    const sig = this.localFunctions.get(fn.name.name)!;
     const ret = sig.returnType === "void" ? "void" : toLlvmType(sig.returnType);
     const params = sig.params.map((t, i) => `${toLlvmType(t)} %arg${i}`).join(", ");
-    return `define ${ret} @${fn.name.name}(${params}) {`;
+    return `define ${ret} @${sig.mangledName}(${params}) {`;
   }
 
   private emitParameter(param: Parameter, index: number, lines: string[]): void {
@@ -684,6 +907,10 @@ export class LlvmCodegen {
 
   private emitCallStatement(call: CallExpression, lines: string[]): void {
     if (call.callee.kind === "MemberExpression") {
+      if (this.isNamespaceCallee(call)) {
+        this.emitNamespaceCall(call, lines, true);
+        return;
+      }
       this.emitMethodCall(call, lines, true);
       return;
     }
@@ -722,8 +949,13 @@ export class LlvmCodegen {
         }
         return { kind: "array", element: this.inferExpressionType(expr.elements[0]!) };
       }
-      case "StructLiteral":
-        return { kind: "struct", name: expr.name.name };
+      case "StructLiteral": {
+        const def = this.lookupStruct(expr.namespace?.name ?? null, expr.name.name);
+        if (!def) {
+          throw new Error(`Codegen: unknown struct '${expr.name.name}'`);
+        }
+        return { kind: "struct", name: def.name };
+      }
       case "IndexExpression": {
         const objectType = this.inferExpressionType(expr.object);
         if (!isArrayType(objectType)) {
@@ -732,12 +964,25 @@ export class LlvmCodegen {
         return objectType.element;
       }
       case "MemberExpression": {
+        // ns.Enum.Variant
+        if (
+          expr.object.kind === "MemberExpression" &&
+          expr.object.object.kind === "Identifier" &&
+          this.namespaces.has(expr.object.object.name) &&
+          !this.locals.has(expr.object.object.name)
+        ) {
+          const ns = this.namespaces.get(expr.object.object.name)!;
+          const def = ns.enums.get(expr.object.property.name);
+          if (def) {
+            return { kind: "enum", name: def.name };
+          }
+        }
         if (
           expr.object.kind === "Identifier" &&
-          this.enums.has(expr.object.name) &&
+          this.localEnums.has(expr.object.name) &&
           !this.locals.has(expr.object.name)
         ) {
-          return { kind: "enum", name: expr.object.name };
+          return { kind: "enum", name: this.localEnums.get(expr.object.name)!.name };
         }
         const objectType = this.inferExpressionType(expr.object);
         if (isStructType(objectType)) {
@@ -783,6 +1028,18 @@ export class LlvmCodegen {
       }
       case "CallExpression": {
         if (expr.callee.kind === "MemberExpression") {
+          if (this.isNamespaceCallee(expr)) {
+            const ns = this.namespaces.get(
+              (expr.callee.object as { kind: "Identifier"; name: string }).name,
+            )!;
+            const sig = ns.functions.get(expr.callee.property.name);
+            if (!sig || sig.returnType === "void") {
+              throw new Error(
+                `Codegen: unexpected namespace call in type inference '${expr.callee.property.name}'`,
+              );
+            }
+            return sig.returnType;
+          }
           const method = expr.callee.property.name;
           const objectType = this.inferExpressionType(expr.callee.object);
           if (!isArrayType(objectType)) {
@@ -799,7 +1056,7 @@ export class LlvmCodegen {
           }
           throw new Error(`Codegen: unexpected method '${method}' in inference`);
         }
-        const sig = this.functions.get(expr.callee.name);
+        const sig = this.localFunctions.get(expr.callee.name);
         if (!sig || sig.returnType === "void") {
           throw new Error(`Codegen: unexpected call in type inference '${expr.callee.name}'`);
         }
@@ -847,11 +1104,28 @@ export class LlvmCodegen {
       }
       case "MemberExpression": {
         if (
+          expr.object.kind === "MemberExpression" &&
+          expr.object.object.kind === "Identifier" &&
+          this.namespaces.has(expr.object.object.name) &&
+          !this.locals.has(expr.object.object.name)
+        ) {
+          const ns = this.namespaces.get(expr.object.object.name)!;
+          const def = ns.enums.get(expr.object.property.name);
+          if (def) {
+            const discriminant = def.variants.get(expr.property.name);
+            if (discriminant === undefined) {
+              throw new Error(`Codegen: unknown variant '${expr.property.name}'`);
+            }
+            const type: EnumValueType = { kind: "enum", name: def.name };
+            return { llvm: String(discriminant), type };
+          }
+        }
+        if (
           expr.object.kind === "Identifier" &&
-          this.enums.has(expr.object.name) &&
+          this.localEnums.has(expr.object.name) &&
           !this.locals.has(expr.object.name)
         ) {
-          const def = this.enums.get(expr.object.name)!;
+          const def = this.localEnums.get(expr.object.name)!;
           const discriminant = def.variants.get(expr.property.name);
           if (discriminant === undefined) {
             throw new Error(`Codegen: unknown variant '${expr.property.name}'`);
@@ -888,14 +1162,54 @@ export class LlvmCodegen {
         return this.emitBinary(expr, lines);
       case "CallExpression":
         if (expr.callee.kind === "MemberExpression") {
+          if (this.isNamespaceCallee(expr)) {
+            return this.emitNamespaceCall(expr, lines, false);
+          }
           return this.emitMethodCall(expr, lines, false);
         }
         return this.emitUserCall(expr, lines, false);
     }
   }
 
+  private lookupStruct(namespace: string | null, name: string): StructInfo | undefined {
+    if (namespace) {
+      return this.namespaces.get(namespace)?.structs.get(name);
+    }
+    return this.localStructs.get(name);
+  }
+
+  private isNamespaceCallee(call: CallExpression): boolean {
+    return (
+      call.callee.kind === "MemberExpression" &&
+      call.callee.object.kind === "Identifier" &&
+      this.namespaces.has(call.callee.object.name) &&
+      !this.locals.has(call.callee.object.name)
+    );
+  }
+
+  private emitNamespaceCall(
+    call: CallExpression,
+    lines: string[],
+    asStatement: boolean,
+  ): EmittedValue {
+    if (call.callee.kind !== "MemberExpression" || call.callee.object.kind !== "Identifier") {
+      throw new Error("Codegen: expected namespace call");
+    }
+    const ns = this.namespaces.get(call.callee.object.name);
+    if (!ns) {
+      throw new Error(`Codegen: unknown namespace '${call.callee.object.name}'`);
+    }
+    const sig = ns.functions.get(call.callee.property.name);
+    if (!sig) {
+      throw new Error(
+        `Codegen: unknown function '${call.callee.object.name}.${call.callee.property.name}'`,
+      );
+    }
+    return this.emitCallWithSig(sig, call.args, lines, asStatement);
+  }
+
   private emitStructLiteral(expr: StructLiteral, lines: string[]): EmittedValue {
-    const def = this.structs.get(expr.name.name);
+    const def = this.lookupStruct(expr.namespace?.name ?? null, expr.name.name);
     if (!def) {
       throw new Error(`Codegen: unknown struct '${expr.name.name}'`);
     }
@@ -1441,21 +1755,29 @@ export class LlvmCodegen {
     if (call.callee.kind !== "Identifier") {
       throw new Error("Codegen: expected identifier callee");
     }
-    const sig = this.functions.get(call.callee.name);
+    const sig = this.localFunctions.get(call.callee.name);
     if (!sig) {
       throw new Error(`Codegen: unknown function '${call.callee.name}'`);
     }
+    return this.emitCallWithSig(sig, call.args, lines, asStatement);
+  }
 
-    const args: EmittedValue[] = [];
-    for (let i = 0; i < call.args.length; i += 1) {
-      args.push(this.emitExpression(call.args[i]!, lines, sig.params[i]));
+  private emitCallWithSig(
+    sig: FunctionSig,
+    args: Expression[],
+    lines: string[],
+    asStatement: boolean,
+  ): EmittedValue {
+    const emittedArgs: EmittedValue[] = [];
+    for (let i = 0; i < args.length; i += 1) {
+      emittedArgs.push(this.emitExpression(args[i]!, lines, sig.params[i]));
     }
 
-    const argList = args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`).join(", ");
+    const argList = emittedArgs.map((a) => `${toLlvmType(a.type)} ${a.llvm}`).join(", ");
     const argSuffix = argList ? argList : "";
 
     if (sig.returnType === "void") {
-      lines.push(`  call void @${sig.name}(${argSuffix})`);
+      lines.push(`  call void @${sig.mangledName}(${argSuffix})`);
       if (!asStatement) {
         throw new Error(`Codegen: void call '${sig.name}' used as value`);
       }
@@ -1464,7 +1786,7 @@ export class LlvmCodegen {
 
     const tmp = this.nextTemp();
     const retTy = toLlvmType(sig.returnType);
-    lines.push(`  ${tmp} = call ${retTy} @${sig.name}(${argSuffix})`);
+    lines.push(`  ${tmp} = call ${retTy} @${sig.mangledName}(${argSuffix})`);
     return { llvm: tmp, type: sig.returnType };
   }
 

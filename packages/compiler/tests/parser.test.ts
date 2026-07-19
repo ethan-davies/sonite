@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { FunctionDeclaration, Program } from "../src/ast/nodes.js";
 import { DiagnosticCollector } from "../src/diagnostics/index.js";
 import { Lexer } from "../src/lexer/index.js";
 import { Parser } from "../src/parser/index.js";
@@ -10,6 +11,15 @@ function parse(source: string) {
   return { ast, diagnostics };
 }
 
+function functionAt(ast: Program, index: number): FunctionDeclaration {
+  const decl = ast.body[index];
+  expect(decl?.kind).toBe("FunctionDeclaration");
+  if (decl?.kind !== "FunctionDeclaration") {
+    throw new Error(`expected FunctionDeclaration at index ${index}`);
+  }
+  return decl;
+}
+
 describe("Parser", () => {
   it("parses main with a return type and print statement", () => {
     const { ast, diagnostics } = parse(`
@@ -19,12 +29,13 @@ describe("Parser", () => {
     `);
     expect(diagnostics.hasErrors).toBe(false);
     expect(ast.body).toHaveLength(1);
-    expect(ast.body[0]?.name.name).toBe("main");
-    expect(ast.body[0]?.returnType).toMatchObject({ kind: "PrimitiveType", name: "void" });
-    expect(ast.body[0]?.params).toEqual([]);
-    expect(ast.body[0]?.body).toHaveLength(1);
+    const main = functionAt(ast, 0);
+    expect(main.name.name).toBe("main");
+    expect(main.returnType).toMatchObject({ kind: "PrimitiveType", name: "void" });
+    expect(main.params).toEqual([]);
+    expect(main.body).toHaveLength(1);
 
-    const stmt = ast.body[0]?.body[0];
+    const stmt = main.body[0];
     expect(stmt?.kind).toBe("ExpressionStatement");
     if (stmt?.kind !== "ExpressionStatement") {
       return;
@@ -55,7 +66,7 @@ describe("Parser", () => {
       }
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const body = ast.body[0]?.body ?? [];
+    const body = functionAt(ast, 0).body;
     expect(body).toHaveLength(5);
     expect(body[0]?.kind).toBe("VariableDeclaration");
     expect(body[1]?.kind).toBe("VariableDeclaration");
@@ -88,7 +99,7 @@ describe("Parser", () => {
       }
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const kinds = (ast.body[0]?.body ?? []).map((stmt) => {
+    const kinds = functionAt(ast, 0).body.map((stmt) => {
       if (stmt.kind !== "ExpressionStatement" || stmt.expression.kind !== "CallExpression") {
         return null;
       }
@@ -106,7 +117,7 @@ describe("Parser", () => {
   it("parses an empty main body", () => {
     const { ast, diagnostics } = parse("function main(): void {}");
     expect(diagnostics.hasErrors).toBe(false);
-    expect(ast.body[0]?.body).toEqual([]);
+    expect(functionAt(ast, 0).body).toEqual([]);
   });
 
   it("rejects missing return type", () => {
@@ -129,9 +140,9 @@ describe("Parser", () => {
     `);
     // Named types are accepted at parse time; resolution happens in typecheck.
     expect(diagnostics.hasErrors).toBe(false);
-    expect(ast.body[0]).toMatchObject({
+      expect(ast.body[0]).toMatchObject({
       kind: "FunctionDeclaration",
-      returnType: { kind: "NamedType", name: "widget" },
+      returnType: { kind: "NamedType", namespace: null, name: "widget" },
     });
   });
 
@@ -220,6 +231,7 @@ describe("Parser", () => {
     if (decl?.kind === "VariableDeclaration") {
       expect(decl.typeAnnotation).toMatchObject({
         kind: "NamedType",
+        namespace: null,
         name: "Direction",
       });
       expect(decl.initializer.kind).toBe("MemberExpression");
@@ -242,7 +254,7 @@ describe("Parser", () => {
       }
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const body = ast.body[0]?.body ?? [];
+    const body = functionAt(ast, 0).body;
     expect(body).toHaveLength(3);
 
     const first = body[0];
@@ -284,7 +296,7 @@ describe("Parser", () => {
       }
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const body = ast.body[0]?.body ?? [];
+    const body = functionAt(ast, 0).body;
 
     const checkLeftAssoc = (index: number, operator: string) => {
       const stmt = body[index];
@@ -319,18 +331,19 @@ describe("Parser", () => {
     `);
     expect(diagnostics.hasErrors).toBe(false);
     expect(ast.body).toHaveLength(2);
-    expect(ast.body[0]?.name.name).toBe("add");
-    expect(ast.body[0]?.params).toHaveLength(2);
-    expect(ast.body[0]?.params[0]?.name.name).toBe("a");
-    expect(ast.body[0]?.params[0]?.typeAnnotation).toMatchObject({
+    const add = functionAt(ast, 0);
+    expect(add.name.name).toBe("add");
+    expect(add.params).toHaveLength(2);
+    expect(add.params[0]?.name.name).toBe("a");
+    expect(add.params[0]?.typeAnnotation).toMatchObject({
       kind: "PrimitiveType",
       name: "i32",
     });
-    expect(ast.body[0]?.body[0]?.kind).toBe("ReturnStatement");
-    if (ast.body[0]?.body[0]?.kind === "ReturnStatement") {
-      expect(ast.body[0].body[0].value?.kind).toBe("BinaryExpression");
+    expect(add.body[0]?.kind).toBe("ReturnStatement");
+    if (add.body[0]?.kind === "ReturnStatement") {
+      expect(add.body[0].value?.kind).toBe("BinaryExpression");
     }
-    expect(ast.body[1]?.name.name).toBe("main");
+    expect(functionAt(ast, 1).name.name).toBe("main");
   });
 
   it("parses bare return in a void function", () => {
@@ -341,7 +354,7 @@ describe("Parser", () => {
       function main(): void {}
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const stmt = ast.body[0]?.body[0];
+    const stmt = functionAt(ast, 0).body[0];
     expect(stmt?.kind).toBe("ReturnStatement");
     if (stmt?.kind === "ReturnStatement") {
       expect(stmt.value).toBeNull();
@@ -355,7 +368,7 @@ describe("Parser", () => {
       }
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const stmt = ast.body[0]?.body[0];
+    const stmt = functionAt(ast, 0).body[0];
     expect(stmt?.kind).toBe("ExpressionStatement");
     if (stmt?.kind !== "ExpressionStatement" || stmt.expression.kind !== "CallExpression") {
       return;
@@ -391,7 +404,7 @@ describe("Parser", () => {
       }
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const stmt = ast.body[0]?.body[1];
+    const stmt = functionAt(ast, 0).body[1];
     expect(stmt?.kind).toBe("IfStatement");
     if (stmt?.kind !== "IfStatement") {
       return;
@@ -424,7 +437,7 @@ describe("Parser", () => {
       }
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const body = ast.body[0]?.body ?? [];
+    const body = functionAt(ast, 0).body;
     expect(body[1]?.kind).toBe("WhileStatement");
     if (body[1]?.kind === "WhileStatement") {
       expect(body[1].body[0]?.kind).toBe("UpdateStatement");
@@ -466,7 +479,7 @@ describe("Parser", () => {
       }
     `);
     expect(diagnostics.hasErrors).toBe(false);
-    const body = ast.body[0]?.body ?? [];
+    const body = functionAt(ast, 0).body;
     expect(body[0]?.kind).toBe("VariableDeclaration");
     if (body[0]?.kind === "VariableDeclaration") {
       expect(body[0].typeAnnotation?.kind).toBe("ArrayType");
@@ -511,5 +524,85 @@ describe("Parser", () => {
       expect(body[6].mutability).toBe("let");
       expect(body[6].name.name).toBe("x");
     }
+  });
+
+  it("parses import, alias, and export declarations", () => {
+    const { ast, diagnostics } = parse(`
+      import "math";
+      import "math/vector" as v;
+      export function add(a: i32, b: i32): i32 {
+        return a + b;
+      }
+      export struct Point {
+        x: i32;
+      }
+      export enum Color {
+        Red,
+        Blue
+      }
+      function main(): void {
+        print(math.add(1, 2));
+        print(v.add(3, 4));
+        let p: math.Point = math.Point { x: 1 };
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(ast.body[0]).toMatchObject({
+      kind: "ImportDeclaration",
+      source: { value: "math" },
+      alias: null,
+    });
+    expect(ast.body[1]).toMatchObject({
+      kind: "ImportDeclaration",
+      source: { value: "math/vector" },
+      alias: { name: "v" },
+    });
+    expect(ast.body[2]).toMatchObject({
+      kind: "FunctionDeclaration",
+      exported: true,
+      name: { name: "add" },
+    });
+    expect(ast.body[3]).toMatchObject({
+      kind: "StructDeclaration",
+      exported: true,
+      name: { name: "Point" },
+    });
+    expect(ast.body[4]).toMatchObject({
+      kind: "EnumDeclaration",
+      exported: true,
+      name: { name: "Color" },
+    });
+    expect(ast.body[5]).toMatchObject({
+      kind: "FunctionDeclaration",
+      exported: false,
+      name: { name: "main" },
+    });
+
+    if (ast.body[5]?.kind !== "FunctionDeclaration") {
+      return;
+    }
+    const body = ast.body[5].body;
+    expect(body[2]?.kind).toBe("VariableDeclaration");
+    if (body[2]?.kind === "VariableDeclaration") {
+      expect(body[2].typeAnnotation).toMatchObject({
+        kind: "NamedType",
+        namespace: "math",
+        name: "Point",
+      });
+      expect(body[2].initializer).toMatchObject({
+        kind: "StructLiteral",
+        namespace: { name: "math" },
+        name: { name: "Point" },
+      });
+    }
+  });
+
+  it("rejects imports after other declarations", () => {
+    const { diagnostics } = parse(`
+      function main(): void {}
+      import "math";
+    `);
+    expect(diagnostics.hasErrors).toBe(true);
+    expect(diagnostics.diagnostics.some((d) => d.code === "E0105")).toBe(true);
   });
 });

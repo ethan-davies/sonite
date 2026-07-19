@@ -22,6 +22,7 @@ export type {
   FunctionDeclaration,
   Identifier,
   IfStatement,
+  ImportDeclaration,
   IndexExpression,
   IntegerLiteral,
   MemberExpression,

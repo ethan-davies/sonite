@@ -9,6 +9,8 @@ import type {
   TypeAnnotation,
 } from "./ast/nodes.js";
 import type { DiagnosticCollector, SourceSpan } from "./diagnostics/diagnostic.js";
+import { mangleSymbol } from "./modules/mangle.js";
+import type { ResolvedModule } from "./modules/resolve.js";
 
 export type PrimitiveValueType = Exclude<PrimitiveTypeName, "void">;
 
@@ -40,12 +42,14 @@ export interface StructDef {
   readonly name: string;
   readonly fields: StructFieldDef[];
   readonly decl: StructDeclaration;
+  readonly exported: boolean;
 }
 
 export interface EnumDef {
   readonly name: string;
   readonly variants: ReadonlyMap<string, number>;
   readonly decl: EnumDeclaration;
+  readonly exported: boolean;
 }
 
 interface Binding {
@@ -55,23 +59,167 @@ interface Binding {
 
 interface FunctionSig {
   readonly name: string;
+  readonly mangledName: string;
   readonly params: ValueType[];
   readonly returnType: ReturnType;
   readonly decl: FunctionDeclaration;
+  readonly exported: boolean;
+}
+
+export interface ModuleNamespace {
+  readonly moduleId: string;
+  readonly functions: ReadonlyMap<string, FunctionSig>;
+  readonly structs: ReadonlyMap<string, StructDef>;
+  readonly enums: ReadonlyMap<string, EnumDef>;
+}
+
+interface ModuleSymbols {
+  readonly moduleId: string;
+  readonly functions: Map<string, FunctionSig>;
+  readonly structs: Map<string, StructDef>;
+  readonly enums: Map<string, EnumDef>;
 }
 
 const NUMERIC_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f64"]);
 const EQUALITY_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f64", "bool", "char"]);
 
+/** Active import namespaces while type-checking a module. */
+let activeNamespaces: Map<string, ModuleNamespace> = new Map();
+
 /**
- * Type-check a validated program: inference, annotations, arithmetic, calls, returns.
+ * Type-check a validated single-file program.
  */
 export function typecheck(program: Program, diagnostics: DiagnosticCollector): void {
-  const enums = collectEnums(program, diagnostics);
-  const structs = collectStructs(program, enums, diagnostics);
+  for (const decl of program.body) {
+    if (decl.kind === "ImportDeclaration") {
+      diagnostics.error(
+        "Import declarations require compiling from a file path (use compileFile)",
+        decl.span,
+        "E0400",
+      );
+      return;
+    }
+  }
+
+  typecheckModules(
+    [
+      {
+        path: "<source>",
+        source: "",
+        ast: program,
+        moduleId: "",
+        isEntry: true,
+        imports: [],
+      },
+    ],
+    diagnostics,
+  );
+}
+
+/**
+ * Type-check a multi-module compilation unit.
+ */
+export function typecheckModules(
+  modules: readonly ResolvedModule[],
+  diagnostics: DiagnosticCollector,
+): void {
+  const byPath = new Map<string, ModuleSymbols>();
+
+  for (const mod of modules) {
+    const symbols = collectModuleSymbols(mod, diagnostics);
+    byPath.set(mod.path, symbols);
+  }
+
+  if (diagnostics.hasErrors) {
+    return;
+  }
+
+  for (const mod of modules) {
+    const local = byPath.get(mod.path)!;
+    const namespaces = new Map<string, ModuleNamespace>();
+
+    // Clash: import alias vs local top-level names
+    const localNames = new Set<string>([
+      ...local.functions.keys(),
+      ...local.structs.keys(),
+      ...local.enums.keys(),
+    ]);
+
+    for (const binding of mod.imports) {
+      if (localNames.has(binding.alias)) {
+        diagnostics.error(
+          `Import namespace '${binding.alias}' conflicts with a local declaration`,
+          binding.span,
+          "E0405",
+        );
+        continue;
+      }
+      const imported = byPath.get(binding.modulePath);
+      if (!imported) {
+        continue;
+      }
+      namespaces.set(binding.alias, {
+        moduleId: imported.moduleId,
+        functions: exportedFunctions(imported.functions),
+        structs: exportedStructs(imported.structs),
+        enums: exportedEnums(imported.enums),
+      });
+    }
+
+    if (diagnostics.hasErrors) {
+      continue;
+    }
+
+    activeNamespaces = namespaces;
+    for (const decl of mod.ast.body) {
+      if (decl.kind === "FunctionDeclaration") {
+        checkFunction(decl, local.functions, local.structs, local.enums, diagnostics);
+      }
+    }
+  }
+
+  activeNamespaces = new Map();
+}
+
+function exportedFunctions(fns: Map<string, FunctionSig>): Map<string, FunctionSig> {
+  const out = new Map<string, FunctionSig>();
+  for (const [name, sig] of fns) {
+    if (sig.exported) {
+      out.set(name, sig);
+    }
+  }
+  return out;
+}
+
+function exportedStructs(structs: Map<string, StructDef>): Map<string, StructDef> {
+  const out = new Map<string, StructDef>();
+  for (const [name, def] of structs) {
+    if (def.exported) {
+      out.set(name, def);
+    }
+  }
+  return out;
+}
+
+function exportedEnums(enums: Map<string, EnumDef>): Map<string, EnumDef> {
+  const out = new Map<string, EnumDef>();
+  for (const [name, def] of enums) {
+    if (def.exported) {
+      out.set(name, def);
+    }
+  }
+  return out;
+}
+
+function collectModuleSymbols(
+  mod: ResolvedModule,
+  diagnostics: DiagnosticCollector,
+): ModuleSymbols {
+  const enums = collectEnums(mod.ast, mod.moduleId, diagnostics);
+  const structs = collectStructs(mod.ast, mod.moduleId, enums, diagnostics);
   const functions = new Map<string, FunctionSig>();
 
-  for (const decl of program.body) {
+  for (const decl of mod.ast.body) {
     if (decl.kind !== "FunctionDeclaration") {
       continue;
     }
@@ -135,21 +283,25 @@ export function typecheck(program: Program, diagnostics: DiagnosticCollector): v
 
     functions.set(fn.name.name, {
       name: fn.name.name,
+      mangledName: fn.name.name === "main" ? "main" : mangleSymbol(mod.moduleId, fn.name.name),
       params,
       returnType,
       decl: fn,
+      exported: fn.exported,
     });
   }
 
-  for (const decl of program.body) {
-    if (decl.kind === "FunctionDeclaration") {
-      checkFunction(decl, functions, structs, enums, diagnostics);
-    }
-  }
+  return {
+    moduleId: mod.moduleId,
+    functions,
+    structs,
+    enums,
+  };
 }
 
 function collectEnums(
   program: Program,
+  moduleId: string,
   diagnostics: DiagnosticCollector,
 ): Map<string, EnumDef> {
   const enums = new Map<string, EnumDef>();
@@ -211,9 +363,10 @@ function collectEnums(
 
     if (variantsOk) {
       enums.set(decl.name.name, {
-        name: decl.name.name,
+        name: mangleSymbol(moduleId, decl.name.name),
         variants,
         decl,
+        exported: decl.exported,
       });
     }
   }
@@ -223,6 +376,7 @@ function collectEnums(
 
 function collectStructs(
   program: Program,
+  moduleId: string,
   enums: Map<string, EnumDef>,
   diagnostics: DiagnosticCollector,
 ): Map<string, StructDef> {
@@ -252,12 +406,12 @@ function collectStructs(
       continue;
     }
 
-    // Placeholder so nested/self references can resolve by name during field typing
     declarations.push(decl);
     structs.set(decl.name.name, {
-      name: decl.name.name,
+      name: mangleSymbol(moduleId, decl.name.name),
       fields: [],
       decl,
+      exported: decl.exported,
     });
   }
 
@@ -287,10 +441,12 @@ function collectStructs(
     }
 
     if (fieldsOk) {
+      const existing = structs.get(decl.name.name)!;
       structs.set(decl.name.name, {
-        name: decl.name.name,
+        name: existing.name,
         fields,
         decl,
+        exported: decl.exported,
       });
     } else {
       structs.delete(decl.name.name);
@@ -354,6 +510,7 @@ export function isIntegerType(type: ValueType): boolean {
 /**
  * Convert a type annotation to a value type.
  * Named types become struct or enum types when `namedKinds` is provided.
+ * Qualified names use `namespace.name` as the lookup key in `namedKinds`.
  */
 export function annotationToValueType(
   ann: TypeAnnotation,
@@ -366,8 +523,12 @@ export function annotationToValueType(
     return ann.name;
   }
   if (ann.kind === "NamedType") {
-    const kind = namedKinds?.get(ann.name) ?? "struct";
-    return { kind, name: ann.name };
+    const key = ann.namespace ? `${ann.namespace}.${ann.name}` : ann.name;
+    const kind = namedKinds?.get(key) ?? "struct";
+    // When namedKinds maps local names to mangled type keys, prefer the map's... 
+    // Actually namedKinds only stores kind; name in ValueType must be the type key.
+    // Callers that need mangled names should use resolveAnnotation instead.
+    return { kind, name: key };
   }
   const element = annotationToValueType(ann.element, namedKinds);
   if (element === null) {
@@ -394,11 +555,30 @@ function resolveAnnotation(
     return ann.name;
   }
   if (ann.kind === "NamedType") {
+    if (ann.namespace) {
+      const ns = activeNamespaces.get(ann.namespace);
+      if (!ns) {
+        diagnostics.error(`Unknown namespace '${ann.namespace}'`, ann.span, "E0406");
+        return null;
+      }
+      if (ns.enums.has(ann.name)) {
+        return { kind: "enum", name: ns.enums.get(ann.name)!.name };
+      }
+      if (ns.structs.has(ann.name)) {
+        return { kind: "struct", name: ns.structs.get(ann.name)!.name };
+      }
+      diagnostics.error(
+        `Unknown type '${ann.namespace}.${ann.name}'`,
+        ann.span,
+        "E0104",
+      );
+      return null;
+    }
     if (enums.has(ann.name)) {
-      return { kind: "enum", name: ann.name };
+      return { kind: "enum", name: enums.get(ann.name)!.name };
     }
     if (structs.has(ann.name)) {
-      return { kind: "struct", name: ann.name };
+      return { kind: "struct", name: structs.get(ann.name)!.name };
     }
     diagnostics.error(`Unknown type '${ann.name}'`, ann.span, "E0104");
     return null;
@@ -426,20 +606,6 @@ function resolveReturnType(
   return value;
 }
 
-function namedKindsFrom(
-  structs: Map<string, StructDef>,
-  enums: Map<string, EnumDef>,
-): Map<string, "struct" | "enum"> {
-  const named = new Map<string, "struct" | "enum">();
-  for (const name of structs.keys()) {
-    named.set(name, "struct");
-  }
-  for (const name of enums.keys()) {
-    named.set(name, "enum");
-  }
-  return named;
-}
-
 function checkFunction(
   fn: FunctionDeclaration,
   functions: Map<string, FunctionSig>,
@@ -448,17 +614,13 @@ function checkFunction(
   diagnostics: DiagnosticCollector,
 ): void {
   const scope = new Map<string, Binding>();
-  const namedKinds = namedKindsFrom(structs, enums);
-  const returnType =
-    fn.returnType.kind === "PrimitiveType" && fn.returnType.name === "void"
-      ? ("void" as const)
-      : annotationToValueType(fn.returnType, namedKinds);
-  if (returnType === null) {
+  const returnType = resolveReturnType(fn.returnType, structs, enums, diagnostics);
+  if (returnType === undefined) {
     return;
   }
 
   for (const param of fn.params) {
-    const paramType = annotationToValueType(param.typeAnnotation, namedKinds);
+    const paramType = resolveAnnotation(param.typeAnnotation, structs, enums, diagnostics);
     if (paramType === null) {
       continue;
     }
@@ -879,7 +1041,8 @@ function checkMemberLvalue(
     );
     return null;
   }
-  const def = structs.get(objectType.name);
+  const def =
+    findStructByTypeName(structs, objectType.name) ?? findStructInNamespaces(objectType.name);
   if (!def) {
     diagnostics.error(`Unknown struct '${objectType.name}'`, expr.object.span, "E0104");
     return null;
@@ -887,13 +1050,107 @@ function checkMemberLvalue(
   const field = def.fields.find((f) => f.name === expr.property.name);
   if (!field) {
     diagnostics.error(
-      `Unknown field '${expr.property.name}' on struct '${objectType.name}'`,
+      `Unknown field '${expr.property.name}' on struct '${def.decl.name.name}'`,
       expr.property.span,
       "E0324",
     );
     return null;
   }
   return field.type;
+}
+
+function findStructByTypeName(
+  structs: Map<string, StructDef>,
+  typeName: string,
+): StructDef | undefined {
+  for (const def of structs.values()) {
+    if (def.name === typeName) {
+      return def;
+    }
+  }
+  return undefined;
+}
+
+function findStructInNamespaces(typeName: string): StructDef | undefined {
+  for (const ns of activeNamespaces.values()) {
+    for (const def of ns.structs.values()) {
+      if (def.name === typeName) {
+        return def;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve `ns.fn(...)` calls. Returns `undefined` if this is not a namespace call
+ * (so the caller can fall through to array method checking).
+ */
+function checkNamespaceCall(
+  expr: Extract<Expression, { kind: "CallExpression" }>,
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+  allowVoidCall: boolean,
+): ValueType | null | undefined {
+  if (expr.callee.kind !== "MemberExpression") {
+    return undefined;
+  }
+  if (expr.callee.object.kind !== "Identifier") {
+    return undefined;
+  }
+  const nsName = expr.callee.object.name;
+  if (!activeNamespaces.has(nsName) || scope.has(nsName)) {
+    return undefined;
+  }
+
+  const ns = activeNamespaces.get(nsName)!;
+  const sig = ns.functions.get(expr.callee.property.name);
+  if (!sig) {
+    diagnostics.error(
+      `Unknown function '${nsName}.${expr.callee.property.name}'`,
+      expr.callee.property.span,
+      "E0307",
+    );
+    return null;
+  }
+
+  if (expr.args.length !== sig.params.length) {
+    diagnostics.error(
+      `Function '${nsName}.${sig.name}' expects ${sig.params.length} argument(s), got ${expr.args.length}`,
+      expr.span,
+      "E0315",
+    );
+    return null;
+  }
+
+  for (let i = 0; i < expr.args.length; i += 1) {
+    const arg = expr.args[i]!;
+    const expected = sig.params[i]!;
+    const argType = checkExpression(arg, scope, functions, structs, enums, diagnostics);
+    if (!argType) {
+      return null;
+    }
+    if (!valueMatchesBinding(arg, argType, expected)) {
+      diagnostics.error(typeMismatchMessage(expected, argType), arg.span, "E0303");
+      return null;
+    }
+  }
+
+  if (sig.returnType === "void") {
+    if (!allowVoidCall) {
+      diagnostics.error(
+        `Void function '${nsName}.${sig.name}' cannot be used as a value`,
+        expr.span,
+        "E0309",
+      );
+    }
+    return null;
+  }
+
+  return sig.returnType;
 }
 
 function checkExpression(
@@ -918,10 +1175,32 @@ function checkExpression(
     case "CharLiteral":
       return "char";
     case "StructLiteral": {
-      const def = structs.get(expr.name.name);
-      if (!def) {
-        diagnostics.error(`Unknown struct '${expr.name.name}'`, expr.name.span, "E0104");
-        return null;
+      let def: StructDef | undefined;
+      if (expr.namespace) {
+        const ns = activeNamespaces.get(expr.namespace.name);
+        if (!ns) {
+          diagnostics.error(
+            `Unknown namespace '${expr.namespace.name}'`,
+            expr.namespace.span,
+            "E0406",
+          );
+          return null;
+        }
+        def = ns.structs.get(expr.name.name);
+        if (!def) {
+          diagnostics.error(
+            `Unknown struct '${expr.namespace.name}.${expr.name.name}'`,
+            expr.name.span,
+            "E0104",
+          );
+          return null;
+        }
+      } else {
+        def = structs.get(expr.name.name);
+        if (!def) {
+          diagnostics.error(`Unknown struct '${expr.name.name}'`, expr.name.span, "E0104");
+          return null;
+        }
       }
 
       const seen = new Set<string>();
@@ -939,7 +1218,7 @@ function checkExpression(
         const field = def.fields.find((f) => f.name === init.name.name);
         if (!field) {
           diagnostics.error(
-            `Unknown field '${init.name.name}' on struct '${def.name}'`,
+            `Unknown field '${init.name.name}' on struct '${def.decl.name.name}'`,
             init.name.span,
             "E0324",
           );
@@ -972,7 +1251,7 @@ function checkExpression(
       for (const field of def.fields) {
         if (!seen.has(field.name)) {
           diagnostics.error(
-            `Missing field '${field.name}' in struct literal for '${def.name}'`,
+            `Missing field '${field.name}' in struct literal for '${def.decl.name.name}'`,
             expr.span,
             "E0332",
           );
@@ -1066,6 +1345,28 @@ function checkExpression(
       return objectType.element;
     }
     case "MemberExpression": {
+      // ns.Enum.Variant
+      if (
+        expr.object.kind === "MemberExpression" &&
+        expr.object.object.kind === "Identifier" &&
+        activeNamespaces.has(expr.object.object.name) &&
+        !scope.has(expr.object.object.name)
+      ) {
+        const ns = activeNamespaces.get(expr.object.object.name)!;
+        const enumDef = ns.enums.get(expr.object.property.name);
+        if (enumDef) {
+          if (!enumDef.variants.has(expr.property.name)) {
+            diagnostics.error(
+              `Unknown variant '${expr.property.name}' on enum '${expr.object.object.name}.${enumDef.decl.name.name}'`,
+              expr.property.span,
+              "E0324",
+            );
+            return null;
+          }
+          return { kind: "enum", name: enumDef.name };
+        }
+      }
+
       // Enum variant access: Direction.Up (type name, not a local binding)
       if (
         expr.object.kind === "Identifier" &&
@@ -1075,7 +1376,7 @@ function checkExpression(
         const def = enums.get(expr.object.name)!;
         if (!def.variants.has(expr.property.name)) {
           diagnostics.error(
-            `Unknown variant '${expr.property.name}' on enum '${def.name}'`,
+            `Unknown variant '${expr.property.name}' on enum '${def.decl.name.name}'`,
             expr.property.span,
             "E0324",
           );
@@ -1084,12 +1385,28 @@ function checkExpression(
         return { kind: "enum", name: def.name };
       }
 
+      // Bare namespace member used as a value (not a call) — only enums are handled above
+      if (
+        expr.object.kind === "Identifier" &&
+        activeNamespaces.has(expr.object.name) &&
+        !scope.has(expr.object.name)
+      ) {
+        diagnostics.error(
+          `Namespace member '${expr.object.name}.${expr.property.name}' cannot be used as a value`,
+          expr.span,
+          "E0407",
+        );
+        return null;
+      }
+
       const objectType = checkExpression(expr.object, scope, functions, structs, enums, diagnostics);
       if (!objectType) {
         return null;
       }
       if (isStructType(objectType)) {
-        const def = structs.get(objectType.name);
+        const def =
+          findStructByTypeName(structs, objectType.name) ??
+          findStructInNamespaces(objectType.name);
         if (!def) {
           diagnostics.error(`Unknown struct '${objectType.name}'`, expr.object.span, "E0104");
           return null;
@@ -1097,7 +1414,7 @@ function checkExpression(
         const field = def.fields.find((f) => f.name === expr.property.name);
         if (!field) {
           diagnostics.error(
-            `Unknown field '${expr.property.name}' on struct '${objectType.name}'`,
+            `Unknown field '${expr.property.name}' on struct '${def.decl.name.name}'`,
             expr.property.span,
             "E0324",
           );
@@ -1214,6 +1531,18 @@ function checkExpression(
     }
     case "CallExpression": {
       if (expr.callee.kind === "MemberExpression") {
+        const nsCall = checkNamespaceCall(
+          expr,
+          scope,
+          functions,
+          structs,
+          enums,
+          diagnostics,
+          allowVoidCall,
+        );
+        if (nsCall !== undefined) {
+          return nsCall;
+        }
         return checkMethodCall(expr, scope, functions, structs, enums, diagnostics, allowVoidCall);
       }
 

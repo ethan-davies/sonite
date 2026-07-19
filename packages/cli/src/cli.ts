@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Command } from "commander";
-import { compile, formatDiagnostics } from "@typescript-native/compiler";
+import { compileFile, formatDiagnostics } from "@typescript-native/compiler";
 
 const program = new Command();
 
@@ -19,7 +19,7 @@ program
   .argument("<input>", "path to a .tsn source file")
   .option("-o, --output <file>", "write LLVM IR to this file (default: <input>.ll)")
   .action((input: string, options: { output?: string }) => {
-    process.exitCode = compileFile(input, options.output);
+    process.exitCode = compileFileToIr(input, options.output);
   });
 
 program
@@ -51,17 +51,8 @@ interface CompiledSource {
 function readAndCompile(inputPath: string): CompiledSource | null {
   const absoluteInput = resolve(inputPath);
   const fileName = basename(absoluteInput);
-  let source: string;
 
-  try {
-    source = readFileSync(absoluteInput, "utf8");
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`error: failed to read '${inputPath}': ${message}`);
-    return null;
-  }
-
-  const result = compile(source, { fileName });
+  const result = compileFile(absoluteInput);
 
   if (!result.success || result.ir === null) {
     const formatted = formatDiagnostics(result.diagnostics, fileName);
@@ -76,7 +67,7 @@ function readAndCompile(inputPath: string): CompiledSource | null {
   return { ir: result.ir, fileName };
 }
 
-function compileFile(inputPath: string, outputPath?: string): number {
+function compileFileToIr(inputPath: string, outputPath?: string): number {
   const compiled = readAndCompile(inputPath);
   if (!compiled) {
     return 1;

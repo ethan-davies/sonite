@@ -1,0 +1,18 @@
+import "./types";
+
+function main(): void {
+  let p: types.Point = types.origin();
+  print(p.x);
+  print(p.y);
+
+  let d: types.Direction = types.Direction.Up;
+  if (d == types.Direction.Up) {
+    print("up");
+  }
+
+  let q = types.Point {
+    x: 1,
+    y: 2
+  };
+  print(q.x);
+}

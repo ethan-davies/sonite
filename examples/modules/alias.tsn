@@ -1,0 +1,6 @@
+import "math/vector" as v;
+
+function main(): void {
+  let result = v.add(5, 10);
+  print(result);
+}

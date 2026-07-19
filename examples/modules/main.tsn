@@ -1,0 +1,7 @@
+import "math";
+
+function main(): void {
+  let result = math.add(5, 10);
+  print(result);
+  print(math.mul(3, 4));
+}

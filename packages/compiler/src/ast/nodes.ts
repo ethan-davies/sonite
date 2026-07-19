@@ -27,6 +27,7 @@ export type BinaryOperator =
 
 export type AstNode =
   | Program
+  | ImportDeclaration
   | FunctionDeclaration
   | StructDeclaration
   | StructField
@@ -65,11 +66,22 @@ interface AstNodeBase {
   readonly span: SourceSpan;
 }
 
-export type TopLevelDeclaration = FunctionDeclaration | StructDeclaration | EnumDeclaration;
+export type TopLevelDeclaration =
+  | ImportDeclaration
+  | FunctionDeclaration
+  | StructDeclaration
+  | EnumDeclaration;
 
 export interface Program extends AstNodeBase {
   readonly kind: "Program";
   readonly body: TopLevelDeclaration[];
+}
+
+export interface ImportDeclaration extends AstNodeBase {
+  readonly kind: "ImportDeclaration";
+  readonly source: StringLiteral;
+  /** Namespace binding; null means use the resolved file basename. */
+  readonly alias: Identifier | null;
 }
 
 export type Statement =
@@ -93,6 +105,7 @@ export interface Parameter extends AstNodeBase {
 
 export interface FunctionDeclaration extends AstNodeBase {
   readonly kind: "FunctionDeclaration";
+  readonly exported: boolean;
   readonly name: Identifier;
   readonly params: Parameter[];
   readonly returnType: TypeAnnotation;
@@ -107,6 +120,7 @@ export interface StructField extends AstNodeBase {
 
 export interface StructDeclaration extends AstNodeBase {
   readonly kind: "StructDeclaration";
+  readonly exported: boolean;
   readonly name: Identifier;
   readonly fields: StructField[];
 }
@@ -118,6 +132,7 @@ export interface EnumVariant extends AstNodeBase {
 
 export interface EnumDeclaration extends AstNodeBase {
   readonly kind: "EnumDeclaration";
+  readonly exported: boolean;
   readonly name: Identifier;
   readonly variants: EnumVariant[];
 }
@@ -255,6 +270,8 @@ export interface StructFieldInit extends AstNodeBase {
 
 export interface StructLiteral extends AstNodeBase {
   readonly kind: "StructLiteral";
+  /** Import alias when written as `math.Point { ... }`; null for bare `Point { ... }`. */
+  readonly namespace: Identifier | null;
   readonly name: Identifier;
   readonly fields: StructFieldInit[];
 }
@@ -309,5 +326,7 @@ export interface ArrayType extends AstNodeBase {
 
 export interface NamedType extends AstNodeBase {
   readonly kind: "NamedType";
+  /** Import alias when written as `math.Point`; null for bare `Point`. */
+  readonly namespace: string | null;
   readonly name: string;
 }

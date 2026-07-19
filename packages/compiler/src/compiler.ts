@@ -3,6 +3,7 @@ import { LlvmCodegen } from "./codegen/llvm.js";
 import { DiagnosticCollector, type Diagnostic } from "./diagnostics/diagnostic.js";
 import { Lexer } from "./lexer/lexer.js";
 import { Parser } from "./parser/parser.js";
+import { typecheck } from "./typecheck.js";
 import { validate } from "./validate.js";
 
 export interface CompileOptions {
@@ -18,7 +19,7 @@ export interface CompileResult {
 }
 
 /**
- * Compile source text through lexer → parser → validate → LLVM IR.
+ * Compile source text through lexer → parser → validate → typecheck → LLVM IR.
  */
 export function compile(source: string, _options: CompileOptions = {}): CompileResult {
   const diagnostics = new DiagnosticCollector();
@@ -29,6 +30,10 @@ export function compile(source: string, _options: CompileOptions = {}): CompileR
 
   if (!diagnostics.hasErrors) {
     validate(ast, diagnostics);
+  }
+
+  if (!diagnostics.hasErrors) {
+    typecheck(ast, diagnostics);
   }
 
   if (diagnostics.hasErrors) {

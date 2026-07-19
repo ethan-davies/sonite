@@ -1,0 +1,19 @@
+function main(): void {
+  let x = 42;
+  const pi = 3.14;
+  let n: i64 = 100;
+  let ok = true;
+  let c: char = 'a';
+  let name = "world";
+
+  x = 10;
+
+  print(42);
+  print(x);
+  print(pi);
+  print(n);
+  print(ok);
+  print(c);
+  print("Hello " + name);
+  print("Hello", name);
+}

@@ -18,7 +18,7 @@ describe("Lexer", () => {
 
   it("tokenizes a hello-world program", () => {
     const { tokens, diagnostics } = lex(`
-      function main() {
+      function main(): void {
         print("Hello, world!");
       }
     `);
@@ -28,6 +28,8 @@ describe("Lexer", () => {
       TokenKind.Identifier,
       TokenKind.LParen,
       TokenKind.RParen,
+      TokenKind.Colon,
+      TokenKind.Identifier,
       TokenKind.LBrace,
       TokenKind.Identifier,
       TokenKind.LParen,
@@ -38,8 +40,44 @@ describe("Lexer", () => {
       TokenKind.Eof,
     ]);
     expect(tokens[1]?.lexeme).toBe("main");
-    expect(tokens[5]?.lexeme).toBe("print");
-    expect(tokens[7]?.value).toBe("Hello, world!");
+    expect(tokens[5]?.lexeme).toBe("void");
+    expect(tokens[7]?.lexeme).toBe("print");
+    expect(tokens[9]?.value).toBe("Hello, world!");
+  });
+
+  it("tokenizes numbers, keywords, and operators", () => {
+    const { tokens, diagnostics } = lex(`let x = 42; const pi = 3.14; true false + , : =`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens.map((t) => t.kind)).toEqual([
+      TokenKind.Let,
+      TokenKind.Identifier,
+      TokenKind.Equal,
+      TokenKind.Integer,
+      TokenKind.Semicolon,
+      TokenKind.Const,
+      TokenKind.Identifier,
+      TokenKind.Equal,
+      TokenKind.Float,
+      TokenKind.Semicolon,
+      TokenKind.True,
+      TokenKind.False,
+      TokenKind.Plus,
+      TokenKind.Comma,
+      TokenKind.Colon,
+      TokenKind.Equal,
+      TokenKind.Eof,
+    ]);
+    expect(tokens[3]?.lexeme).toBe("42");
+    expect(tokens[8]?.lexeme).toBe("3.14");
+  });
+
+  it("tokenizes char literals separately from strings", () => {
+    const { tokens, diagnostics } = lex(`'a' "b"`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens[0]?.kind).toBe(TokenKind.Char);
+    expect(tokens[0]?.value).toBe("a");
+    expect(tokens[1]?.kind).toBe(TokenKind.String);
+    expect(tokens[1]?.value).toBe("b");
   });
 
   it("decodes string escape sequences", () => {
@@ -52,7 +90,7 @@ describe("Lexer", () => {
   it("skips line and block comments", () => {
     const { tokens, diagnostics } = lex(`
       // line comment
-      function /* block */ main() {}
+      function /* block */ main(): void {}
     `);
     expect(diagnostics.hasErrors).toBe(false);
     expect(tokens.map((t) => t.kind)).toEqual([
@@ -60,6 +98,8 @@ describe("Lexer", () => {
       TokenKind.Identifier,
       TokenKind.LParen,
       TokenKind.RParen,
+      TokenKind.Colon,
+      TokenKind.Identifier,
       TokenKind.LBrace,
       TokenKind.RBrace,
       TokenKind.Eof,

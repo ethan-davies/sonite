@@ -2,7 +2,7 @@ import type { Program } from "./ast/nodes.js";
 import type { DiagnosticCollector } from "./diagnostics/diagnostic.js";
 
 /**
- * Semantic checks for the v0 language beyond pure grammar.
+ * Semantic checks for program shape beyond pure grammar.
  */
 export function validate(program: Program, diagnostics: DiagnosticCollector): void {
   if (program.body.length === 0) {
@@ -32,22 +32,11 @@ export function validate(program: Program, diagnostics: DiagnosticCollector): vo
     );
   }
 
-  for (const stmt of fn.body) {
-    const call = stmt.expression;
-    if (call.callee.name !== "print") {
-      diagnostics.error(
-        `Only 'print' calls are supported, found '${call.callee.name}'`,
-        call.callee.span,
-        "E0203",
-      );
-      continue;
-    }
-    if (call.args.length !== 1 || call.args[0]?.kind !== "StringLiteral") {
-      diagnostics.error(
-        "'print' requires exactly one string argument",
-        call.span,
-        "E0204",
-      );
-    }
+  if (fn.returnType.name !== "void") {
+    diagnostics.error(
+      `Entry function 'main' must return 'void', found '${fn.returnType.name}'`,
+      fn.returnType.span,
+      "E0205",
+    );
   }
 }

@@ -42,8 +42,16 @@ export class Lexer {
       return this.identifierOrKeyword(start);
     }
 
-    if (ch === '"' || ch === "'") {
-      return this.stringLiteral(ch, start);
+    if (isDigit(ch)) {
+      return this.numberLiteral(start);
+    }
+
+    if (ch === '"') {
+      return this.stringLiteral(start);
+    }
+
+    if (ch === "'") {
+      return this.charLiteral(start);
     }
 
     switch (ch) {
@@ -57,6 +65,14 @@ export class Lexer {
         return this.makeToken(TokenKind.RBrace, ch, start);
       case ";":
         return this.makeToken(TokenKind.Semicolon, ch, start);
+      case ":":
+        return this.makeToken(TokenKind.Colon, ch, start);
+      case ",":
+        return this.makeToken(TokenKind.Comma, ch, start);
+      case "+":
+        return this.makeToken(TokenKind.Plus, ch, start);
+      case "=":
+        return this.makeToken(TokenKind.Equal, ch, start);
     }
 
     this.diagnostics.error(`Unexpected character '${ch}'`, span(start, this.location()), "E0001");
@@ -73,10 +89,28 @@ export class Lexer {
     return this.makeToken(kind, lexeme, start);
   }
 
-  private stringLiteral(quote: string, start: SourceLocation): Token {
+  private numberLiteral(start: SourceLocation): Token {
+    while (!this.isAtEnd() && isDigit(this.peek())) {
+      this.advance();
+    }
+
+    if (this.peek() === "." && isDigit(this.peekNext())) {
+      this.advance(); // '.'
+      while (!this.isAtEnd() && isDigit(this.peek())) {
+        this.advance();
+      }
+      const lexeme = this.source.slice(start.offset, this.offset);
+      return this.makeToken(TokenKind.Float, lexeme, start);
+    }
+
+    const lexeme = this.source.slice(start.offset, this.offset);
+    return this.makeToken(TokenKind.Integer, lexeme, start);
+  }
+
+  private stringLiteral(start: SourceLocation): Token {
     let value = "";
 
-    while (!this.isAtEnd() && this.peek() !== quote) {
+    while (!this.isAtEnd() && this.peek() !== '"') {
       if (this.peek() === "\n") {
         this.line += 1;
         this.column = 0;
@@ -104,6 +138,55 @@ export class Lexer {
     this.advance(); // closing quote
     const lexeme = this.source.slice(start.offset, this.offset);
     return this.makeToken(TokenKind.String, lexeme, start, value);
+  }
+
+  private charLiteral(start: SourceLocation): Token {
+    if (this.isAtEnd()) {
+      this.diagnostics.error("Unterminated character literal", span(start, this.location()), "E0002");
+      return this.makeToken(TokenKind.Invalid, "'", start);
+    }
+
+    let value = "";
+    if (this.peek() === "\\") {
+      this.advance();
+      if (this.isAtEnd()) {
+        this.diagnostics.error("Unterminated character literal", span(start, this.location()), "E0002");
+        const lexeme = this.source.slice(start.offset, this.offset);
+        return this.makeToken(TokenKind.Invalid, lexeme, start);
+      }
+      value = decodeEscape(this.advance());
+    } else if (this.peek() === "'") {
+      this.diagnostics.error("Empty character literal", span(start, this.location()), "E0003");
+      this.advance();
+      const lexeme = this.source.slice(start.offset, this.offset);
+      return this.makeToken(TokenKind.Invalid, lexeme, start);
+    } else if (this.peek() === "\n") {
+      this.diagnostics.error("Unterminated character literal", span(start, this.location()), "E0002");
+      const lexeme = this.source.slice(start.offset, this.offset);
+      return this.makeToken(TokenKind.Invalid, lexeme, start);
+    } else {
+      value = this.advance();
+    }
+
+    if (this.isAtEnd() || this.peek() !== "'") {
+      this.diagnostics.error(
+        "Character literal must contain exactly one character",
+        span(start, this.location()),
+        "E0003",
+      );
+      while (!this.isAtEnd() && this.peek() !== "'" && this.peek() !== "\n") {
+        this.advance();
+      }
+      if (this.peek() === "'") {
+        this.advance();
+      }
+      const lexeme = this.source.slice(start.offset, this.offset);
+      return this.makeToken(TokenKind.Invalid, lexeme, start);
+    }
+
+    this.advance(); // closing quote
+    const lexeme = this.source.slice(start.offset, this.offset);
+    return this.makeToken(TokenKind.Char, lexeme, start, value);
   }
 
   private skipTrivia(): void {

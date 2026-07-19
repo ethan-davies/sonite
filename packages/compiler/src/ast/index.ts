@@ -11,6 +11,7 @@ export type {
   FloatLiteral,
   FunctionDeclaration,
   Identifier,
+  IfStatement,
   IntegerLiteral,
   Parameter,
   PrimitiveTypeName,

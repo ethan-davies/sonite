@@ -239,4 +239,65 @@ describe("Parser", () => {
       expect(stmt.value).toBeNull();
     }
   });
+
+  it("parses comparison and logical precedence", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        print(1 < 2 == true && false || !true);
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const stmt = ast.body[0]?.body[0];
+    expect(stmt?.kind).toBe("ExpressionStatement");
+    if (stmt?.kind !== "ExpressionStatement" || stmt.expression.kind !== "CallExpression") {
+      return;
+    }
+    const expr = stmt.expression.args[0];
+    expect(expr?.kind).toBe("BinaryExpression");
+    if (expr?.kind !== "BinaryExpression") {
+      return;
+    }
+    // || is lowest: (1 < 2 == true && false) || !true
+    expect(expr.operator).toBe("||");
+    expect(expr.left.kind).toBe("BinaryExpression");
+    if (expr.left.kind === "BinaryExpression") {
+      expect(expr.left.operator).toBe("&&");
+    }
+    expect(expr.right.kind).toBe("UnaryExpression");
+    if (expr.right.kind === "UnaryExpression") {
+      expect(expr.right.operator).toBe("!");
+    }
+  });
+
+  it("parses if / elseif / else chains", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        let age = 16;
+        if (age >= 18) {
+          print("Adult");
+        } elseif (age >= 13) {
+          print("Teen");
+        } else {
+          print("Minor");
+        }
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const stmt = ast.body[0]?.body[1];
+    expect(stmt?.kind).toBe("IfStatement");
+    if (stmt?.kind !== "IfStatement") {
+      return;
+    }
+    expect(stmt.condition.kind).toBe("BinaryExpression");
+    if (stmt.condition.kind === "BinaryExpression") {
+      expect(stmt.condition.operator).toBe(">=");
+    }
+    expect(stmt.consequent).toHaveLength(1);
+    expect(stmt.alternate).not.toBeNull();
+    expect(!Array.isArray(stmt.alternate) && stmt.alternate?.kind === "IfStatement").toBe(true);
+    if (!Array.isArray(stmt.alternate) && stmt.alternate?.kind === "IfStatement") {
+      expect(stmt.alternate.alternate).toHaveLength(1);
+      expect(Array.isArray(stmt.alternate.alternate)).toBe(true);
+    }
+  });
 });

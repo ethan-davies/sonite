@@ -1,0 +1,15 @@
+function main(): void {
+  let age = 16;
+
+  if (age >= 18) {
+    print("Adult");
+  } elseif (age >= 13) {
+    print("Teen");
+  } else {
+    print("Minor");
+  }
+
+  print(5 > 2);
+  print(!true == false);
+  print(true && false || true);
+}

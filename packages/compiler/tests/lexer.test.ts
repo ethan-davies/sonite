@@ -78,6 +78,38 @@ describe("Lexer", () => {
     expect(tokens[8]?.lexeme).toBe("3.14");
   });
 
+  it("tokenizes comparison, logical, and if keywords", () => {
+    const { tokens, diagnostics } = lex(
+      `== != < > <= >= && || ! if else elseif`,
+    );
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens.map((t) => t.kind)).toEqual([
+      TokenKind.EqualEqual,
+      TokenKind.BangEqual,
+      TokenKind.Less,
+      TokenKind.Greater,
+      TokenKind.LessEqual,
+      TokenKind.GreaterEqual,
+      TokenKind.AmpAmp,
+      TokenKind.PipePipe,
+      TokenKind.Bang,
+      TokenKind.If,
+      TokenKind.Else,
+      TokenKind.ElseIf,
+      TokenKind.Eof,
+    ]);
+  });
+
+  it("rejects single & and |", () => {
+    const amp = lex("&");
+    expect(amp.diagnostics.hasErrors).toBe(true);
+    expect(amp.diagnostics.diagnostics[0]?.code).toBe("E0001");
+
+    const pipe = lex("|");
+    expect(pipe.diagnostics.hasErrors).toBe(true);
+    expect(pipe.diagnostics.diagnostics[0]?.code).toBe("E0001");
+  });
+
   it("tokenizes identifiers with underscores", () => {
     const { tokens, diagnostics } = lex(`_foo bar_baz`);
     expect(diagnostics.hasErrors).toBe(false);

@@ -191,8 +191,55 @@ describe("compile pipeline", () => {
       expect(result.ir).toContain("add i64");
     });
 
-    it("compiles the hello, variables, and arithmetic examples", () => {
-      for (const name of ["hello.tsn", "variables.tsn", "arithmetic.tsn"]) {
+    it("compiles comparisons, logical ops, and boolean print", () => {
+      const result = compile(`
+        function main(): void {
+          print(5 > 2);
+          print(1 == 1);
+          print(1.5 < 2.0);
+          print(!true);
+          print(true && false);
+          print(true || false);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("icmp sgt i32");
+      expect(result.ir).toContain("icmp eq i32");
+      expect(result.ir).toContain("fcmp olt double");
+      expect(result.ir).toContain("xor i1");
+      expect(result.ir).toContain("and i1");
+      expect(result.ir).toContain("or i1");
+      expect(result.ir).toContain(encodeLlvmString("true"));
+      expect(result.ir).toContain(encodeLlvmString("false"));
+      expect(result.ir).toContain("select i1");
+    });
+
+    it("compiles if / elseif / else branches", () => {
+      const result = compile(`
+        function main(): void {
+          let age = 16;
+          if (age >= 18) {
+            print("Adult");
+          } elseif (age >= 13) {
+            print("Teen");
+          } else {
+            print("Minor");
+          }
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("icmp sge i32");
+      expect(result.ir).toContain("br i1");
+      expect(result.ir).toContain("then.0:");
+      expect(result.ir).toContain("else.0:");
+      expect(result.ir).toContain("merge.0:");
+      expect(result.ir).toContain(encodeLlvmString("Adult"));
+      expect(result.ir).toContain(encodeLlvmString("Teen"));
+      expect(result.ir).toContain(encodeLlvmString("Minor"));
+    });
+
+    it("compiles the hello, variables, arithmetic, and control-flow examples", () => {
+      for (const name of ["hello.tsn", "variables.tsn", "arithmetic.tsn", "control-flow.tsn"]) {
         const source = readFileSync(join(examplesDir, name), "utf8");
         const result = compile(source);
         expect(result.success, name).toBe(true);
@@ -449,6 +496,38 @@ describe("compile pipeline", () => {
       `);
       expect(result.success).toBe(false);
       expect(result.diagnostics.some((d) => d.code === "E0303")).toBe(true);
+    });
+
+    it("fails when if condition is not bool", () => {
+      const result = compile(`
+        function main(): void {
+          if (1) {
+            print("x");
+          }
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0316")).toBe(true);
+    });
+
+    it("fails on mismatched comparison operands", () => {
+      const result = compile(`
+        function main(): void {
+          print(1 > true);
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0306")).toBe(true);
+    });
+
+    it("fails on non-bool logical operands", () => {
+      const result = compile(`
+        function main(): void {
+          print(1 && true);
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0306")).toBe(true);
     });
   });
 });

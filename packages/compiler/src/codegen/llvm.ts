@@ -4,6 +4,7 @@ import type {
   CallExpression,
   Expression,
   FunctionDeclaration,
+  IfStatement,
   Parameter,
   Program,
   ReturnStatement,
@@ -29,12 +30,16 @@ interface FunctionSig {
   readonly returnType: ValueType | "void";
 }
 
+const COMPARISON_OPS = new Set(["==", "!=", "<", "<=", ">", ">="]);
+const LOGICAL_OPS = new Set(["&&", "||"]);
+
 /**
  * Lowers a validated, type-checked AST to LLVM IR text.
  */
 export class LlvmCodegen {
   private stringCounter = 0;
   private tempCounter = 0;
+  private labelCounter = 0;
   private readonly stringGlobals = new Map<string, { name: string; length: number }>();
   private locals = new Map<string, LocalBinding>();
   private functions = new Map<string, FunctionSig>();
@@ -45,6 +50,7 @@ export class LlvmCodegen {
   emit(program: Program): string {
     this.stringCounter = 0;
     this.tempCounter = 0;
+    this.labelCounter = 0;
     this.stringGlobals.clear();
     this.locals = new Map();
     this.functions.clear();
@@ -165,7 +171,59 @@ export class LlvmCodegen {
       case "ReturnStatement":
         this.emitReturn(stmt, lines);
         return true;
+      case "IfStatement":
+        return this.emitIfStatement(stmt, lines);
     }
+  }
+
+  private emitIfStatement(stmt: IfStatement, lines: string[]): boolean {
+    const id = this.labelCounter;
+    this.labelCounter += 1;
+    const thenLabel = `then.${id}`;
+    const elseLabel = `else.${id}`;
+    const mergeLabel = `merge.${id}`;
+
+    const cond = this.emitExpression(stmt.condition, lines);
+    const hasElse = stmt.alternate !== null;
+    lines.push(
+      `  br i1 ${cond.llvm}, label %${thenLabel}, label %${hasElse ? elseLabel : mergeLabel}`,
+    );
+
+    lines.push(`${thenLabel}:`);
+    let thenTerminated = false;
+    for (const s of stmt.consequent) {
+      if (thenTerminated) {
+        break;
+      }
+      thenTerminated = this.emitStatement(s, lines);
+    }
+    if (!thenTerminated) {
+      lines.push(`  br label %${mergeLabel}`);
+    }
+
+    let elseTerminated = false;
+    if (hasElse) {
+      lines.push(`${elseLabel}:`);
+      if (Array.isArray(stmt.alternate)) {
+        for (const s of stmt.alternate) {
+          if (elseTerminated) {
+            break;
+          }
+          elseTerminated = this.emitStatement(s, lines);
+        }
+      } else if (stmt.alternate) {
+        elseTerminated = this.emitIfStatement(stmt.alternate, lines);
+      }
+      if (!elseTerminated) {
+        lines.push(`  br label %${mergeLabel}`);
+      }
+    }
+
+    const bothTerminated = thenTerminated && elseTerminated && hasElse;
+    if (!bothTerminated) {
+      lines.push(`${mergeLabel}:`);
+    }
+    return bothTerminated;
   }
 
   private emitVariableDeclaration(stmt: VariableDeclaration, lines: string[]): void {
@@ -232,8 +290,14 @@ export class LlvmCodegen {
         return local.type;
       }
       case "UnaryExpression":
+        if (expr.operator === "!") {
+          return "bool";
+        }
         return this.inferExpressionType(expr.operand);
       case "BinaryExpression": {
+        if (COMPARISON_OPS.has(expr.operator) || LOGICAL_OPS.has(expr.operator)) {
+          return "bool";
+        }
         if (expr.operator === "+") {
           const left = this.inferExpressionType(expr.left);
           if (left === "string") {
@@ -297,8 +361,12 @@ export class LlvmCodegen {
 
   private emitUnary(expr: UnaryExpression, lines: string[]): EmittedValue {
     const operand = this.emitExpression(expr.operand, lines);
-    const llvmType = toLlvmType(operand.type);
     const tmp = this.nextTemp();
+    if (expr.operator === "!") {
+      lines.push(`  ${tmp} = xor i1 ${operand.llvm}, true`);
+      return { llvm: tmp, type: "bool" };
+    }
+    const llvmType = toLlvmType(operand.type);
     if (operand.type === "f32" || operand.type === "f64") {
       lines.push(`  ${tmp} = fneg ${llvmType} ${operand.llvm}`);
     } else {
@@ -319,8 +387,25 @@ export class LlvmCodegen {
     const right = this.emitExpression(expr.right, lines, left.type);
     const llvmType = toLlvmType(left.type);
     const tmp = this.nextTemp();
-    const isFloat = left.type === "f32" || left.type === "f64";
 
+    if (expr.operator === "&&") {
+      lines.push(`  ${tmp} = and i1 ${left.llvm}, ${right.llvm}`);
+      return { llvm: tmp, type: "bool" };
+    }
+    if (expr.operator === "||") {
+      lines.push(`  ${tmp} = or i1 ${left.llvm}, ${right.llvm}`);
+      return { llvm: tmp, type: "bool" };
+    }
+
+    if (COMPARISON_OPS.has(expr.operator)) {
+      const pred = comparisonPredicate(expr.operator, left.type);
+      const isFloat = left.type === "f32" || left.type === "f64";
+      const cmp = isFloat ? "fcmp" : "icmp";
+      lines.push(`  ${tmp} = ${cmp} ${pred} ${llvmType} ${left.llvm}, ${right.llvm}`);
+      return { llvm: tmp, type: "bool" };
+    }
+
+    const isFloat = left.type === "f32" || left.type === "f64";
     let opcode: string;
     switch (expr.operator) {
       case "+":
@@ -338,6 +423,8 @@ export class LlvmCodegen {
       case "%":
         opcode = isFloat ? "frem" : "srem";
         break;
+      default:
+        throw new Error(`Codegen: unexpected arithmetic operator '${expr.operator}'`);
     }
 
     lines.push(`  ${tmp} = ${opcode} ${llvmType} ${left.llvm}, ${right.llvm}`);
@@ -495,6 +582,26 @@ export class LlvmCodegen {
       );
     }
     return lines;
+  }
+}
+
+function comparisonPredicate(operator: string, type: ValueType): string {
+  const isFloat = type === "f32" || type === "f64";
+  switch (operator) {
+    case "==":
+      return isFloat ? "oeq" : "eq";
+    case "!=":
+      return isFloat ? "one" : "ne";
+    case "<":
+      return isFloat ? "olt" : "slt";
+    case "<=":
+      return isFloat ? "ole" : "sle";
+    case ">":
+      return isFloat ? "ogt" : "sgt";
+    case ">=":
+      return isFloat ? "oge" : "sge";
+    default:
+      throw new Error(`Codegen: unexpected comparison '${operator}'`);
   }
 }
 

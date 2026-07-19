@@ -5,7 +5,7 @@ import type {
   Program,
   Statement,
 } from "./ast/nodes.js";
-import type { DiagnosticCollector } from "./diagnostics/diagnostic.js";
+import type { DiagnosticCollector, SourceSpan } from "./diagnostics/diagnostic.js";
 
 export type ValueType = Exclude<PrimitiveTypeName, "void">;
 
@@ -234,6 +234,30 @@ function checkStatement(
       }
       return;
     }
+    case "IfStatement": {
+      const condType = checkExpression(stmt.condition, scope, functions, diagnostics);
+      if (condType && condType !== "bool") {
+        diagnostics.error(
+          `If condition must be 'bool', got '${condType}'`,
+          stmt.condition.span,
+          "E0316",
+        );
+      }
+      for (const s of stmt.consequent) {
+        checkStatement(s, scope, functions, returnType, diagnostics);
+      }
+      if (stmt.alternate === null) {
+        return;
+      }
+      if (Array.isArray(stmt.alternate)) {
+        for (const s of stmt.alternate) {
+          checkStatement(s, scope, functions, returnType, diagnostics);
+        }
+      } else {
+        checkStatement(stmt.alternate, scope, functions, returnType, diagnostics);
+      }
+      return;
+    }
   }
 }
 
@@ -268,6 +292,17 @@ function checkExpression(
       if (!operand) {
         return null;
       }
+      if (expr.operator === "!") {
+        if (operand !== "bool") {
+          diagnostics.error(
+            `Operator '!' requires a bool operand, got '${operand}'`,
+            expr.span,
+            "E0306",
+          );
+          return null;
+        }
+        return "bool";
+      }
       if (!NUMERIC_TYPES.has(operand)) {
         diagnostics.error(
           `Operator '-' requires a numeric operand, got '${operand}'`,
@@ -283,6 +318,29 @@ function checkExpression(
       const right = checkExpression(expr.right, scope, functions, diagnostics);
       if (!left || !right) {
         return null;
+      }
+
+      if (expr.operator === "&&" || expr.operator === "||") {
+        if (left !== "bool" || right !== "bool") {
+          diagnostics.error(
+            `Operator '${expr.operator}' requires two bool operands, got '${left}' and '${right}'`,
+            expr.span,
+            "E0306",
+          );
+          return null;
+        }
+        return "bool";
+      }
+
+      if (
+        expr.operator === "==" ||
+        expr.operator === "!=" ||
+        expr.operator === "<" ||
+        expr.operator === "<=" ||
+        expr.operator === ">" ||
+        expr.operator === ">="
+      ) {
+        return checkComparison(expr.operator, left, right, expr.span, diagnostics);
       }
 
       if (expr.operator === "+") {
@@ -388,6 +446,46 @@ function initializerMatchesAnnotation(
   annotated: ValueType,
 ): boolean {
   return valueMatchesBinding(initializer, inferred, annotated);
+}
+
+function checkComparison(
+  operator: "==" | "!=" | "<" | "<=" | ">" | ">=",
+  left: ValueType,
+  right: ValueType,
+  span: SourceSpan,
+  diagnostics: DiagnosticCollector,
+): ValueType | null {
+  if (left !== right) {
+    diagnostics.error(
+      `Operator '${operator}' requires matching operand types, got '${left}' and '${right}'`,
+      span,
+      "E0306",
+    );
+    return null;
+  }
+
+  const isEquality = operator === "==" || operator === "!=";
+  if (isEquality) {
+    if (NUMERIC_TYPES.has(left) || left === "bool" || left === "char") {
+      return "bool";
+    }
+    diagnostics.error(
+      `Operator '${operator}' is not supported for type '${left}'`,
+      span,
+      "E0306",
+    );
+    return null;
+  }
+
+  if (!NUMERIC_TYPES.has(left)) {
+    diagnostics.error(
+      `Operator '${operator}' requires two matching numeric operands, got '${left}' and '${right}'`,
+      span,
+      "E0306",
+    );
+    return null;
+  }
+  return "bool";
 }
 
 function valueMatchesBinding(

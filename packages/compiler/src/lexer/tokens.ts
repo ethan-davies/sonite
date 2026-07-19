@@ -13,6 +13,9 @@ export enum TokenKind {
   Return = "return",
   True = "true",
   False = "false",
+  If = "if",
+  Else = "else",
+  ElseIf = "elseif",
 
   LParen = "(",
   RParen = ")",
@@ -27,6 +30,15 @@ export enum TokenKind {
   Slash = "/",
   Percent = "%",
   Equal = "=",
+  EqualEqual = "==",
+  Bang = "!",
+  BangEqual = "!=",
+  Less = "<",
+  LessEqual = "<=",
+  Greater = ">",
+  GreaterEqual = ">=",
+  AmpAmp = "&&",
+  PipePipe = "||",
 
   Eof = "Eof",
   Invalid = "Invalid",
@@ -47,4 +59,7 @@ export const KEYWORDS: ReadonlyMap<string, TokenKind> = new Map([
   ["return", TokenKind.Return],
   ["true", TokenKind.True],
   ["false", TokenKind.False],
+  ["if", TokenKind.If],
+  ["else", TokenKind.Else],
+  ["elseif", TokenKind.ElseIf],
 ]);

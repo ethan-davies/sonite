@@ -10,7 +10,20 @@ export type PrimitiveTypeName =
   | "char"
   | "void";
 
-export type BinaryOperator = "+" | "-" | "*" | "/" | "%";
+export type BinaryOperator =
+  | "+"
+  | "-"
+  | "*"
+  | "/"
+  | "%"
+  | "=="
+  | "!="
+  | "<"
+  | "<="
+  | ">"
+  | ">="
+  | "&&"
+  | "||";
 
 export type AstNode =
   | Program
@@ -20,6 +33,7 @@ export type AstNode =
   | AssignmentStatement
   | ExpressionStatement
   | ReturnStatement
+  | IfStatement
   | CallExpression
   | BinaryExpression
   | UnaryExpression
@@ -45,7 +59,8 @@ export type Statement =
   | VariableDeclaration
   | AssignmentStatement
   | ExpressionStatement
-  | ReturnStatement;
+  | ReturnStatement
+  | IfStatement;
 
 export interface Parameter extends AstNodeBase {
   readonly kind: "Parameter";
@@ -85,6 +100,14 @@ export interface ReturnStatement extends AstNodeBase {
   readonly value: Expression | null;
 }
 
+export interface IfStatement extends AstNodeBase {
+  readonly kind: "IfStatement";
+  readonly condition: Expression;
+  readonly consequent: Statement[];
+  /** elseif → nested IfStatement; else { } → Statement[]; bare if → null */
+  readonly alternate: IfStatement | Statement[] | null;
+}
+
 export type Expression =
   | CallExpression
   | BinaryExpression
@@ -111,7 +134,7 @@ export interface BinaryExpression extends AstNodeBase {
 
 export interface UnaryExpression extends AstNodeBase {
   readonly kind: "UnaryExpression";
-  readonly operator: "-";
+  readonly operator: "-" | "!";
   readonly operand: Expression;
 }
 

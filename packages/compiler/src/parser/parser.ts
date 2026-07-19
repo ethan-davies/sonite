@@ -10,6 +10,7 @@ import type {
   FloatLiteral,
   FunctionDeclaration,
   Identifier,
+  IfStatement,
   IntegerLiteral,
   Parameter,
   PrimitiveTypeName,
@@ -39,18 +40,26 @@ const PRIMITIVE_TYPES = new Set<string>([
  * Recursive-descent parser:
  *
  *   program      = functionDecl*
- *   functionDecl = "function" Ident "(" params? ")" ":" type "{" statement* "}"
+ *   functionDecl = "function" Ident "(" params? ")" ":" type block
  *   params       = param ("," param)*
  *   param        = Ident ":" type
- *   statement    = varDecl | assignment | returnStmt | exprStmt
+ *   statement    = varDecl | assignment | returnStmt | ifStmt | exprStmt
  *   varDecl      = ("let"|"const") Ident (":" type)? "=" expression ";"
  *   assignment   = Ident "=" expression ";"
  *   returnStmt   = "return" expression? ";"
+ *   ifStmt       = "if" "(" expression ")" block
+ *                  ("elseif" "(" expression ")" block)*
+ *                  ("else" block)?
+ *   block        = "{" statement* "}"
  *   exprStmt     = callExpr ";"
- *   expression   = additive
+ *   expression   = or
+ *   or           = and ("||" and)*
+ *   and          = equality ("&&" equality)*
+ *   equality     = relational (("==" | "!=") relational)*
+ *   relational   = additive (("<" | "<=" | ">" | ">=") additive)*
  *   additive     = multiplicative (("+" | "-") multiplicative)*
  *   multiplicative = unary (("*" | "/" | "%") unary)*
- *   unary        = "-" unary | primary
+ *   unary        = ("-" | "!") unary | primary
  *   primary      = "(" expression ")" | literal | Ident | callExpr
  *   callExpr     = Ident "(" (expression ("," expression)*)? ")"
  *   type         = Ident
@@ -133,31 +142,19 @@ export class Parser {
       return null;
     }
 
-    if (!this.expect(TokenKind.LBrace, "Expected '{' before function body")) {
+    const body = this.parseBlock();
+    if (!body) {
       this.synchronizeToTopLevel();
       return null;
     }
-
-    const body: Statement[] = [];
-    while (!this.check(TokenKind.RBrace) && !this.isAtEnd()) {
-      const stmt = this.parseStatement();
-      if (stmt) {
-        body.push(stmt);
-      } else {
-        this.synchronizeStatement();
-      }
-    }
-
-    const rbrace = this.expect(TokenKind.RBrace, "Expected '}' after function body");
-    const end = rbrace?.span.end ?? this.peek().span.end;
 
     return {
       kind: "FunctionDeclaration",
       name,
       params,
       returnType,
-      body,
-      span: { start, end },
+      body: body.statements,
+      span: { start, end: body.end },
     };
   }
 
@@ -224,11 +221,138 @@ export class Parser {
       return this.parseReturnStatement();
     }
 
+    if (this.check(TokenKind.If)) {
+      return this.parseIfStatement();
+    }
+
     if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.Equal)) {
       return this.parseAssignment();
     }
 
     return this.parseExpressionStatement();
+  }
+
+  private parseBlock(): { statements: Statement[]; end: { line: number; column: number; offset: number } } | null {
+    if (!this.expect(TokenKind.LBrace, "Expected '{'")) {
+      return null;
+    }
+
+    const statements: Statement[] = [];
+    while (!this.check(TokenKind.RBrace) && !this.isAtEnd()) {
+      const stmt = this.parseStatement();
+      if (stmt) {
+        statements.push(stmt);
+      } else {
+        this.synchronizeStatement();
+      }
+    }
+
+    const rbrace = this.expect(TokenKind.RBrace, "Expected '}'");
+    const end = rbrace?.span.end ?? this.peek().span.end;
+    return { statements, end };
+  }
+
+  private parseIfStatement(): IfStatement | null {
+    const start = this.peek().span.start;
+    this.advance(); // if
+
+    if (!this.expect(TokenKind.LParen, "Expected '(' after 'if'")) {
+      return null;
+    }
+
+    const condition = this.parseExpression();
+    if (!condition) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after if condition")) {
+      return null;
+    }
+
+    const consequentBlock = this.parseBlock();
+    if (!consequentBlock) {
+      return null;
+    }
+
+    let alternate: IfStatement | Statement[] | null = null;
+    let end = consequentBlock.end;
+
+    if (this.check(TokenKind.ElseIf)) {
+      const elseif = this.parseElseIfChain();
+      if (!elseif) {
+        return null;
+      }
+      alternate = elseif;
+      end = elseif.span.end;
+    } else if (this.check(TokenKind.Else)) {
+      this.advance();
+      const elseBlock = this.parseBlock();
+      if (!elseBlock) {
+        return null;
+      }
+      alternate = elseBlock.statements;
+      end = elseBlock.end;
+    }
+
+    return {
+      kind: "IfStatement",
+      condition,
+      consequent: consequentBlock.statements,
+      alternate,
+      span: { start, end },
+    };
+  }
+
+  /** Parse `elseif (cond) { ... }` as an IfStatement, chaining further elseif/else. */
+  private parseElseIfChain(): IfStatement | null {
+    const start = this.peek().span.start;
+    this.advance(); // elseif
+
+    if (!this.expect(TokenKind.LParen, "Expected '(' after 'elseif'")) {
+      return null;
+    }
+
+    const condition = this.parseExpression();
+    if (!condition) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after elseif condition")) {
+      return null;
+    }
+
+    const consequentBlock = this.parseBlock();
+    if (!consequentBlock) {
+      return null;
+    }
+
+    let alternate: IfStatement | Statement[] | null = null;
+    let end = consequentBlock.end;
+
+    if (this.check(TokenKind.ElseIf)) {
+      const nested = this.parseElseIfChain();
+      if (!nested) {
+        return null;
+      }
+      alternate = nested;
+      end = nested.span.end;
+    } else if (this.check(TokenKind.Else)) {
+      this.advance();
+      const elseBlock = this.parseBlock();
+      if (!elseBlock) {
+        return null;
+      }
+      alternate = elseBlock.statements;
+      end = elseBlock.end;
+    }
+
+    return {
+      kind: "IfStatement",
+      condition,
+      consequent: consequentBlock.statements,
+      alternate,
+      span: { start, end },
+    };
   }
 
   private parseVariableDeclaration(): VariableDeclaration | null {
@@ -362,7 +486,112 @@ export class Parser {
   }
 
   private parseExpression(): Expression | null {
-    return this.parseAdditive();
+    return this.parseOr();
+  }
+
+  private parseOr(): Expression | null {
+    let left = this.parseAnd();
+    if (!left) {
+      return null;
+    }
+
+    while (this.check(TokenKind.PipePipe)) {
+      const opToken = this.advance();
+      const right = this.parseAnd();
+      if (!right) {
+        return null;
+      }
+      const binary: BinaryExpression = {
+        kind: "BinaryExpression",
+        operator: opToken.lexeme as BinaryOperator,
+        left,
+        right,
+        span: { start: left.span.start, end: right.span.end },
+      };
+      left = binary;
+    }
+
+    return left;
+  }
+
+  private parseAnd(): Expression | null {
+    let left = this.parseEquality();
+    if (!left) {
+      return null;
+    }
+
+    while (this.check(TokenKind.AmpAmp)) {
+      const opToken = this.advance();
+      const right = this.parseEquality();
+      if (!right) {
+        return null;
+      }
+      const binary: BinaryExpression = {
+        kind: "BinaryExpression",
+        operator: opToken.lexeme as BinaryOperator,
+        left,
+        right,
+        span: { start: left.span.start, end: right.span.end },
+      };
+      left = binary;
+    }
+
+    return left;
+  }
+
+  private parseEquality(): Expression | null {
+    let left = this.parseRelational();
+    if (!left) {
+      return null;
+    }
+
+    while (this.check(TokenKind.EqualEqual) || this.check(TokenKind.BangEqual)) {
+      const opToken = this.advance();
+      const right = this.parseRelational();
+      if (!right) {
+        return null;
+      }
+      const binary: BinaryExpression = {
+        kind: "BinaryExpression",
+        operator: opToken.lexeme as BinaryOperator,
+        left,
+        right,
+        span: { start: left.span.start, end: right.span.end },
+      };
+      left = binary;
+    }
+
+    return left;
+  }
+
+  private parseRelational(): Expression | null {
+    let left = this.parseAdditive();
+    if (!left) {
+      return null;
+    }
+
+    while (
+      this.check(TokenKind.Less) ||
+      this.check(TokenKind.LessEqual) ||
+      this.check(TokenKind.Greater) ||
+      this.check(TokenKind.GreaterEqual)
+    ) {
+      const opToken = this.advance();
+      const right = this.parseAdditive();
+      if (!right) {
+        return null;
+      }
+      const binary: BinaryExpression = {
+        kind: "BinaryExpression",
+        operator: opToken.lexeme as BinaryOperator,
+        left,
+        right,
+        span: { start: left.span.start, end: right.span.end },
+      };
+      left = binary;
+    }
+
+    return left;
   }
 
   private parseAdditive(): Expression | null {
@@ -422,7 +651,7 @@ export class Parser {
   }
 
   private parseUnary(): Expression | null {
-    if (this.check(TokenKind.Minus)) {
+    if (this.check(TokenKind.Minus) || this.check(TokenKind.Bang)) {
       const opToken = this.advance();
       const operand = this.parseUnary();
       if (!operand) {
@@ -430,7 +659,7 @@ export class Parser {
       }
       const unary: UnaryExpression = {
         kind: "UnaryExpression",
-        operator: "-",
+        operator: opToken.lexeme as "-" | "!",
         operand,
         span: { start: opToken.span.start, end: operand.span.end },
       };

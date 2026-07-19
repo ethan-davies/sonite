@@ -80,7 +80,41 @@ export class Lexer {
       case "%":
         return this.makeToken(TokenKind.Percent, ch, start);
       case "=":
+        if (this.peek() === "=") {
+          this.advance();
+          return this.makeToken(TokenKind.EqualEqual, "==", start);
+        }
         return this.makeToken(TokenKind.Equal, ch, start);
+      case "!":
+        if (this.peek() === "=") {
+          this.advance();
+          return this.makeToken(TokenKind.BangEqual, "!=", start);
+        }
+        return this.makeToken(TokenKind.Bang, ch, start);
+      case "<":
+        if (this.peek() === "=") {
+          this.advance();
+          return this.makeToken(TokenKind.LessEqual, "<=", start);
+        }
+        return this.makeToken(TokenKind.Less, ch, start);
+      case ">":
+        if (this.peek() === "=") {
+          this.advance();
+          return this.makeToken(TokenKind.GreaterEqual, ">=", start);
+        }
+        return this.makeToken(TokenKind.Greater, ch, start);
+      case "&":
+        if (this.peek() === "&") {
+          this.advance();
+          return this.makeToken(TokenKind.AmpAmp, "&&", start);
+        }
+        break;
+      case "|":
+        if (this.peek() === "|") {
+          this.advance();
+          return this.makeToken(TokenKind.PipePipe, "||", start);
+        }
+        break;
     }
 
     this.diagnostics.error(`Unexpected character '${ch}'`, span(start, this.location()), "E0001");

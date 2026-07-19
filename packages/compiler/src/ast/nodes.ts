@@ -10,14 +10,19 @@ export type PrimitiveTypeName =
   | "char"
   | "void";
 
+export type BinaryOperator = "+" | "-" | "*" | "/" | "%";
+
 export type AstNode =
   | Program
   | FunctionDeclaration
+  | Parameter
   | VariableDeclaration
   | AssignmentStatement
   | ExpressionStatement
+  | ReturnStatement
   | CallExpression
   | BinaryExpression
+  | UnaryExpression
   | Identifier
   | StringLiteral
   | IntegerLiteral
@@ -36,11 +41,22 @@ export interface Program extends AstNodeBase {
   readonly body: FunctionDeclaration[];
 }
 
-export type Statement = VariableDeclaration | AssignmentStatement | ExpressionStatement;
+export type Statement =
+  | VariableDeclaration
+  | AssignmentStatement
+  | ExpressionStatement
+  | ReturnStatement;
+
+export interface Parameter extends AstNodeBase {
+  readonly kind: "Parameter";
+  readonly name: Identifier;
+  readonly typeAnnotation: TypeAnnotation;
+}
 
 export interface FunctionDeclaration extends AstNodeBase {
   readonly kind: "FunctionDeclaration";
   readonly name: Identifier;
+  readonly params: Parameter[];
   readonly returnType: TypeAnnotation;
   readonly body: Statement[];
 }
@@ -64,9 +80,15 @@ export interface ExpressionStatement extends AstNodeBase {
   readonly expression: Expression;
 }
 
+export interface ReturnStatement extends AstNodeBase {
+  readonly kind: "ReturnStatement";
+  readonly value: Expression | null;
+}
+
 export type Expression =
   | CallExpression
   | BinaryExpression
+  | UnaryExpression
   | Identifier
   | StringLiteral
   | IntegerLiteral
@@ -82,9 +104,15 @@ export interface CallExpression extends AstNodeBase {
 
 export interface BinaryExpression extends AstNodeBase {
   readonly kind: "BinaryExpression";
-  readonly operator: "+";
+  readonly operator: BinaryOperator;
   readonly left: Expression;
   readonly right: Expression;
+}
+
+export interface UnaryExpression extends AstNodeBase {
+  readonly kind: "UnaryExpression";
+  readonly operator: "-";
+  readonly operand: Expression;
 }
 
 export interface Identifier extends AstNodeBase {

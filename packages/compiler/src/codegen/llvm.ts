@@ -4,8 +4,11 @@ import type {
   CallExpression,
   Expression,
   FunctionDeclaration,
+  Parameter,
   Program,
+  ReturnStatement,
   Statement,
+  UnaryExpression,
   VariableDeclaration,
 } from "../ast/nodes.js";
 import type { ValueType } from "../typecheck.js";
@@ -20,6 +23,12 @@ interface EmittedValue {
   readonly type: ValueType;
 }
 
+interface FunctionSig {
+  readonly name: string;
+  readonly params: ValueType[];
+  readonly returnType: ValueType | "void";
+}
+
 /**
  * Lowers a validated, type-checked AST to LLVM IR text.
  */
@@ -27,26 +36,33 @@ export class LlvmCodegen {
   private stringCounter = 0;
   private tempCounter = 0;
   private readonly stringGlobals = new Map<string, { name: string; length: number }>();
-  private readonly locals = new Map<string, LocalBinding>();
+  private locals = new Map<string, LocalBinding>();
+  private functions = new Map<string, FunctionSig>();
   private needsPrintf = false;
   private needsStringRuntime = false;
-  private readonly lines: string[] = [];
+  private readonly functionBodies: string[] = [];
 
   emit(program: Program): string {
     this.stringCounter = 0;
     this.tempCounter = 0;
     this.stringGlobals.clear();
-    this.locals.clear();
+    this.locals = new Map();
+    this.functions.clear();
     this.needsPrintf = false;
     this.needsStringRuntime = false;
-    this.lines.length = 0;
+    this.functionBodies.length = 0;
 
-    const fn = program.body[0];
-    if (!fn) {
-      throw new Error("LlvmCodegen.emit called without a function");
+    for (const fn of program.body) {
+      this.functions.set(fn.name.name, {
+        name: fn.name.name,
+        params: fn.params.map((p) => p.typeAnnotation.name as ValueType),
+        returnType: fn.returnType.name === "void" ? "void" : fn.returnType.name,
+      });
     }
 
-    this.emitMainBody(fn);
+    for (const fn of program.body) {
+      this.emitFunction(fn);
+    }
 
     const globalLines = this.emitStringGlobals();
     const declares: string[] = [];
@@ -68,57 +84,125 @@ export class LlvmCodegen {
       globalLines.length > 0 ? "" : null,
       ...declares,
       declares.length > 0 ? "" : null,
-      "define i32 @main() {",
-      "entry:",
-      ...this.lines,
-      "  ret i32 0",
-      "}",
+      ...this.functionBodies,
       "",
     ]
       .filter((line): line is string => line !== null)
       .join("\n");
   }
 
-  private emitMainBody(fn: FunctionDeclaration): void {
-    for (const stmt of fn.body) {
-      this.emitStatement(stmt);
+  private emitFunction(fn: FunctionDeclaration): void {
+    this.locals = new Map();
+    this.tempCounter = 0;
+    const lines: string[] = [];
+
+    const isMain = fn.name.name === "main";
+    const header = isMain
+      ? "define i32 @main() {"
+      : this.emitFunctionHeader(fn);
+
+    lines.push(header);
+    lines.push("entry:");
+
+    if (!isMain) {
+      for (let i = 0; i < fn.params.length; i += 1) {
+        this.emitParameter(fn.params[i]!, i, lines);
+      }
     }
+
+    let terminated = false;
+    for (const stmt of fn.body) {
+      if (terminated) {
+        break;
+      }
+      terminated = this.emitStatement(stmt, lines);
+    }
+
+    if (!terminated) {
+      if (isMain || fn.returnType.name === "void") {
+        lines.push(isMain ? "  ret i32 0" : "  ret void");
+      } else {
+        throw new Error(`Codegen: non-void function '${fn.name.name}' missing return`);
+      }
+    }
+
+    lines.push("}");
+    lines.push("");
+    this.functionBodies.push(...lines);
   }
 
-  private emitStatement(stmt: Statement): void {
+  private emitFunctionHeader(fn: FunctionDeclaration): string {
+    const ret = fn.returnType.name === "void" ? "void" : toLlvmType(fn.returnType.name);
+    const params = fn.params
+      .map((p, i) => `${toLlvmType(p.typeAnnotation.name as ValueType)} %arg${i}`)
+      .join(", ");
+    return `define ${ret} @${fn.name.name}(${params}) {`;
+  }
+
+  private emitParameter(param: Parameter, index: number, lines: string[]): void {
+    const type = param.typeAnnotation.name as ValueType;
+    const llvmType = toLlvmType(type);
+    const ptr = `%v.${param.name.name}`;
+    lines.push(`  ${ptr} = alloca ${llvmType}`);
+    lines.push(`  store ${llvmType} %arg${index}, ptr ${ptr}`);
+    this.locals.set(param.name.name, { ptr, type });
+  }
+
+  /** Returns true if the statement terminates the block (return). */
+  private emitStatement(stmt: Statement, lines: string[]): boolean {
     switch (stmt.kind) {
       case "VariableDeclaration":
-        this.emitVariableDeclaration(stmt);
-        return;
+        this.emitVariableDeclaration(stmt, lines);
+        return false;
       case "AssignmentStatement":
-        this.emitAssignment(stmt);
-        return;
+        this.emitAssignment(stmt, lines);
+        return false;
       case "ExpressionStatement":
         if (stmt.expression.kind === "CallExpression") {
-          this.emitPrintCall(stmt.expression);
+          this.emitCallStatement(stmt.expression, lines);
         }
-        return;
+        return false;
+      case "ReturnStatement":
+        this.emitReturn(stmt, lines);
+        return true;
     }
   }
 
-  private emitVariableDeclaration(stmt: VariableDeclaration): void {
+  private emitVariableDeclaration(stmt: VariableDeclaration, lines: string[]): void {
     const type = this.resolveDeclType(stmt);
     const llvmType = toLlvmType(type);
     const ptr = `%v.${stmt.name.name}`;
-    this.lines.push(`  ${ptr} = alloca ${llvmType}`);
+    lines.push(`  ${ptr} = alloca ${llvmType}`);
     this.locals.set(stmt.name.name, { ptr, type });
 
-    const init = this.emitExpression(stmt.initializer, type);
-    this.lines.push(`  store ${llvmType} ${init.llvm}, ptr ${ptr}`);
+    const init = this.emitExpression(stmt.initializer, lines, type);
+    lines.push(`  store ${llvmType} ${init.llvm}, ptr ${ptr}`);
   }
 
-  private emitAssignment(stmt: AssignmentStatement): void {
+  private emitAssignment(stmt: AssignmentStatement, lines: string[]): void {
     const local = this.locals.get(stmt.name.name);
     if (!local) {
       throw new Error(`Codegen: unknown variable '${stmt.name.name}'`);
     }
-    const value = this.emitExpression(stmt.value, local.type);
-    this.lines.push(`  store ${toLlvmType(local.type)} ${value.llvm}, ptr ${local.ptr}`);
+    const value = this.emitExpression(stmt.value, lines, local.type);
+    lines.push(`  store ${toLlvmType(local.type)} ${value.llvm}, ptr ${local.ptr}`);
+  }
+
+  private emitReturn(stmt: ReturnStatement, lines: string[]): void {
+    if (stmt.value === null) {
+      lines.push("  ret void");
+      return;
+    }
+    const value = this.emitExpression(stmt.value, lines);
+    lines.push(`  ret ${toLlvmType(value.type)} ${value.llvm}`);
+  }
+
+  private emitCallStatement(call: CallExpression, lines: string[]): void {
+    if (call.callee.name === "print") {
+      this.emitPrintCall(call, lines);
+      return;
+    }
+    this.emitUserCall(call, lines, true);
   }
 
   private resolveDeclType(stmt: VariableDeclaration): ValueType {
@@ -147,14 +231,29 @@ export class LlvmCodegen {
         }
         return local.type;
       }
-      case "BinaryExpression":
-        return "string";
-      case "CallExpression":
-        throw new Error("Codegen: unexpected call in type inference");
+      case "UnaryExpression":
+        return this.inferExpressionType(expr.operand);
+      case "BinaryExpression": {
+        if (expr.operator === "+") {
+          const left = this.inferExpressionType(expr.left);
+          if (left === "string") {
+            return "string";
+          }
+          return left;
+        }
+        return this.inferExpressionType(expr.left);
+      }
+      case "CallExpression": {
+        const sig = this.functions.get(expr.callee.name);
+        if (!sig || sig.returnType === "void") {
+          throw new Error(`Codegen: unexpected call in type inference '${expr.callee.name}'`);
+        }
+        return sig.returnType;
+      }
     }
   }
 
-  private emitExpression(expr: Expression, expected?: ValueType): EmittedValue {
+  private emitExpression(expr: Expression, lines: string[], expected?: ValueType): EmittedValue {
     switch (expr.kind) {
       case "IntegerLiteral": {
         const type: ValueType = expected === "i64" ? "i64" : "i32";
@@ -172,8 +271,8 @@ export class LlvmCodegen {
       }
       case "StringLiteral": {
         const global = this.internString(expr.value);
-        const tmp = this.nextTemp("str");
-        this.lines.push(
+        const tmp = this.nextTemp();
+        lines.push(
           `  ${tmp} = getelementptr inbounds [${global.length} x i8], ptr @${global.name}, i64 0, i64 0`,
         );
         return { llvm: tmp, type: "string" };
@@ -183,62 +282,142 @@ export class LlvmCodegen {
         if (!local) {
           throw new Error(`Codegen: unknown variable '${expr.name}'`);
         }
-        const tmp = this.nextTemp("load");
-        this.lines.push(`  ${tmp} = load ${toLlvmType(local.type)}, ptr ${local.ptr}`);
+        const tmp = this.nextTemp();
+        lines.push(`  ${tmp} = load ${toLlvmType(local.type)}, ptr ${local.ptr}`);
         return { llvm: tmp, type: local.type };
       }
+      case "UnaryExpression":
+        return this.emitUnary(expr, lines);
       case "BinaryExpression":
-        return this.emitStringConcat(expr);
+        return this.emitBinary(expr, lines);
       case "CallExpression":
-        throw new Error("Codegen: call expressions are not values");
+        return this.emitUserCall(expr, lines, false);
     }
   }
 
-  private emitStringConcat(expr: BinaryExpression): EmittedValue {
+  private emitUnary(expr: UnaryExpression, lines: string[]): EmittedValue {
+    const operand = this.emitExpression(expr.operand, lines);
+    const llvmType = toLlvmType(operand.type);
+    const tmp = this.nextTemp();
+    if (operand.type === "f32" || operand.type === "f64") {
+      lines.push(`  ${tmp} = fneg ${llvmType} ${operand.llvm}`);
+    } else {
+      lines.push(`  ${tmp} = sub ${llvmType} 0, ${operand.llvm}`);
+    }
+    return { llvm: tmp, type: operand.type };
+  }
+
+  private emitBinary(expr: BinaryExpression, lines: string[]): EmittedValue {
+    if (expr.operator === "+") {
+      const leftType = this.inferExpressionType(expr.left);
+      if (leftType === "string") {
+        return this.emitStringConcat(expr, lines);
+      }
+    }
+
+    const left = this.emitExpression(expr.left, lines);
+    const right = this.emitExpression(expr.right, lines, left.type);
+    const llvmType = toLlvmType(left.type);
+    const tmp = this.nextTemp();
+    const isFloat = left.type === "f32" || left.type === "f64";
+
+    let opcode: string;
+    switch (expr.operator) {
+      case "+":
+        opcode = isFloat ? "fadd" : "add";
+        break;
+      case "-":
+        opcode = isFloat ? "fsub" : "sub";
+        break;
+      case "*":
+        opcode = isFloat ? "fmul" : "mul";
+        break;
+      case "/":
+        opcode = isFloat ? "fdiv" : "sdiv";
+        break;
+      case "%":
+        opcode = isFloat ? "frem" : "srem";
+        break;
+    }
+
+    lines.push(`  ${tmp} = ${opcode} ${llvmType} ${left.llvm}, ${right.llvm}`);
+    return { llvm: tmp, type: left.type };
+  }
+
+  private emitStringConcat(expr: BinaryExpression, lines: string[]): EmittedValue {
     if (expr.left.kind === "StringLiteral" && expr.right.kind === "StringLiteral") {
       const folded = expr.left.value + expr.right.value;
       const global = this.internString(folded);
-      const tmp = this.nextTemp("str");
-      this.lines.push(
+      const tmp = this.nextTemp();
+      lines.push(
         `  ${tmp} = getelementptr inbounds [${global.length} x i8], ptr @${global.name}, i64 0, i64 0`,
       );
       return { llvm: tmp, type: "string" };
     }
 
     this.needsStringRuntime = true;
-    const left = this.emitExpression(expr.left);
-    const right = this.emitExpression(expr.right);
+    const left = this.emitExpression(expr.left, lines);
+    const right = this.emitExpression(expr.right, lines);
 
-    const leftLen = this.nextTemp("len");
-    const rightLen = this.nextTemp("len");
-    const total = this.nextTemp("total");
-    const buf = this.nextTemp("buf");
+    const leftLen = this.nextTemp();
+    const rightLen = this.nextTemp();
+    const total = this.nextTemp();
+    const buf = this.nextTemp();
 
-    this.lines.push(`  ${leftLen} = call i64 @strlen(ptr noundef ${left.llvm})`);
-    this.lines.push(`  ${rightLen} = call i64 @strlen(ptr noundef ${right.llvm})`);
-    this.lines.push(`  ${total} = add i64 ${leftLen}, ${rightLen}`);
-    const totalPlus = this.nextTemp("total");
-    this.lines.push(`  ${totalPlus} = add i64 ${total}, 1`);
-    this.lines.push(`  ${buf} = call ptr @malloc(i64 noundef ${totalPlus})`);
-    this.lines.push(`  call ptr @strcpy(ptr noundef ${buf}, ptr noundef ${left.llvm})`);
-    this.lines.push(`  call ptr @strcat(ptr noundef ${buf}, ptr noundef ${right.llvm})`);
+    lines.push(`  ${leftLen} = call i64 @strlen(ptr noundef ${left.llvm})`);
+    lines.push(`  ${rightLen} = call i64 @strlen(ptr noundef ${right.llvm})`);
+    lines.push(`  ${total} = add i64 ${leftLen}, ${rightLen}`);
+    const totalPlus = this.nextTemp();
+    lines.push(`  ${totalPlus} = add i64 ${total}, 1`);
+    lines.push(`  ${buf} = call ptr @malloc(i64 noundef ${totalPlus})`);
+    lines.push(`  call ptr @strcpy(ptr noundef ${buf}, ptr noundef ${left.llvm})`);
+    lines.push(`  call ptr @strcat(ptr noundef ${buf}, ptr noundef ${right.llvm})`);
 
     return { llvm: buf, type: "string" };
   }
 
-  private emitPrintCall(call: CallExpression): void {
-    if (call.callee.name !== "print") {
-      throw new Error(`Codegen: unsupported call '${call.callee.name}'`);
+  private emitUserCall(
+    call: CallExpression,
+    lines: string[],
+    asStatement: boolean,
+  ): EmittedValue {
+    const sig = this.functions.get(call.callee.name);
+    if (!sig) {
+      throw new Error(`Codegen: unknown function '${call.callee.name}'`);
     }
+
+    const args: EmittedValue[] = [];
+    for (let i = 0; i < call.args.length; i += 1) {
+      args.push(this.emitExpression(call.args[i]!, lines, sig.params[i]));
+    }
+
+    const argList = args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`).join(", ");
+    const argSuffix = argList ? argList : "";
+
+    if (sig.returnType === "void") {
+      lines.push(`  call void @${sig.name}(${argSuffix})`);
+      if (!asStatement) {
+        throw new Error(`Codegen: void call '${sig.name}' used as value`);
+      }
+      return { llvm: "void", type: "i32" };
+    }
+
+    const tmp = this.nextTemp();
+    const retTy = toLlvmType(sig.returnType);
+    lines.push(`  ${tmp} = call ${retTy} @${sig.name}(${argSuffix})`);
+    return { llvm: tmp, type: sig.returnType };
+  }
+
+  private emitPrintCall(call: CallExpression, lines: string[]): void {
     this.needsPrintf = true;
 
     const emittedArgs: EmittedValue[] = [];
     const formatParts: string[] = [];
 
     for (const arg of call.args) {
-      const value = this.emitExpression(arg);
+      const value = this.emitExpression(arg, lines);
       if (value.type === "bool") {
-        const boolStr = this.emitBoolToString(value.llvm);
+        const boolStr = this.emitBoolToString(value.llvm, lines);
         emittedArgs.push({ llvm: boolStr, type: "string" });
         formatParts.push("%s");
       } else {
@@ -249,45 +428,45 @@ export class LlvmCodegen {
 
     const format = `${formatParts.join(" ")}\n`;
     const formatGlobal = this.internString(format);
-    const formatPtr = this.nextTemp("fmt");
-    this.lines.push(
+    const formatPtr = this.nextTemp();
+    lines.push(
       `  ${formatPtr} = getelementptr inbounds [${formatGlobal.length} x i8], ptr @${formatGlobal.name}, i64 0, i64 0`,
     );
 
     const argList = emittedArgs
       .map((arg) => {
         if (arg.type === "f32") {
-          const widened = this.nextTemp("fpext");
-          this.lines.push(`  ${widened} = fpext float ${arg.llvm} to double`);
+          const widened = this.nextTemp();
+          lines.push(`  ${widened} = fpext float ${arg.llvm} to double`);
           return `double ${widened}`;
         }
         return `${printfArgType(arg.type)} ${arg.llvm}`;
       })
       .join(", ");
 
-    this.lines.push(
+    lines.push(
       `  call i32 (ptr, ...) @printf(ptr noundef ${formatPtr}${argList ? `, ${argList}` : ""})`,
     );
   }
 
-  private emitBoolToString(boolValue: string): string {
+  private emitBoolToString(boolValue: string, lines: string[]): string {
     const trueGlobal = this.internString("true");
     const falseGlobal = this.internString("false");
-    const truePtr = this.nextTemp("true");
-    const falsePtr = this.nextTemp("false");
-    const selected = this.nextTemp("boolstr");
+    const truePtr = this.nextTemp();
+    const falsePtr = this.nextTemp();
+    const selected = this.nextTemp();
 
-    this.lines.push(
+    lines.push(
       `  ${truePtr} = getelementptr inbounds [${trueGlobal.length} x i8], ptr @${trueGlobal.name}, i64 0, i64 0`,
     );
-    this.lines.push(
+    lines.push(
       `  ${falsePtr} = getelementptr inbounds [${falseGlobal.length} x i8], ptr @${falseGlobal.name}, i64 0, i64 0`,
     );
-    this.lines.push(`  ${selected} = select i1 ${boolValue}, ptr ${truePtr}, ptr ${falsePtr}`);
+    lines.push(`  ${selected} = select i1 ${boolValue}, ptr ${truePtr}, ptr ${falsePtr}`);
     return selected;
   }
 
-  private nextTemp(_prefix: string): string {
+  private nextTemp(): string {
     const name = `%t${this.tempCounter}`;
     this.tempCounter += 1;
     return name;
@@ -319,7 +498,7 @@ export class LlvmCodegen {
   }
 }
 
-function toLlvmType(type: ValueType): string {
+function toLlvmType(type: ValueType | "void"): string {
   switch (type) {
     case "i32":
       return "i32";
@@ -335,6 +514,8 @@ function toLlvmType(type: ValueType): string {
       return "i8";
     case "string":
       return "ptr";
+    case "void":
+      return "void";
   }
 }
 
@@ -374,10 +555,9 @@ function printfArgType(type: ValueType): string {
   }
 }
 
-function formatFloat(value: number, type: ValueType): string {
-  // LLVM float/double constants need a decimal representation.
+function formatFloat(value: number, _type: ValueType): string {
   if (Number.isInteger(value)) {
-    return type === "f32" ? `${value}.0` : `${value}.0`;
+    return `${value}.0`;
   }
   return String(value);
 }

@@ -1,5 +1,6 @@
 import type {
   Expression,
+  FunctionDeclaration,
   PrimitiveTypeName,
   Program,
   Statement,
@@ -13,25 +14,118 @@ interface Binding {
   readonly mutable: boolean;
 }
 
+interface FunctionSig {
+  readonly name: string;
+  readonly params: ValueType[];
+  readonly returnType: PrimitiveTypeName;
+  readonly decl: FunctionDeclaration;
+}
+
+const NUMERIC_TYPES = new Set<ValueType>(["i32", "i64", "f32", "f64"]);
+
 /**
- * Type-check a validated program: inference, annotations, print, and string +.
+ * Type-check a validated program: inference, annotations, arithmetic, calls, returns.
  */
 export function typecheck(program: Program, diagnostics: DiagnosticCollector): void {
-  const fn = program.body[0];
-  if (!fn) {
-    return;
+  const functions = new Map<string, FunctionSig>();
+
+  for (const fn of program.body) {
+    if (fn.name.name === "print") {
+      diagnostics.error(
+        "Cannot redefine builtin function 'print'",
+        fn.name.span,
+        "E0310",
+      );
+      continue;
+    }
+
+    if (functions.has(fn.name.name)) {
+      diagnostics.error(
+        `Duplicate function '${fn.name.name}'`,
+        fn.name.span,
+        "E0311",
+      );
+      continue;
+    }
+
+    const params: ValueType[] = [];
+    let paramsOk = true;
+    for (const param of fn.params) {
+      if (param.typeAnnotation.name === "void") {
+        diagnostics.error(
+          "'void' cannot be used as a parameter type",
+          param.typeAnnotation.span,
+          "E0302",
+        );
+        paramsOk = false;
+        continue;
+      }
+      params.push(param.typeAnnotation.name);
+    }
+
+    if (!paramsOk) {
+      continue;
+    }
+
+    functions.set(fn.name.name, {
+      name: fn.name.name,
+      params,
+      returnType: fn.returnType.name,
+      decl: fn,
+    });
   }
 
+  for (const fn of program.body) {
+    checkFunction(fn, functions, diagnostics);
+  }
+}
+
+function checkFunction(
+  fn: FunctionDeclaration,
+  functions: Map<string, FunctionSig>,
+  diagnostics: DiagnosticCollector,
+): void {
   const scope = new Map<string, Binding>();
 
+  for (const param of fn.params) {
+    if (param.typeAnnotation.name === "void") {
+      continue;
+    }
+    if (scope.has(param.name.name)) {
+      diagnostics.error(
+        `Duplicate parameter '${param.name.name}'`,
+        param.name.span,
+        "E0301",
+      );
+      continue;
+    }
+    scope.set(param.name.name, {
+      type: param.typeAnnotation.name,
+      mutable: false,
+    });
+  }
+
   for (const stmt of fn.body) {
-    checkStatement(stmt, scope, diagnostics);
+    checkStatement(stmt, scope, functions, fn.returnType.name, diagnostics);
+  }
+
+  if (fn.returnType.name !== "void") {
+    const last = fn.body[fn.body.length - 1];
+    if (!last || last.kind !== "ReturnStatement" || last.value === null) {
+      diagnostics.error(
+        `Function '${fn.name.name}' must end with a return statement`,
+        fn.name.span,
+        "E0312",
+      );
+    }
   }
 }
 
 function checkStatement(
   stmt: Statement,
   scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  returnType: PrimitiveTypeName,
   diagnostics: DiagnosticCollector,
 ): void {
   switch (stmt.kind) {
@@ -50,7 +144,7 @@ function checkStatement(
         return;
       }
 
-      const inferred = checkExpression(stmt.initializer, scope, diagnostics);
+      const inferred = checkExpression(stmt.initializer, scope, functions, diagnostics);
       if (!inferred) {
         return;
       }
@@ -89,7 +183,7 @@ function checkStatement(
         );
         return;
       }
-      const valueType = checkExpression(stmt.value, scope, diagnostics);
+      const valueType = checkExpression(stmt.value, scope, functions, diagnostics);
       if (!valueType) {
         return;
       }
@@ -103,7 +197,41 @@ function checkStatement(
       return;
     }
     case "ExpressionStatement": {
-      checkExpression(stmt.expression, scope, diagnostics, true);
+      checkExpression(stmt.expression, scope, functions, diagnostics, true);
+      return;
+    }
+    case "ReturnStatement": {
+      if (returnType === "void") {
+        if (stmt.value !== null) {
+          diagnostics.error(
+            "Void function cannot return a value",
+            stmt.value.span,
+            "E0313",
+          );
+        }
+        return;
+      }
+
+      if (stmt.value === null) {
+        diagnostics.error(
+          `Function must return a value of type '${returnType}'`,
+          stmt.span,
+          "E0314",
+        );
+        return;
+      }
+
+      const valueType = checkExpression(stmt.value, scope, functions, diagnostics);
+      if (!valueType) {
+        return;
+      }
+      if (!valueMatchesBinding(stmt.value, valueType, returnType as ValueType)) {
+        diagnostics.error(
+          `Type mismatch: expected '${returnType}', got '${valueType}'`,
+          stmt.value.span,
+          "E0303",
+        );
+      }
       return;
     }
   }
@@ -112,8 +240,9 @@ function checkStatement(
 function checkExpression(
   expr: Expression,
   scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
   diagnostics: DiagnosticCollector,
-  allowPrint = false,
+  allowVoidCall = false,
 ): ValueType | null {
   switch (expr.kind) {
     case "IntegerLiteral":
@@ -134,27 +263,74 @@ function checkExpression(
       }
       return binding.type;
     }
+    case "UnaryExpression": {
+      const operand = checkExpression(expr.operand, scope, functions, diagnostics);
+      if (!operand) {
+        return null;
+      }
+      if (!NUMERIC_TYPES.has(operand)) {
+        diagnostics.error(
+          `Operator '-' requires a numeric operand, got '${operand}'`,
+          expr.span,
+          "E0306",
+        );
+        return null;
+      }
+      return operand;
+    }
     case "BinaryExpression": {
-      const left = checkExpression(expr.left, scope, diagnostics);
-      const right = checkExpression(expr.right, scope, diagnostics);
+      const left = checkExpression(expr.left, scope, functions, diagnostics);
+      const right = checkExpression(expr.right, scope, functions, diagnostics);
       if (!left || !right) {
         return null;
       }
+
       if (expr.operator === "+") {
-        if (left !== "string" || right !== "string") {
-          diagnostics.error(
-            "Operator '+' requires string operands",
-            expr.span,
-            "E0306",
-          );
-          return null;
+        if (left === "string" && right === "string") {
+          return "string";
         }
-        return "string";
+        if (NUMERIC_TYPES.has(left) && left === right) {
+          return left;
+        }
+        diagnostics.error(
+          `Operator '+' requires two string or two matching numeric operands, got '${left}' and '${right}'`,
+          expr.span,
+          "E0306",
+        );
+        return null;
       }
-      return null;
+
+      if (!NUMERIC_TYPES.has(left) || left !== right) {
+        diagnostics.error(
+          `Operator '${expr.operator}' requires two matching numeric operands, got '${left}' and '${right}'`,
+          expr.span,
+          "E0306",
+        );
+        return null;
+      }
+      return left;
     }
     case "CallExpression": {
-      if (expr.callee.name !== "print") {
+      if (expr.callee.name === "print") {
+        if (!allowVoidCall) {
+          diagnostics.error("'print' cannot be used as a value", expr.span, "E0309");
+          return null;
+        }
+        if (expr.args.length === 0) {
+          diagnostics.error("'print' requires at least one argument", expr.span, "E0308");
+          return null;
+        }
+        for (const arg of expr.args) {
+          const argType = checkExpression(arg, scope, functions, diagnostics);
+          if (!argType) {
+            return null;
+          }
+        }
+        return null;
+      }
+
+      const sig = functions.get(expr.callee.name);
+      if (!sig) {
         diagnostics.error(
           `Unknown function '${expr.callee.name}'`,
           expr.callee.span,
@@ -162,21 +338,45 @@ function checkExpression(
         );
         return null;
       }
-      if (!allowPrint) {
-        diagnostics.error("'print' cannot be used as a value", expr.span, "E0309");
+
+      if (expr.args.length !== sig.params.length) {
+        diagnostics.error(
+          `Function '${sig.name}' expects ${sig.params.length} argument(s), got ${expr.args.length}`,
+          expr.span,
+          "E0315",
+        );
         return null;
       }
-      if (expr.args.length === 0) {
-        diagnostics.error("'print' requires at least one argument", expr.span, "E0308");
-        return null;
-      }
-      for (const arg of expr.args) {
-        const argType = checkExpression(arg, scope, diagnostics);
+
+      for (let i = 0; i < expr.args.length; i += 1) {
+        const arg = expr.args[i]!;
+        const expected = sig.params[i]!;
+        const argType = checkExpression(arg, scope, functions, diagnostics);
         if (!argType) {
           return null;
         }
+        if (!valueMatchesBinding(arg, argType, expected)) {
+          diagnostics.error(
+            `Type mismatch: expected '${expected}', got '${argType}'`,
+            arg.span,
+            "E0303",
+          );
+          return null;
+        }
       }
-      return null;
+
+      if (sig.returnType === "void") {
+        if (!allowVoidCall) {
+          diagnostics.error(
+            `Void function '${sig.name}' cannot be used as a value`,
+            expr.span,
+            "E0309",
+          );
+        }
+        return null;
+      }
+
+      return sig.returnType;
     }
   }
 }

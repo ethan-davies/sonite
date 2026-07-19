@@ -46,7 +46,9 @@ describe("Lexer", () => {
   });
 
   it("tokenizes numbers, keywords, and operators", () => {
-    const { tokens, diagnostics } = lex(`let x = 42; const pi = 3.14; true false + , : =`);
+    const { tokens, diagnostics } = lex(
+      `let x = 42; const pi = 3.14; true false return + - * / % , : =`,
+    );
     expect(diagnostics.hasErrors).toBe(false);
     expect(tokens.map((t) => t.kind)).toEqual([
       TokenKind.Let,
@@ -61,7 +63,12 @@ describe("Lexer", () => {
       TokenKind.Semicolon,
       TokenKind.True,
       TokenKind.False,
+      TokenKind.Return,
       TokenKind.Plus,
+      TokenKind.Minus,
+      TokenKind.Star,
+      TokenKind.Slash,
+      TokenKind.Percent,
       TokenKind.Comma,
       TokenKind.Colon,
       TokenKind.Equal,
@@ -69,6 +76,24 @@ describe("Lexer", () => {
     ]);
     expect(tokens[3]?.lexeme).toBe("42");
     expect(tokens[8]?.lexeme).toBe("3.14");
+  });
+
+  it("tokenizes identifiers with underscores", () => {
+    const { tokens, diagnostics } = lex(`_foo bar_baz`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens[0]).toMatchObject({ kind: TokenKind.Identifier, lexeme: "_foo" });
+    expect(tokens[1]).toMatchObject({ kind: TokenKind.Identifier, lexeme: "bar_baz" });
+  });
+
+  it("keeps // as a line comment, not division", () => {
+    const { tokens, diagnostics } = lex(`10 // comment\n/ 2`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens.map((t) => t.kind)).toEqual([
+      TokenKind.Integer,
+      TokenKind.Slash,
+      TokenKind.Integer,
+      TokenKind.Eof,
+    ]);
   });
 
   it("tokenizes char literals separately from strings", () => {
@@ -85,6 +110,14 @@ describe("Lexer", () => {
     expect(diagnostics.hasErrors).toBe(false);
     expect(tokens[0]?.kind).toBe(TokenKind.String);
     expect(tokens[0]?.value).toBe('a\nb\t"c');
+  });
+
+  it("decodes char escape sequences", () => {
+    const { tokens, diagnostics } = lex(`'\\n' '\\t' '\\''`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens[0]?.value).toBe("\n");
+    expect(tokens[1]?.value).toBe("\t");
+    expect(tokens[2]?.value).toBe("'");
   });
 
   it("skips line and block comments", () => {
@@ -117,5 +150,11 @@ describe("Lexer", () => {
     expect(diagnostics.hasErrors).toBe(true);
     expect(tokens[0]?.kind).toBe(TokenKind.Invalid);
     expect(diagnostics.diagnostics[0]?.code).toBe("E0001");
+  });
+
+  it("reports unterminated strings", () => {
+    const { diagnostics } = lex(`"hello`);
+    expect(diagnostics.hasErrors).toBe(true);
+    expect(diagnostics.diagnostics.some((d) => d.code === "E0002")).toBe(true);
   });
 });

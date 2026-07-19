@@ -21,6 +21,7 @@ describe("Parser", () => {
     expect(ast.body).toHaveLength(1);
     expect(ast.body[0]?.name.name).toBe("main");
     expect(ast.body[0]?.returnType.name).toBe("void");
+    expect(ast.body[0]?.params).toEqual([]);
     expect(ast.body[0]?.body).toHaveLength(1);
 
     const stmt = ast.body[0]?.body[0];
@@ -63,10 +64,40 @@ describe("Parser", () => {
       expect(body[0].mutability).toBe("let");
       expect(body[0].initializer.kind).toBe("IntegerLiteral");
     }
+    if (body[1]?.kind === "VariableDeclaration") {
+      expect(body[1].mutability).toBe("const");
+      expect(body[1].typeAnnotation?.name).toBe("string");
+    }
     if (body[4]?.kind === "ExpressionStatement" && body[4].expression.kind === "CallExpression") {
       const arg = body[4].expression.args[0];
       expect(arg?.kind).toBe("BinaryExpression");
     }
+  });
+
+  it("parses literal forms", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        print(1);
+        print(2.5);
+        print(true);
+        print(false);
+        print('z');
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const kinds = (ast.body[0]?.body ?? []).map((stmt) => {
+      if (stmt.kind !== "ExpressionStatement" || stmt.expression.kind !== "CallExpression") {
+        return null;
+      }
+      return stmt.expression.args[0]?.kind;
+    });
+    expect(kinds).toEqual([
+      "IntegerLiteral",
+      "FloatLiteral",
+      "BooleanLiteral",
+      "BooleanLiteral",
+      "CharLiteral",
+    ]);
   });
 
   it("parses an empty main body", () => {
@@ -87,5 +118,125 @@ describe("Parser", () => {
   it("rejects missing parentheses", () => {
     const { diagnostics } = parse('function main: void { print("x"); }');
     expect(diagnostics.hasErrors).toBe(true);
+  });
+
+  it("rejects unknown type names", () => {
+    const { diagnostics } = parse(`
+      function main(): widget {}
+    `);
+    expect(diagnostics.hasErrors).toBe(true);
+    expect(diagnostics.diagnostics.some((d) => d.code === "E0104")).toBe(true);
+  });
+
+  it("parses arithmetic precedence, parentheses, and unary minus", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        print(2 + 3 * 4);
+        print((2 + 3) * 4);
+        print(-5);
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const body = ast.body[0]?.body ?? [];
+    expect(body).toHaveLength(3);
+
+    const first = body[0];
+    expect(first?.kind).toBe("ExpressionStatement");
+    if (first?.kind === "ExpressionStatement" && first.expression.kind === "CallExpression") {
+      const expr = first.expression.args[0];
+      expect(expr?.kind).toBe("BinaryExpression");
+      if (expr?.kind === "BinaryExpression") {
+        expect(expr.operator).toBe("+");
+        expect(expr.right.kind).toBe("BinaryExpression");
+        if (expr.right.kind === "BinaryExpression") {
+          expect(expr.right.operator).toBe("*");
+        }
+      }
+    }
+
+    const second = body[1];
+    if (second?.kind === "ExpressionStatement" && second.expression.kind === "CallExpression") {
+      const expr = second.expression.args[0];
+      expect(expr?.kind).toBe("BinaryExpression");
+      if (expr?.kind === "BinaryExpression") {
+        expect(expr.operator).toBe("*");
+        expect(expr.left.kind).toBe("BinaryExpression");
+      }
+    }
+
+    const third = body[2];
+    if (third?.kind === "ExpressionStatement" && third.expression.kind === "CallExpression") {
+      expect(third.expression.args[0]?.kind).toBe("UnaryExpression");
+    }
+  });
+
+  it("parses left-associative additive and multiplicative chains", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        print(1 - 2 - 3);
+        print(8 / 2 / 2);
+        print(8 % 5 % 2);
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const body = ast.body[0]?.body ?? [];
+
+    const checkLeftAssoc = (index: number, operator: string) => {
+      const stmt = body[index];
+      expect(stmt?.kind).toBe("ExpressionStatement");
+      if (stmt?.kind !== "ExpressionStatement" || stmt.expression.kind !== "CallExpression") {
+        return;
+      }
+      const expr = stmt.expression.args[0];
+      expect(expr?.kind).toBe("BinaryExpression");
+      if (expr?.kind === "BinaryExpression") {
+        expect(expr.operator).toBe(operator);
+        expect(expr.left.kind).toBe("BinaryExpression");
+        if (expr.left.kind === "BinaryExpression") {
+          expect(expr.left.operator).toBe(operator);
+        }
+      }
+    };
+
+    checkLeftAssoc(0, "-");
+    checkLeftAssoc(1, "/");
+    checkLeftAssoc(2, "%");
+  });
+
+  it("parses multiple functions with parameters and return", () => {
+    const { ast, diagnostics } = parse(`
+      function add(a: i32, b: i32): i32 {
+        return a + b;
+      }
+      function main(): void {
+        print(add(1, 2));
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(ast.body).toHaveLength(2);
+    expect(ast.body[0]?.name.name).toBe("add");
+    expect(ast.body[0]?.params).toHaveLength(2);
+    expect(ast.body[0]?.params[0]?.name.name).toBe("a");
+    expect(ast.body[0]?.params[0]?.typeAnnotation.name).toBe("i32");
+    expect(ast.body[0]?.body[0]?.kind).toBe("ReturnStatement");
+    if (ast.body[0]?.body[0]?.kind === "ReturnStatement") {
+      expect(ast.body[0].body[0].value?.kind).toBe("BinaryExpression");
+    }
+    expect(ast.body[1]?.name.name).toBe("main");
+  });
+
+  it("parses bare return in a void function", () => {
+    const { ast, diagnostics } = parse(`
+      function noop(): void {
+        return;
+      }
+      function main(): void {}
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const stmt = ast.body[0]?.body[0];
+    expect(stmt?.kind).toBe("ReturnStatement");
+    if (stmt?.kind === "ReturnStatement") {
+      expect(stmt.value).toBeNull();
+    }
   });
 });

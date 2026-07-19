@@ -10,6 +10,7 @@ export enum TokenKind {
   Function = "function",
   Let = "let",
   Const = "const",
+  Return = "return",
   True = "true",
   False = "false",
 
@@ -21,6 +22,10 @@ export enum TokenKind {
   Colon = ":",
   Comma = ",",
   Plus = "+",
+  Minus = "-",
+  Star = "*",
+  Slash = "/",
+  Percent = "%",
   Equal = "=",
 
   Eof = "Eof",
@@ -39,6 +44,7 @@ export const KEYWORDS: ReadonlyMap<string, TokenKind> = new Map([
   ["function", TokenKind.Function],
   ["let", TokenKind.Let],
   ["const", TokenKind.Const],
+  ["return", TokenKind.Return],
   ["true", TokenKind.True],
   ["false", TokenKind.False],
 ]);

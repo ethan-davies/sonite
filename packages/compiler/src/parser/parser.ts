@@ -1,6 +1,7 @@
 import type {
   AssignmentStatement,
   BinaryExpression,
+  BinaryOperator,
   BooleanLiteral,
   CallExpression,
   CharLiteral,
@@ -10,11 +11,14 @@ import type {
   FunctionDeclaration,
   Identifier,
   IntegerLiteral,
+  Parameter,
   PrimitiveTypeName,
   Program,
+  ReturnStatement,
   Statement,
   StringLiteral,
   TypeAnnotation,
+  UnaryExpression,
   VariableDeclaration,
 } from "../ast/nodes.js";
 import type { DiagnosticCollector } from "../diagnostics/diagnostic.js";
@@ -34,14 +38,20 @@ const PRIMITIVE_TYPES = new Set<string>([
 /**
  * Recursive-descent parser:
  *
- *   program      = functionDecl EOF
- *   functionDecl = "function" Ident "(" ")" ":" type "{" statement* "}"
- *   statement    = varDecl | assignment | exprStmt
+ *   program      = functionDecl*
+ *   functionDecl = "function" Ident "(" params? ")" ":" type "{" statement* "}"
+ *   params       = param ("," param)*
+ *   param        = Ident ":" type
+ *   statement    = varDecl | assignment | returnStmt | exprStmt
  *   varDecl      = ("let"|"const") Ident (":" type)? "=" expression ";"
  *   assignment   = Ident "=" expression ";"
+ *   returnStmt   = "return" expression? ";"
  *   exprStmt     = callExpr ";"
- *   expression   = primary ("+" primary)*
- *   primary      = literal | Ident | callExpr
+ *   expression   = additive
+ *   additive     = multiplicative (("+" | "-") multiplicative)*
+ *   multiplicative = unary (("*" | "/" | "%") unary)*
+ *   unary        = "-" unary | primary
+ *   primary      = "(" expression ")" | literal | Ident | callExpr
  *   callExpr     = Ident "(" (expression ("," expression)*)? ")"
  *   type         = Ident
  */
@@ -59,19 +69,12 @@ export class Parser {
     const start = this.peek().span.start;
     const functions: FunctionDeclaration[] = [];
 
-    if (!this.check(TokenKind.Eof)) {
+    while (!this.check(TokenKind.Eof)) {
       const fn = this.parseFunctionDeclaration();
       if (fn) {
         functions.push(fn);
-      }
-
-      while (!this.isAtEnd()) {
-        this.diagnostics.error(
-          `Unexpected token '${this.peek().lexeme}'`,
-          this.peek().span,
-          "E0101",
-        );
-        this.advance();
+      } else {
+        break;
       }
     }
 
@@ -107,6 +110,13 @@ export class Parser {
       this.synchronizeToTopLevel();
       return null;
     }
+
+    const params = this.parseParameterList();
+    if (params === null) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
     if (!this.expect(TokenKind.RParen, "Expected ')' after parameter list")) {
       this.synchronizeToTopLevel();
       return null;
@@ -144,15 +154,74 @@ export class Parser {
     return {
       kind: "FunctionDeclaration",
       name,
+      params,
       returnType,
       body,
       span: { start, end },
     };
   }
 
+  private parseParameterList(): Parameter[] | null {
+    const params: Parameter[] = [];
+
+    if (this.check(TokenKind.RParen)) {
+      return params;
+    }
+
+    const first = this.parseParameter();
+    if (!first) {
+      return null;
+    }
+    params.push(first);
+
+    while (this.check(TokenKind.Comma)) {
+      this.advance();
+      const param = this.parseParameter();
+      if (!param) {
+        return null;
+      }
+      params.push(param);
+    }
+
+    return params;
+  }
+
+  private parseParameter(): Parameter | null {
+    const nameToken = this.expect(TokenKind.Identifier, "Expected parameter name");
+    if (!nameToken) {
+      return null;
+    }
+
+    const name: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+
+    if (!this.expect(TokenKind.Colon, "Expected ':' after parameter name")) {
+      return null;
+    }
+
+    const typeAnnotation = this.parseType();
+    if (!typeAnnotation) {
+      return null;
+    }
+
+    return {
+      kind: "Parameter",
+      name,
+      typeAnnotation,
+      span: { start: name.span.start, end: typeAnnotation.span.end },
+    };
+  }
+
   private parseStatement(): Statement | null {
     if (this.check(TokenKind.Let) || this.check(TokenKind.Const)) {
       return this.parseVariableDeclaration();
+    }
+
+    if (this.check(TokenKind.Return)) {
+      return this.parseReturnStatement();
     }
 
     if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.Equal)) {
@@ -238,6 +307,28 @@ export class Parser {
     };
   }
 
+  private parseReturnStatement(): ReturnStatement | null {
+    const start = this.peek().span.start;
+    this.advance(); // return
+
+    let value: Expression | null = null;
+    if (!this.check(TokenKind.Semicolon)) {
+      value = this.parseExpression();
+      if (!value) {
+        return null;
+      }
+    }
+
+    const semicolon = this.expect(TokenKind.Semicolon, "Expected ';' after return");
+    const end = semicolon?.span.end ?? value?.span.end ?? this.peek().span.end;
+
+    return {
+      kind: "ReturnStatement",
+      value,
+      span: { start, end },
+    };
+  }
+
   private parseExpressionStatement(): ExpressionStatement | null {
     const start = this.peek().span.start;
 
@@ -271,20 +362,25 @@ export class Parser {
   }
 
   private parseExpression(): Expression | null {
-    let left = this.parsePrimary();
+    return this.parseAdditive();
+  }
+
+  private parseAdditive(): Expression | null {
+    let left = this.parseMultiplicative();
     if (!left) {
       return null;
     }
 
-    while (this.check(TokenKind.Plus)) {
-      this.advance();
-      const right = this.parsePrimary();
+    while (this.check(TokenKind.Plus) || this.check(TokenKind.Minus)) {
+      const opToken = this.advance();
+      const operator = opToken.lexeme as BinaryOperator;
+      const right = this.parseMultiplicative();
       if (!right) {
         return null;
       }
       const binary: BinaryExpression = {
         kind: "BinaryExpression",
-        operator: "+",
+        operator,
         left,
         right,
         span: { start: left.span.start, end: right.span.end },
@@ -295,7 +391,68 @@ export class Parser {
     return left;
   }
 
+  private parseMultiplicative(): Expression | null {
+    let left = this.parseUnary();
+    if (!left) {
+      return null;
+    }
+
+    while (
+      this.check(TokenKind.Star) ||
+      this.check(TokenKind.Slash) ||
+      this.check(TokenKind.Percent)
+    ) {
+      const opToken = this.advance();
+      const operator = opToken.lexeme as BinaryOperator;
+      const right = this.parseUnary();
+      if (!right) {
+        return null;
+      }
+      const binary: BinaryExpression = {
+        kind: "BinaryExpression",
+        operator,
+        left,
+        right,
+        span: { start: left.span.start, end: right.span.end },
+      };
+      left = binary;
+    }
+
+    return left;
+  }
+
+  private parseUnary(): Expression | null {
+    if (this.check(TokenKind.Minus)) {
+      const opToken = this.advance();
+      const operand = this.parseUnary();
+      if (!operand) {
+        return null;
+      }
+      const unary: UnaryExpression = {
+        kind: "UnaryExpression",
+        operator: "-",
+        operand,
+        span: { start: opToken.span.start, end: operand.span.end },
+      };
+      return unary;
+    }
+
+    return this.parsePrimary();
+  }
+
   private parsePrimary(): Expression | null {
+    if (this.check(TokenKind.LParen)) {
+      this.advance();
+      const expr = this.parseExpression();
+      if (!expr) {
+        return null;
+      }
+      if (!this.expect(TokenKind.RParen, "Expected ')' after expression")) {
+        return null;
+      }
+      return expr;
+    }
+
     if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.LParen)) {
       return this.parseCallExpression();
     }
@@ -458,6 +615,9 @@ export class Parser {
 
   private synchronizeToTopLevel(): void {
     while (!this.isAtEnd()) {
+      if (this.check(TokenKind.Function)) {
+        return;
+      }
       this.advance();
     }
   }

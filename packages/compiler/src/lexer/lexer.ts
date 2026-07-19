@@ -71,6 +71,14 @@ export class Lexer {
         return this.makeToken(TokenKind.Comma, ch, start);
       case "+":
         return this.makeToken(TokenKind.Plus, ch, start);
+      case "-":
+        return this.makeToken(TokenKind.Minus, ch, start);
+      case "*":
+        return this.makeToken(TokenKind.Star, ch, start);
+      case "/":
+        return this.makeToken(TokenKind.Slash, ch, start);
+      case "%":
+        return this.makeToken(TokenKind.Percent, ch, start);
       case "=":
         return this.makeToken(TokenKind.Equal, ch, start);
     }

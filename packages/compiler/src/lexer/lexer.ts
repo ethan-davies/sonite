@@ -70,8 +70,24 @@ export class Lexer {
       case ",":
         return this.makeToken(TokenKind.Comma, ch, start);
       case "+":
+        if (this.peek() === "+") {
+          this.advance();
+          return this.makeToken(TokenKind.PlusPlus, "++", start);
+        }
+        if (this.peek() === "=") {
+          this.advance();
+          return this.makeToken(TokenKind.PlusEqual, "+=", start);
+        }
         return this.makeToken(TokenKind.Plus, ch, start);
       case "-":
+        if (this.peek() === "-") {
+          this.advance();
+          return this.makeToken(TokenKind.MinusMinus, "--", start);
+        }
+        if (this.peek() === "=") {
+          this.advance();
+          return this.makeToken(TokenKind.MinusEqual, "-=", start);
+        }
         return this.makeToken(TokenKind.Minus, ch, start);
       case "*":
         return this.makeToken(TokenKind.Star, ch, start);

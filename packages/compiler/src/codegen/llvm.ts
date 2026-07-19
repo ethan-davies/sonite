@@ -3,6 +3,7 @@ import type {
   BinaryExpression,
   CallExpression,
   Expression,
+  ForStatement,
   FunctionDeclaration,
   IfStatement,
   Parameter,
@@ -10,7 +11,9 @@ import type {
   ReturnStatement,
   Statement,
   UnaryExpression,
+  UpdateStatement,
   VariableDeclaration,
+  WhileStatement,
 } from "../ast/nodes.js";
 import type { ValueType } from "../typecheck.js";
 
@@ -30,6 +33,11 @@ interface FunctionSig {
   readonly returnType: ValueType | "void";
 }
 
+interface LoopContext {
+  readonly continueLabel: string;
+  readonly breakLabel: string;
+}
+
 const COMPARISON_OPS = new Set(["==", "!=", "<", "<=", ">", ">="]);
 const LOGICAL_OPS = new Set(["&&", "||"]);
 
@@ -46,6 +54,7 @@ export class LlvmCodegen {
   private needsPrintf = false;
   private needsStringRuntime = false;
   private readonly functionBodies: string[] = [];
+  private readonly loopStack: LoopContext[] = [];
 
   emit(program: Program): string {
     this.stringCounter = 0;
@@ -57,6 +66,7 @@ export class LlvmCodegen {
     this.needsPrintf = false;
     this.needsStringRuntime = false;
     this.functionBodies.length = 0;
+    this.loopStack.length = 0;
 
     for (const fn of program.body) {
       this.functions.set(fn.name.name, {
@@ -100,6 +110,7 @@ export class LlvmCodegen {
   private emitFunction(fn: FunctionDeclaration): void {
     this.locals = new Map();
     this.tempCounter = 0;
+    this.loopStack.length = 0;
     const lines: string[] = [];
 
     const isMain = fn.name.name === "main";
@@ -154,7 +165,7 @@ export class LlvmCodegen {
     this.locals.set(param.name.name, { ptr, type });
   }
 
-  /** Returns true if the statement terminates the block (return). */
+  /** Returns true if the statement terminates the block (return/break/continue). */
   private emitStatement(stmt: Statement, lines: string[]): boolean {
     switch (stmt.kind) {
       case "VariableDeclaration":
@@ -162,6 +173,9 @@ export class LlvmCodegen {
         return false;
       case "AssignmentStatement":
         this.emitAssignment(stmt, lines);
+        return false;
+      case "UpdateStatement":
+        this.emitUpdate(stmt, lines);
         return false;
       case "ExpressionStatement":
         if (stmt.expression.kind === "CallExpression") {
@@ -173,7 +187,106 @@ export class LlvmCodegen {
         return true;
       case "IfStatement":
         return this.emitIfStatement(stmt, lines);
+      case "WhileStatement":
+        return this.emitWhileStatement(stmt, lines);
+      case "ForStatement":
+        return this.emitForStatement(stmt, lines);
+      case "BreakStatement": {
+        const loop = this.currentLoop();
+        lines.push(`  br label %${loop.breakLabel}`);
+        return true;
+      }
+      case "ContinueStatement": {
+        const loop = this.currentLoop();
+        lines.push(`  br label %${loop.continueLabel}`);
+        return true;
+      }
     }
+  }
+
+  private currentLoop(): LoopContext {
+    const loop = this.loopStack[this.loopStack.length - 1];
+    if (!loop) {
+      throw new Error("Codegen: break/continue outside loop");
+    }
+    return loop;
+  }
+
+  private emitWhileStatement(stmt: WhileStatement, lines: string[]): boolean {
+    const id = this.labelCounter;
+    this.labelCounter += 1;
+    const condLabel = `while.cond.${id}`;
+    const bodyLabel = `while.body.${id}`;
+    const exitLabel = `while.exit.${id}`;
+
+    lines.push(`  br label %${condLabel}`);
+
+    lines.push(`${condLabel}:`);
+    const cond = this.emitExpression(stmt.condition, lines);
+    lines.push(`  br i1 ${cond.llvm}, label %${bodyLabel}, label %${exitLabel}`);
+
+    lines.push(`${bodyLabel}:`);
+    this.loopStack.push({ continueLabel: condLabel, breakLabel: exitLabel });
+    let terminated = false;
+    for (const s of stmt.body) {
+      if (terminated) {
+        break;
+      }
+      terminated = this.emitStatement(s, lines);
+    }
+    this.loopStack.pop();
+    if (!terminated) {
+      lines.push(`  br label %${condLabel}`);
+    }
+
+    lines.push(`${exitLabel}:`);
+    return false;
+  }
+
+  private emitForStatement(stmt: ForStatement, lines: string[]): boolean {
+    const id = this.labelCounter;
+    this.labelCounter += 1;
+    const condLabel = `for.cond.${id}`;
+    const bodyLabel = `for.body.${id}`;
+    const latchLabel = `for.latch.${id}`;
+    const exitLabel = `for.exit.${id}`;
+
+    if (stmt.initializer) {
+      this.emitStatement(stmt.initializer, lines);
+    }
+
+    lines.push(`  br label %${condLabel}`);
+
+    lines.push(`${condLabel}:`);
+    if (stmt.condition) {
+      const cond = this.emitExpression(stmt.condition, lines);
+      lines.push(`  br i1 ${cond.llvm}, label %${bodyLabel}, label %${exitLabel}`);
+    } else {
+      lines.push(`  br label %${bodyLabel}`);
+    }
+
+    lines.push(`${bodyLabel}:`);
+    this.loopStack.push({ continueLabel: latchLabel, breakLabel: exitLabel });
+    let terminated = false;
+    for (const s of stmt.body) {
+      if (terminated) {
+        break;
+      }
+      terminated = this.emitStatement(s, lines);
+    }
+    this.loopStack.pop();
+    if (!terminated) {
+      lines.push(`  br label %${latchLabel}`);
+    }
+
+    lines.push(`${latchLabel}:`);
+    if (stmt.update) {
+      this.emitStatement(stmt.update, lines);
+    }
+    lines.push(`  br label %${condLabel}`);
+
+    lines.push(`${exitLabel}:`);
+    return false;
   }
 
   private emitIfStatement(stmt: IfStatement, lines: string[]): boolean {
@@ -242,8 +355,50 @@ export class LlvmCodegen {
     if (!local) {
       throw new Error(`Codegen: unknown variable '${stmt.name.name}'`);
     }
-    const value = this.emitExpression(stmt.value, lines, local.type);
-    lines.push(`  store ${toLlvmType(local.type)} ${value.llvm}, ptr ${local.ptr}`);
+    const llvmType = toLlvmType(local.type);
+
+    if (stmt.operator === "=") {
+      const value = this.emitExpression(stmt.value, lines, local.type);
+      lines.push(`  store ${llvmType} ${value.llvm}, ptr ${local.ptr}`);
+      return;
+    }
+
+    const loaded = this.nextTemp();
+    lines.push(`  ${loaded} = load ${llvmType}, ptr ${local.ptr}`);
+    const rhs = this.emitExpression(stmt.value, lines, local.type);
+    const result = this.nextTemp();
+    const isFloat = local.type === "f32" || local.type === "f64";
+    const opcode =
+      stmt.operator === "+="
+        ? isFloat
+          ? "fadd"
+          : "add"
+        : isFloat
+          ? "fsub"
+          : "sub";
+    lines.push(`  ${result} = ${opcode} ${llvmType} ${loaded}, ${rhs.llvm}`);
+    lines.push(`  store ${llvmType} ${result}, ptr ${local.ptr}`);
+  }
+
+  private emitUpdate(stmt: UpdateStatement, lines: string[]): void {
+    const local = this.locals.get(stmt.name.name);
+    if (!local) {
+      throw new Error(`Codegen: unknown variable '${stmt.name.name}'`);
+    }
+    const llvmType = toLlvmType(local.type);
+    const loaded = this.nextTemp();
+    lines.push(`  ${loaded} = load ${llvmType}, ptr ${local.ptr}`);
+    const result = this.nextTemp();
+    const isFloat = local.type === "f32" || local.type === "f64";
+    const one = typedOne(local.type);
+    if (stmt.operator === "++") {
+      const opcode = isFloat ? "fadd" : "add";
+      lines.push(`  ${result} = ${opcode} ${llvmType} ${loaded}, ${one}`);
+    } else {
+      const opcode = isFloat ? "fsub" : "sub";
+      lines.push(`  ${result} = ${opcode} ${llvmType} ${loaded}, ${one}`);
+    }
+    lines.push(`  store ${llvmType} ${result}, ptr ${local.ptr}`);
   }
 
   private emitReturn(stmt: ReturnStatement, lines: string[]): void {
@@ -623,6 +778,21 @@ function toLlvmType(type: ValueType | "void"): string {
       return "ptr";
     case "void":
       return "void";
+  }
+}
+
+function typedOne(type: ValueType): string {
+  switch (type) {
+    case "i32":
+      return "1";
+    case "i64":
+      return "1";
+    case "f32":
+      return "1.000000e+00";
+    case "f64":
+      return "1.000000e+00";
+    default:
+      throw new Error(`Codegen: cannot increment type '${type}'`);
   }
 }
 

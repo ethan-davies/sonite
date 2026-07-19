@@ -100,6 +100,24 @@ describe("Lexer", () => {
     ]);
   });
 
+  it("tokenizes loop keywords and update operators", () => {
+    const { tokens, diagnostics } = lex(
+      `while for break continue ++ -- += -=`,
+    );
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens.map((t) => t.kind)).toEqual([
+      TokenKind.While,
+      TokenKind.For,
+      TokenKind.Break,
+      TokenKind.Continue,
+      TokenKind.PlusPlus,
+      TokenKind.MinusMinus,
+      TokenKind.PlusEqual,
+      TokenKind.MinusEqual,
+      TokenKind.Eof,
+    ]);
+  });
+
   it("rejects single & and |", () => {
     const amp = lex("&");
     expect(amp.diagnostics.hasErrors).toBe(true);

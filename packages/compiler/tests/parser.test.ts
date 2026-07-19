@@ -300,4 +300,44 @@ describe("Parser", () => {
       expect(Array.isArray(stmt.alternate.alternate)).toBe(true);
     }
   });
+
+  it("parses while, for, updates, break, and continue", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        let n = 5;
+        while (n > 0) {
+          n--;
+          continue;
+        }
+        for (let i = 0; i < 3; i++) {
+          i += 1;
+          break;
+        }
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const body = ast.body[0]?.body ?? [];
+    expect(body[1]?.kind).toBe("WhileStatement");
+    if (body[1]?.kind === "WhileStatement") {
+      expect(body[1].body[0]?.kind).toBe("UpdateStatement");
+      expect(body[1].body[1]?.kind).toBe("ContinueStatement");
+      if (body[1].body[0]?.kind === "UpdateStatement") {
+        expect(body[1].body[0].operator).toBe("--");
+      }
+    }
+    expect(body[2]?.kind).toBe("ForStatement");
+    if (body[2]?.kind === "ForStatement") {
+      expect(body[2].initializer?.kind).toBe("VariableDeclaration");
+      expect(body[2].condition?.kind).toBe("BinaryExpression");
+      expect(body[2].update?.kind).toBe("UpdateStatement");
+      if (body[2].update?.kind === "UpdateStatement") {
+        expect(body[2].update.operator).toBe("++");
+      }
+      expect(body[2].body[0]?.kind).toBe("AssignmentStatement");
+      if (body[2].body[0]?.kind === "AssignmentStatement") {
+        expect(body[2].body[0].operator).toBe("+=");
+      }
+      expect(body[2].body[1]?.kind).toBe("BreakStatement");
+    }
+  });
 });

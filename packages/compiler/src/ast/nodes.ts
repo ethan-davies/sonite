@@ -31,9 +31,14 @@ export type AstNode =
   | Parameter
   | VariableDeclaration
   | AssignmentStatement
+  | UpdateStatement
   | ExpressionStatement
   | ReturnStatement
   | IfStatement
+  | WhileStatement
+  | ForStatement
+  | BreakStatement
+  | ContinueStatement
   | CallExpression
   | BinaryExpression
   | UnaryExpression
@@ -58,9 +63,14 @@ export interface Program extends AstNodeBase {
 export type Statement =
   | VariableDeclaration
   | AssignmentStatement
+  | UpdateStatement
   | ExpressionStatement
   | ReturnStatement
-  | IfStatement;
+  | IfStatement
+  | WhileStatement
+  | ForStatement
+  | BreakStatement
+  | ContinueStatement;
 
 export interface Parameter extends AstNodeBase {
   readonly kind: "Parameter";
@@ -87,7 +97,14 @@ export interface VariableDeclaration extends AstNodeBase {
 export interface AssignmentStatement extends AstNodeBase {
   readonly kind: "AssignmentStatement";
   readonly name: Identifier;
+  readonly operator: "=" | "+=" | "-=";
   readonly value: Expression;
+}
+
+export interface UpdateStatement extends AstNodeBase {
+  readonly kind: "UpdateStatement";
+  readonly name: Identifier;
+  readonly operator: "++" | "--";
 }
 
 export interface ExpressionStatement extends AstNodeBase {
@@ -106,6 +123,28 @@ export interface IfStatement extends AstNodeBase {
   readonly consequent: Statement[];
   /** elseif → nested IfStatement; else { } → Statement[]; bare if → null */
   readonly alternate: IfStatement | Statement[] | null;
+}
+
+export interface WhileStatement extends AstNodeBase {
+  readonly kind: "WhileStatement";
+  readonly condition: Expression;
+  readonly body: Statement[];
+}
+
+export interface ForStatement extends AstNodeBase {
+  readonly kind: "ForStatement";
+  readonly initializer: VariableDeclaration | AssignmentStatement | null;
+  readonly condition: Expression | null;
+  readonly update: UpdateStatement | AssignmentStatement | null;
+  readonly body: Statement[];
+}
+
+export interface BreakStatement extends AstNodeBase {
+  readonly kind: "BreakStatement";
+}
+
+export interface ContinueStatement extends AstNodeBase {
+  readonly kind: "ContinueStatement";
 }
 
 export type Expression =

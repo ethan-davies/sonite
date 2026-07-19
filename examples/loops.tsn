@@ -1,0 +1,31 @@
+function main(): void {
+  for (let i: i32 = 0; i < 5; i++) {
+    print(i);
+  }
+
+  for (let j = 0; j < 3; j++) {
+    print(j);
+  }
+
+  let countdown: i32 = 5;
+  while (countdown > 0) {
+    print("T-minus", countdown, "...");
+    countdown--;
+  }
+  print("Blastoff!");
+
+  for (let n = 0; n < 10; n++) {
+    if (n == 3) {
+      continue;
+    }
+    if (n == 7) {
+      break;
+    }
+    print(n);
+  }
+
+  let x: i32 = 10;
+  x += 5;
+  x -= 3;
+  print(x);
+}

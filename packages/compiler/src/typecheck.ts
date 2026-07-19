@@ -106,7 +106,7 @@ function checkFunction(
   }
 
   for (const stmt of fn.body) {
-    checkStatement(stmt, scope, functions, fn.returnType.name, diagnostics);
+    checkStatement(stmt, scope, functions, fn.returnType.name, diagnostics, 0);
   }
 
   if (fn.returnType.name !== "void") {
@@ -127,6 +127,7 @@ function checkStatement(
   functions: Map<string, FunctionSig>,
   returnType: PrimitiveTypeName,
   diagnostics: DiagnosticCollector,
+  loopDepth: number,
 ): void {
   switch (stmt.kind) {
     case "VariableDeclaration": {
@@ -170,6 +171,10 @@ function checkStatement(
       return;
     }
     case "AssignmentStatement": {
+      checkAssignment(stmt, scope, functions, diagnostics);
+      return;
+    }
+    case "UpdateStatement": {
       const binding = scope.get(stmt.name.name);
       if (!binding) {
         diagnostics.error(`Undefined variable '${stmt.name.name}'`, stmt.name.span, "E0304");
@@ -183,15 +188,11 @@ function checkStatement(
         );
         return;
       }
-      const valueType = checkExpression(stmt.value, scope, functions, diagnostics);
-      if (!valueType) {
-        return;
-      }
-      if (!valueMatchesBinding(stmt.value, valueType, binding.type)) {
+      if (!NUMERIC_TYPES.has(binding.type)) {
         diagnostics.error(
-          `Type mismatch: expected '${binding.type}', got '${valueType}'`,
-          stmt.value.span,
-          "E0303",
+          `Operator '${stmt.operator}' requires a numeric variable, got '${binding.type}'`,
+          stmt.name.span,
+          "E0306",
         );
       }
       return;
@@ -244,20 +245,112 @@ function checkStatement(
         );
       }
       for (const s of stmt.consequent) {
-        checkStatement(s, scope, functions, returnType, diagnostics);
+        checkStatement(s, scope, functions, returnType, diagnostics, loopDepth);
       }
       if (stmt.alternate === null) {
         return;
       }
       if (Array.isArray(stmt.alternate)) {
         for (const s of stmt.alternate) {
-          checkStatement(s, scope, functions, returnType, diagnostics);
+          checkStatement(s, scope, functions, returnType, diagnostics, loopDepth);
         }
       } else {
-        checkStatement(stmt.alternate, scope, functions, returnType, diagnostics);
+        checkStatement(stmt.alternate, scope, functions, returnType, diagnostics, loopDepth);
       }
       return;
     }
+    case "WhileStatement": {
+      const condType = checkExpression(stmt.condition, scope, functions, diagnostics);
+      if (condType && condType !== "bool") {
+        diagnostics.error(
+          `While condition must be 'bool', got '${condType}'`,
+          stmt.condition.span,
+          "E0316",
+        );
+      }
+      for (const s of stmt.body) {
+        checkStatement(s, scope, functions, returnType, diagnostics, loopDepth + 1);
+      }
+      return;
+    }
+    case "ForStatement": {
+      if (stmt.initializer) {
+        checkStatement(stmt.initializer, scope, functions, returnType, diagnostics, loopDepth);
+      }
+      if (stmt.condition) {
+        const condType = checkExpression(stmt.condition, scope, functions, diagnostics);
+        if (condType && condType !== "bool") {
+          diagnostics.error(
+            `For condition must be 'bool', got '${condType}'`,
+            stmt.condition.span,
+            "E0316",
+          );
+        }
+      }
+      if (stmt.update) {
+        checkStatement(stmt.update, scope, functions, returnType, diagnostics, loopDepth);
+      }
+      for (const s of stmt.body) {
+        checkStatement(s, scope, functions, returnType, diagnostics, loopDepth + 1);
+      }
+      return;
+    }
+    case "BreakStatement": {
+      if (loopDepth === 0) {
+        diagnostics.error("'break' used outside of a loop", stmt.span, "E0317");
+      }
+      return;
+    }
+    case "ContinueStatement": {
+      if (loopDepth === 0) {
+        diagnostics.error("'continue' used outside of a loop", stmt.span, "E0317");
+      }
+      return;
+    }
+  }
+}
+
+function checkAssignment(
+  stmt: Extract<Statement, { kind: "AssignmentStatement" }>,
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  diagnostics: DiagnosticCollector,
+): void {
+  const binding = scope.get(stmt.name.name);
+  if (!binding) {
+    diagnostics.error(`Undefined variable '${stmt.name.name}'`, stmt.name.span, "E0304");
+    return;
+  }
+  if (!binding.mutable) {
+    diagnostics.error(
+      `Cannot assign to const variable '${stmt.name.name}'`,
+      stmt.name.span,
+      "E0305",
+    );
+    return;
+  }
+
+  if (stmt.operator === "+=" || stmt.operator === "-=") {
+    if (!NUMERIC_TYPES.has(binding.type)) {
+      diagnostics.error(
+        `Operator '${stmt.operator}' requires a numeric variable, got '${binding.type}'`,
+        stmt.name.span,
+        "E0306",
+      );
+      return;
+    }
+  }
+
+  const valueType = checkExpression(stmt.value, scope, functions, diagnostics);
+  if (!valueType) {
+    return;
+  }
+  if (!valueMatchesBinding(stmt.value, valueType, binding.type)) {
+    diagnostics.error(
+      `Type mismatch: expected '${binding.type}', got '${valueType}'`,
+      stmt.value.span,
+      "E0303",
+    );
   }
 }
 

@@ -238,8 +238,62 @@ describe("compile pipeline", () => {
       expect(result.ir).toContain(encodeLlvmString("Minor"));
     });
 
-    it("compiles the hello, variables, arithmetic, and control-flow examples", () => {
-      for (const name of ["hello.tsn", "variables.tsn", "arithmetic.tsn", "control-flow.tsn"]) {
+    it("compiles while and for loops with updates", () => {
+      const result = compile(`
+        function main(): void {
+          let n: i32 = 3;
+          while (n > 0) {
+            print(n);
+            n--;
+          }
+          for (let i = 0; i < 3; i++) {
+            print(i);
+          }
+          let x = 10;
+          x += 5;
+          x -= 2;
+          print(x);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("while.cond.0:");
+      expect(result.ir).toContain("while.body.0:");
+      expect(result.ir).toContain("while.exit.0:");
+      expect(result.ir).toContain("for.cond.1:");
+      expect(result.ir).toContain("for.body.1:");
+      expect(result.ir).toContain("for.latch.1:");
+      expect(result.ir).toContain("for.exit.1:");
+      expect(result.ir).toContain("add i32");
+      expect(result.ir).toContain("sub i32");
+    });
+
+    it("compiles break and continue in loops", () => {
+      const result = compile(`
+        function main(): void {
+          for (let i = 0; i < 10; i++) {
+            if (i == 2) {
+              continue;
+            }
+            if (i == 5) {
+              break;
+            }
+            print(i);
+          }
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("br label %for.latch.0");
+      expect(result.ir).toContain("br label %for.exit.0");
+    });
+
+    it("compiles the hello, variables, arithmetic, control-flow, and loops examples", () => {
+      for (const name of [
+        "hello.tsn",
+        "variables.tsn",
+        "arithmetic.tsn",
+        "control-flow.tsn",
+        "loops.tsn",
+      ]) {
         const source = readFileSync(join(examplesDir, name), "utf8");
         const result = compile(source);
         expect(result.success, name).toBe(true);
@@ -508,6 +562,26 @@ describe("compile pipeline", () => {
       `);
       expect(result.success).toBe(false);
       expect(result.diagnostics.some((d) => d.code === "E0316")).toBe(true);
+    });
+
+    it("fails when break is used outside a loop", () => {
+      const result = compile(`
+        function main(): void {
+          break;
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0317")).toBe(true);
+    });
+
+    it("fails when continue is used outside a loop", () => {
+      const result = compile(`
+        function main(): void {
+          continue;
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0317")).toBe(true);
     });
 
     it("fails on mismatched comparison operands", () => {

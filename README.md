@@ -76,10 +76,12 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 - A single top-level `function main(): void` with no parameters (return type required)
 - Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`
 - `let` / `const` variables with optional annotations and inference (`5` → `i32`, `3.14` → `f64`)
-- Reassignment for `let` only
+- Reassignment for `let` only (`=`, `+=`, `-=`, `++`, `--` on numeric lets)
 - Literals: integers, floats, booleans, strings, chars
 - `print(...)` of printable values; multiple args are joined with spaces
 - String concatenation with `+`
+- Comparisons (`== != < <= > >=`) and logical ops (`&& || !`)
+- Control flow: `if` / `elseif` / `else`, `while`, `for`, `break`, `continue`
 - `//` line comments and `/* */` block comments
 
 `print` is a builtin. It is lowered to libc `printf` in the generated LLVM IR.
@@ -90,6 +92,9 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 | --- | --- |
 | [`examples/hello.tsn`](./examples/hello.tsn) | Minimal `main` + `print` |
 | [`examples/variables.tsn`](./examples/variables.tsn) | Types, inference, `let`/`const`, concat, multi-arg `print` |
+| [`examples/arithmetic.tsn`](./examples/arithmetic.tsn) | Arithmetic and precedence |
+| [`examples/control-flow.tsn`](./examples/control-flow.tsn) | `if` / `elseif` / `else`, comparisons |
+| [`examples/loops.tsn`](./examples/loops.tsn) | `for` / `while`, updates, `break` / `continue` |
 
 ## Development
 

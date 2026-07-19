@@ -49,6 +49,29 @@ describe("compile pipeline", () => {
       expect(calls).toHaveLength(2);
     });
 
+    it("compiles annotated and inferred bindings", () => {
+      const result = compile(`
+        function main(): void {
+          let age: i32 = 16;
+          let name: string = "Ethan";
+          let active: bool = true;
+          let inferredAge = 16;
+          let inferredName = "Ethan";
+          print(age);
+          print(name);
+          print(active);
+          print(inferredAge);
+          print(inferredName);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("%v.age = alloca i32");
+      expect(result.ir).toContain("%v.name = alloca ptr");
+      expect(result.ir).toContain("%v.active = alloca i1");
+      expect(result.ir).toContain("%v.inferredAge = alloca i32");
+      expect(result.ir).toContain("%v.inferredName = alloca ptr");
+    });
+
     it("compiles variables, inference, and concat", () => {
       const result = compile(`
         function main(): void {
@@ -286,19 +309,76 @@ describe("compile pipeline", () => {
       expect(result.ir).toContain("br label %for.exit.0");
     });
 
-    it("compiles the hello, variables, arithmetic, control-flow, and loops examples", () => {
+    it("compiles the hello, variables, arithmetic, control-flow, loops, and arrays examples", () => {
       for (const name of [
         "hello.tsn",
         "variables.tsn",
         "arithmetic.tsn",
         "control-flow.tsn",
         "loops.tsn",
+        "arrays.tsn",
       ]) {
         const source = readFileSync(join(examplesDir, name), "utf8");
         const result = compile(source);
         expect(result.success, name).toBe(true);
         expect(result.ir, name).toContain("define i32 @main()");
       }
+    });
+
+    it("compiles array literals, indexing, length, mutation, methods, and for-in", () => {
+      const result = compile(`
+        function main(): void {
+          let numbers: i32[] = [1, 2, 3];
+          print(numbers[0]);
+          numbers[0] = 10;
+          print(numbers.length);
+          numbers.push(4);
+          print(numbers.includes(10));
+          print(numbers.indexOf(2));
+          let last = numbers.pop();
+          print(last);
+          for (i in numbers) {
+            print(i);
+          }
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("declare ptr @malloc");
+      expect(result.ir).toContain("declare ptr @realloc");
+      expect(result.ir).toContain("%v.numbers = alloca ptr");
+      expect(result.ir).toContain("forin.cond.");
+      expect(result.ir).toContain("forin.body.");
+      expect(result.ir).toContain("arr.grow.");
+    });
+
+    it("allows mutating const array elements and push", () => {
+      const result = compile(`
+        function main(): void {
+          const xs = [1, 2];
+          xs[0] = 9;
+          xs.push(3);
+          print(xs[0]);
+        }
+      `);
+      expect(result.success).toBe(true);
+    });
+
+    it("compiles array parameters and returns", () => {
+      const result = compile(`
+        function first(xs: i32[]): i32 {
+          return xs[0];
+        }
+        function make(): i32[] {
+          return [7, 8];
+        }
+        function main(): void {
+          let a = make();
+          print(first(a));
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("define i32 @first(ptr %arg0)");
+      expect(result.ir).toContain("define ptr @make()");
     });
   });
 
@@ -375,11 +455,24 @@ describe("compile pipeline", () => {
     it("fails on type annotation mismatch", () => {
       const result = compile(`
         function main(): void {
+          let age: i32 = "hello";
+        }
+      `);
+      expect(result.success).toBe(false);
+      const mismatch = result.diagnostics.find((d) => d.code === "E0303");
+      expect(mismatch).toBeDefined();
+      expect(mismatch?.message).toBe("Expected i32, got string");
+    });
+
+    it("fails on string annotated as wrong type", () => {
+      const result = compile(`
+        function main(): void {
           let x: string = 42;
         }
       `);
       expect(result.success).toBe(false);
-      expect(result.diagnostics.some((d) => d.code === "E0303")).toBe(true);
+      const mismatch = result.diagnostics.find((d) => d.code === "E0303");
+      expect(mismatch?.message).toBe("Expected string, got i32");
     });
 
     it("fails on duplicate variable declarations", () => {
@@ -602,6 +695,65 @@ describe("compile pipeline", () => {
       `);
       expect(result.success).toBe(false);
       expect(result.diagnostics.some((d) => d.code === "E0306")).toBe(true);
+    });
+
+    it("fails on empty array without annotation", () => {
+      const result = compile(`
+        function main(): void {
+          let xs = [];
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0321")).toBe(true);
+    });
+
+    it("compiles printing an array value as [elements]", () => {
+      const result = compile(`
+        function main(): void {
+          let xs: i32[] = [1, 2, 3];
+          print(xs);
+          let empty: i32[] = [];
+          print(empty);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("declare i32 @sprintf");
+      expect(result.ir).toContain(encodeLlvmString("["));
+      expect(result.ir).toContain(encodeLlvmString(", "));
+      expect(result.ir).toContain(encodeLlvmString("]"));
+    });
+
+    it("fails on heterogeneous array literals", () => {
+      const result = compile(`
+        function main(): void {
+          let xs = [1, true];
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0322")).toBe(true);
+    });
+
+    it("fails when rebinding a const array", () => {
+      const result = compile(`
+        function main(): void {
+          const xs = [1];
+          xs = [2];
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0305")).toBe(true);
+    });
+
+    it("fails on for-in over a non-array", () => {
+      const result = compile(`
+        function main(): void {
+          for (i in 1) {
+            print(i);
+          }
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0318")).toBe(true);
     });
   });
 });

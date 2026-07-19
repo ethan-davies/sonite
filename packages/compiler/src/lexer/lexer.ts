@@ -63,12 +63,18 @@ export class Lexer {
         return this.makeToken(TokenKind.LBrace, ch, start);
       case "}":
         return this.makeToken(TokenKind.RBrace, ch, start);
+      case "[":
+        return this.makeToken(TokenKind.LBracket, ch, start);
+      case "]":
+        return this.makeToken(TokenKind.RBracket, ch, start);
       case ";":
         return this.makeToken(TokenKind.Semicolon, ch, start);
       case ":":
         return this.makeToken(TokenKind.Colon, ch, start);
       case ",":
         return this.makeToken(TokenKind.Comma, ch, start);
+      case ".":
+        return this.makeToken(TokenKind.Dot, ch, start);
       case "+":
         if (this.peek() === "+") {
           this.advance();

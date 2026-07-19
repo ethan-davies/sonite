@@ -37,11 +37,15 @@ export type AstNode =
   | IfStatement
   | WhileStatement
   | ForStatement
+  | ForInStatement
   | BreakStatement
   | ContinueStatement
   | CallExpression
   | BinaryExpression
   | UnaryExpression
+  | IndexExpression
+  | MemberExpression
+  | ArrayLiteral
   | Identifier
   | StringLiteral
   | IntegerLiteral
@@ -69,6 +73,7 @@ export type Statement =
   | IfStatement
   | WhileStatement
   | ForStatement
+  | ForInStatement
   | BreakStatement
   | ContinueStatement;
 
@@ -94,9 +99,11 @@ export interface VariableDeclaration extends AstNodeBase {
   readonly initializer: Expression;
 }
 
+export type Assignable = Identifier | IndexExpression;
+
 export interface AssignmentStatement extends AstNodeBase {
   readonly kind: "AssignmentStatement";
-  readonly name: Identifier;
+  readonly target: Assignable;
   readonly operator: "=" | "+=" | "-=";
   readonly value: Expression;
 }
@@ -139,6 +146,15 @@ export interface ForStatement extends AstNodeBase {
   readonly body: Statement[];
 }
 
+export interface ForInStatement extends AstNodeBase {
+  readonly kind: "ForInStatement";
+  /** null = bare `for (i in xs)`; let/const introduce an explicit binding */
+  readonly mutability: "let" | "const" | null;
+  readonly name: Identifier;
+  readonly iterable: Expression;
+  readonly body: Statement[];
+}
+
 export interface BreakStatement extends AstNodeBase {
   readonly kind: "BreakStatement";
 }
@@ -151,6 +167,9 @@ export type Expression =
   | CallExpression
   | BinaryExpression
   | UnaryExpression
+  | IndexExpression
+  | MemberExpression
+  | ArrayLiteral
   | Identifier
   | StringLiteral
   | IntegerLiteral
@@ -158,9 +177,11 @@ export type Expression =
   | BooleanLiteral
   | CharLiteral;
 
+export type CallCallee = Identifier | MemberExpression;
+
 export interface CallExpression extends AstNodeBase {
   readonly kind: "CallExpression";
-  readonly callee: Identifier;
+  readonly callee: CallCallee;
   readonly args: Expression[];
 }
 
@@ -175,6 +196,23 @@ export interface UnaryExpression extends AstNodeBase {
   readonly kind: "UnaryExpression";
   readonly operator: "-" | "!";
   readonly operand: Expression;
+}
+
+export interface IndexExpression extends AstNodeBase {
+  readonly kind: "IndexExpression";
+  readonly object: Expression;
+  readonly index: Expression;
+}
+
+export interface MemberExpression extends AstNodeBase {
+  readonly kind: "MemberExpression";
+  readonly object: Expression;
+  readonly property: Identifier;
+}
+
+export interface ArrayLiteral extends AstNodeBase {
+  readonly kind: "ArrayLiteral";
+  readonly elements: Expression[];
 }
 
 export interface Identifier extends AstNodeBase {
@@ -213,7 +251,14 @@ export interface CharLiteral extends AstNodeBase {
   readonly raw: string;
 }
 
-export interface TypeAnnotation extends AstNodeBase {
-  readonly kind: "TypeAnnotation";
+export type TypeAnnotation = PrimitiveType | ArrayType;
+
+export interface PrimitiveType extends AstNodeBase {
+  readonly kind: "PrimitiveType";
   readonly name: PrimitiveTypeName;
+}
+
+export interface ArrayType extends AstNodeBase {
+  readonly kind: "ArrayType";
+  readonly element: TypeAnnotation;
 }

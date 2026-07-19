@@ -43,9 +43,13 @@ export function validate(program: Program, diagnostics: DiagnosticCollector): vo
     );
   }
 
-  if (main.returnType.name !== "void") {
+  if (main.returnType.kind !== "PrimitiveType" || main.returnType.name !== "void") {
+    const found =
+      main.returnType.kind === "PrimitiveType"
+        ? main.returnType.name
+        : "array";
     diagnostics.error(
-      `Entry function 'main' must return 'void', found '${main.returnType.name}'`,
+      `Entry function 'main' must return 'void', found '${found}'`,
       main.returnType.span,
       "E0205",
     );

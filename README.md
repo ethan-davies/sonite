@@ -74,14 +74,15 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 **Currently supported:**
 
 - A single top-level `function main(): void` with no parameters (return type required)
-- Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`
+- Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`, and arrays `T[]`
 - `let` / `const` variables with optional annotations and inference (`5` → `i32`, `3.14` → `f64`)
 - Reassignment for `let` only (`=`, `+=`, `-=`, `++`, `--` on numeric lets)
+- Arrays: literals `[1, 2, 3]`, indexing, element assignment, `.length`, `.push` / `.pop` / `.includes` / `.indexOf`
 - Literals: integers, floats, booleans, strings, chars
 - `print(...)` of printable values; multiple args are joined with spaces
 - String concatenation with `+`
 - Comparisons (`== != < <= > >=`) and logical ops (`&& || !`)
-- Control flow: `if` / `elseif` / `else`, `while`, `for`, `break`, `continue`
+- Control flow: `if` / `elseif` / `else`, `while`, C-style `for`, element `for (i in arr)`, `break`, `continue`
 - `//` line comments and `/* */` block comments
 
 `print` is a builtin. It is lowered to libc `printf` in the generated LLVM IR.
@@ -95,6 +96,7 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 | [`examples/arithmetic.tsn`](./examples/arithmetic.tsn) | Arithmetic and precedence |
 | [`examples/control-flow.tsn`](./examples/control-flow.tsn) | `if` / `elseif` / `else`, comparisons |
 | [`examples/loops.tsn`](./examples/loops.tsn) | `for` / `while`, updates, `break` / `continue` |
+| [`examples/arrays.tsn`](./examples/arrays.tsn) | Array literals, indexing, methods, `for-in` |
 
 ## Development
 

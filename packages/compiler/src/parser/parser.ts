@@ -1,4 +1,5 @@
 import type {
+  ArrayLiteral,
   AssignmentStatement,
   BinaryExpression,
   BinaryOperator,
@@ -10,11 +11,14 @@ import type {
   Expression,
   ExpressionStatement,
   FloatLiteral,
+  ForInStatement,
   ForStatement,
   FunctionDeclaration,
   Identifier,
   IfStatement,
+  IndexExpression,
   IntegerLiteral,
+  MemberExpression,
   Parameter,
   PrimitiveTypeName,
   Program,
@@ -59,14 +63,16 @@ const UPDATE_OPS = new Set<TokenKind>([TokenKind.PlusPlus, TokenKind.MinusMinus]
  *   statement    = varDecl | assignment | updateStmt | returnStmt
  *                | ifStmt | whileStmt | forStmt | breakStmt | continueStmt | exprStmt
  *   varDecl      = ("let"|"const") Ident (":" type)? "=" expression ";"
- *   assignment   = Ident ("=" | "+=" | "-=") expression ";"
+ *   assignment   = (Ident | Ident "[" expression "]") ("=" | "+=" | "-=") expression ";"
  *   updateStmt   = Ident ("++" | "--") ";"
  *   returnStmt   = "return" expression? ";"
  *   ifStmt       = "if" "(" expression ")" block
  *                  ("elseif" "(" expression ")" block)*
  *                  ("else" block)?
  *   whileStmt    = "while" "(" expression ")" block
- *   forStmt      = "for" "(" forInit condition? ";" forUpdate? ")" block
+ *   forStmt      = forCStyle | forIn
+ *   forCStyle    = "for" "(" forInit condition? ";" forUpdate? ")" block
+ *   forIn        = "for" "(" (("let"|"const")? Ident) "in" expression ")" block
  *   forInit      = varDecl | assignment | ";"
  *   forUpdate    = updateStmtNoSemi | assignmentNoSemi
  *   breakStmt    = "break" ";"
@@ -74,16 +80,10 @@ const UPDATE_OPS = new Set<TokenKind>([TokenKind.PlusPlus, TokenKind.MinusMinus]
  *   block        = "{" statement* "}"
  *   exprStmt     = callExpr ";"
  *   expression   = or
- *   or           = and ("||" and)*
- *   and          = equality ("&&" equality)*
- *   equality     = relational (("==" | "!=") relational)*
- *   relational   = additive (("<" | "<=" | ">" | ">=") additive)*
- *   additive     = multiplicative (("+" | "-") multiplicative)*
- *   multiplicative = unary (("*" | "/" | "%") unary)*
- *   unary        = ("-" | "!") unary | primary
- *   primary      = "(" expression ")" | literal | Ident | callExpr
- *   callExpr     = Ident "(" (expression ("," expression)*)? ")"
- *   type         = Ident
+ *   primary      = "(" expression ")" | arrayLiteral | literal | Ident | callExpr
+ *   postfix      = primary ("[" expression "]" | "." Ident ("(" args? ")")?)*
+ *   arrayLiteral = "[" (expression ("," expression)*)? "]"
+ *   type         = Ident ("[" "]")*
  */
 export class Parser {
   private readonly tokens: Token[];
@@ -270,6 +270,10 @@ export class Parser {
       if (next && ASSIGNMENT_OPS.has(next.kind)) {
         return this.parseAssignment(true);
       }
+      // numbers[0] = ...
+      if (next?.kind === TokenKind.LBracket) {
+        return this.parseIndexAssignment(true);
+      }
     }
 
     return this.parseExpressionStatement();
@@ -376,12 +380,17 @@ export class Parser {
     };
   }
 
-  private parseForStatement(): ForStatement | null {
+  private parseForStatement(): ForStatement | ForInStatement | null {
     const start = this.peek().span.start;
     this.advance(); // for
 
     if (!this.expect(TokenKind.LParen, "Expected '(' after 'for'")) {
       return null;
+    }
+
+    // for (i in ...) | for (let i in ...) | for (const i in ...)
+    if (this.isForInStart()) {
+      return this.parseForInRemainder(start);
     }
 
     const initializer = this.parseForInitializer();
@@ -427,6 +436,66 @@ export class Parser {
     };
   }
 
+  private isForInStart(): boolean {
+    if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.In)) {
+      return true;
+    }
+    if (
+      (this.check(TokenKind.Let) || this.check(TokenKind.Const)) &&
+      this.tokens[this.current + 1]?.kind === TokenKind.Identifier &&
+      this.tokens[this.current + 2]?.kind === TokenKind.In
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  private parseForInRemainder(start: { line: number; column: number; offset: number }): ForInStatement | null {
+    let mutability: "let" | "const" | null = null;
+    if (this.check(TokenKind.Let) || this.check(TokenKind.Const)) {
+      const token = this.advance();
+      mutability = token.kind === TokenKind.Const ? "const" : "let";
+    }
+
+    const nameToken = this.expect(TokenKind.Identifier, "Expected loop variable name");
+    if (!nameToken) {
+      return null;
+    }
+
+    const name: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+
+    if (!this.expect(TokenKind.In, "Expected 'in' in for-in loop")) {
+      return null;
+    }
+
+    const iterable = this.parseExpression();
+    if (!iterable) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after for-in clause")) {
+      return null;
+    }
+
+    const body = this.parseBlock();
+    if (!body) {
+      return null;
+    }
+
+    return {
+      kind: "ForInStatement",
+      mutability,
+      name,
+      iterable,
+      body: body.statements,
+      span: { start, end: body.end },
+    };
+  }
+
   /** Returns null for empty init, undefined on parse failure. */
   private parseForInitializer(): VariableDeclaration | AssignmentStatement | null | undefined {
     if (this.check(TokenKind.Semicolon)) {
@@ -442,6 +511,9 @@ export class Parser {
       const next = this.tokens[this.current + 1];
       if (next && ASSIGNMENT_OPS.has(next.kind)) {
         return this.parseAssignment(true);
+      }
+      if (next?.kind === TokenKind.LBracket) {
+        return this.parseIndexAssignment(true);
       }
     }
 
@@ -461,6 +533,9 @@ export class Parser {
     }
     if (next && ASSIGNMENT_OPS.has(next.kind)) {
       return this.parseAssignment(false);
+    }
+    if (next?.kind === TokenKind.LBracket) {
+      return this.parseIndexAssignment(false);
     }
 
     this.diagnostics.error("Expected for-loop update", this.peek().span, "E0102");
@@ -591,12 +666,53 @@ export class Parser {
   private parseAssignment(requireSemicolon: boolean): AssignmentStatement | null {
     const start = this.peek().span.start;
     const nameToken = this.advance();
-    const name: Identifier = {
+    const target: Identifier = {
       kind: "Identifier",
       name: nameToken.lexeme,
       span: nameToken.span,
     };
 
+    return this.finishAssignment(start, target, requireSemicolon);
+  }
+
+  private parseIndexAssignment(requireSemicolon: boolean): AssignmentStatement | null {
+    const start = this.peek().span.start;
+    const nameToken = this.advance();
+    const object: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+
+    if (!this.expect(TokenKind.LBracket, "Expected '['")) {
+      return null;
+    }
+
+    const index = this.parseExpression();
+    if (!index) {
+      return null;
+    }
+
+    const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after index");
+    if (!rbracket) {
+      return null;
+    }
+
+    const target: IndexExpression = {
+      kind: "IndexExpression",
+      object,
+      index,
+      span: { start: object.span.start, end: rbracket.span.end },
+    };
+
+    return this.finishAssignment(start, target, requireSemicolon);
+  }
+
+  private finishAssignment(
+    start: { line: number; column: number; offset: number },
+    target: Identifier | IndexExpression,
+    requireSemicolon: boolean,
+  ): AssignmentStatement | null {
     const opToken = this.advance();
     let operator: "=" | "+=" | "-=";
     if (opToken.kind === TokenKind.Equal) {
@@ -623,7 +739,7 @@ export class Parser {
 
     return {
       kind: "AssignmentStatement",
-      name,
+      target,
       operator,
       value,
       span: { start, end },
@@ -689,22 +805,34 @@ export class Parser {
   private parseExpressionStatement(): ExpressionStatement | null {
     const start = this.peek().span.start;
 
-    if (!this.check(TokenKind.Identifier)) {
-      this.diagnostics.error("Expected a statement", this.peek().span, "E0102");
+    // Method call: Ident . Ident ( ... ) or Ident [ ... ] . Ident ( ... )
+    // Function call: Ident (
+    if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.LParen)) {
+      const expression = this.parseCallExpression();
+      if (!expression) {
+        return null;
+      }
+      const semicolon = this.expect(TokenKind.Semicolon, "Expected ';' after expression");
+      const end = semicolon?.span.end ?? expression.span.end;
+      return {
+        kind: "ExpressionStatement",
+        expression,
+        span: { start, end },
+      };
+    }
+
+    // Parse a primary with postfix; must end as a CallExpression
+    const expression = this.parsePrimary();
+    if (!expression) {
       return null;
     }
 
-    if (!this.checkNext(TokenKind.LParen)) {
+    if (expression.kind !== "CallExpression") {
       this.diagnostics.error(
-        `Expected a call statement; found '${this.peek().lexeme}'`,
-        this.peek().span,
+        "Expected a call statement",
+        expression.span,
         "E0102",
       );
-      return null;
-    }
-
-    const expression = this.parseCallExpression();
-    if (!expression) {
       return null;
     }
 
@@ -903,32 +1031,30 @@ export class Parser {
   }
 
   private parsePrimary(): Expression | null {
+    let expr: Expression | null = null;
+
     if (this.check(TokenKind.LParen)) {
       this.advance();
-      const expr = this.parseExpression();
-      if (!expr) {
+      const inner = this.parseExpression();
+      if (!inner) {
         return null;
       }
       if (!this.expect(TokenKind.RParen, "Expected ')' after expression")) {
         return null;
       }
-      return expr;
-    }
-
-    if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.LParen)) {
-      return this.parseCallExpression();
-    }
-
-    if (this.check(TokenKind.Identifier)) {
+      expr = inner;
+    } else if (this.check(TokenKind.LBracket)) {
+      expr = this.parseArrayLiteral();
+    } else if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.LParen)) {
+      expr = this.parseCallExpression();
+    } else if (this.check(TokenKind.Identifier)) {
       const token = this.advance();
-      return {
+      expr = {
         kind: "Identifier",
         name: token.lexeme,
         span: token.span,
       };
-    }
-
-    if (this.check(TokenKind.String)) {
+    } else if (this.check(TokenKind.String)) {
       const token = this.advance();
       const literal: StringLiteral = {
         kind: "StringLiteral",
@@ -936,10 +1062,8 @@ export class Parser {
         raw: token.lexeme,
         span: token.span,
       };
-      return literal;
-    }
-
-    if (this.check(TokenKind.Integer)) {
+      expr = literal;
+    } else if (this.check(TokenKind.Integer)) {
       const token = this.advance();
       const literal: IntegerLiteral = {
         kind: "IntegerLiteral",
@@ -947,10 +1071,8 @@ export class Parser {
         raw: token.lexeme,
         span: token.span,
       };
-      return literal;
-    }
-
-    if (this.check(TokenKind.Float)) {
+      expr = literal;
+    } else if (this.check(TokenKind.Float)) {
       const token = this.advance();
       const literal: FloatLiteral = {
         kind: "FloatLiteral",
@@ -958,20 +1080,16 @@ export class Parser {
         raw: token.lexeme,
         span: token.span,
       };
-      return literal;
-    }
-
-    if (this.check(TokenKind.True) || this.check(TokenKind.False)) {
+      expr = literal;
+    } else if (this.check(TokenKind.True) || this.check(TokenKind.False)) {
       const token = this.advance();
       const literal: BooleanLiteral = {
         kind: "BooleanLiteral",
         value: token.kind === TokenKind.True,
         span: token.span,
       };
-      return literal;
-    }
-
-    if (this.check(TokenKind.Char)) {
+      expr = literal;
+    } else if (this.check(TokenKind.Char)) {
       const token = this.advance();
       const literal: CharLiteral = {
         kind: "CharLiteral",
@@ -979,11 +1097,111 @@ export class Parser {
         raw: token.lexeme,
         span: token.span,
       };
-      return literal;
+      expr = literal;
+    } else {
+      this.diagnostics.error(`Expected an expression, found '${this.peek().lexeme}'`, this.peek().span, "E0103");
+      return null;
     }
 
-    this.diagnostics.error(`Expected an expression, found '${this.peek().lexeme}'`, this.peek().span, "E0103");
-    return null;
+    if (!expr) {
+      return null;
+    }
+
+    return this.parsePostfix(expr);
+  }
+
+  private parsePostfix(expr: Expression): Expression | null {
+    let current = expr;
+
+    for (;;) {
+      if (this.check(TokenKind.LBracket)) {
+        this.advance();
+        const index = this.parseExpression();
+        if (!index) {
+          return null;
+        }
+        const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after index");
+        if (!rbracket) {
+          return null;
+        }
+        current = {
+          kind: "IndexExpression",
+          object: current,
+          index,
+          span: { start: current.span.start, end: rbracket.span.end },
+        };
+        continue;
+      }
+
+      if (this.check(TokenKind.Dot)) {
+        this.advance();
+        const propToken = this.expect(TokenKind.Identifier, "Expected property name after '.'");
+        if (!propToken) {
+          return null;
+        }
+        const property: Identifier = {
+          kind: "Identifier",
+          name: propToken.lexeme,
+          span: propToken.span,
+        };
+        const member: MemberExpression = {
+          kind: "MemberExpression",
+          object: current,
+          property,
+          span: { start: current.span.start, end: property.span.end },
+        };
+
+        if (this.check(TokenKind.LParen)) {
+          const call = this.parseCallArgs(member);
+          if (!call) {
+            return null;
+          }
+          current = call;
+        } else {
+          current = member;
+        }
+        continue;
+      }
+
+      break;
+    }
+
+    return current;
+  }
+
+  private parseArrayLiteral(): ArrayLiteral | null {
+    const start = this.peek().span.start;
+    this.advance(); // [
+
+    const elements: Expression[] = [];
+    if (!this.check(TokenKind.RBracket)) {
+      const first = this.parseExpression();
+      if (!first) {
+        return null;
+      }
+      elements.push(first);
+
+      while (this.check(TokenKind.Comma)) {
+        this.advance();
+        if (this.check(TokenKind.RBracket)) {
+          break; // trailing comma
+        }
+        const elem = this.parseExpression();
+        if (!elem) {
+          return null;
+        }
+        elements.push(elem);
+      }
+    }
+
+    const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after array elements");
+    const end = rbracket?.span.end ?? this.peek().span.end;
+
+    return {
+      kind: "ArrayLiteral",
+      elements,
+      span: { start, end },
+    };
   }
 
   private parseCallExpression(): CallExpression | null {
@@ -999,6 +1217,13 @@ export class Parser {
       span: calleeToken.span,
     };
 
+    return this.parseCallArgs(callee, start);
+  }
+
+  private parseCallArgs(
+    callee: Identifier | MemberExpression,
+    start = callee.span.start,
+  ): CallExpression | null {
     if (!this.expect(TokenKind.LParen, "Expected '(' after function name")) {
       return null;
     }
@@ -1047,11 +1272,26 @@ export class Parser {
       return null;
     }
 
-    return {
-      kind: "TypeAnnotation",
+    let type: TypeAnnotation = {
+      kind: "PrimitiveType",
       name: token.lexeme as PrimitiveTypeName,
       span: token.span,
     };
+
+    while (this.check(TokenKind.LBracket)) {
+      this.advance();
+      const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after '[' in array type");
+      if (!rbracket) {
+        return null;
+      }
+      type = {
+        kind: "ArrayType",
+        element: type,
+        span: { start: type.span.start, end: rbracket.span.end },
+      };
+    }
+
+    return type;
   }
 
   private expect(kind: TokenKind, message: string): Token | null {

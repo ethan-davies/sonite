@@ -20,7 +20,7 @@ describe("Parser", () => {
     expect(diagnostics.hasErrors).toBe(false);
     expect(ast.body).toHaveLength(1);
     expect(ast.body[0]?.name.name).toBe("main");
-    expect(ast.body[0]?.returnType.name).toBe("void");
+    expect(ast.body[0]?.returnType).toMatchObject({ kind: "PrimitiveType", name: "void" });
     expect(ast.body[0]?.params).toEqual([]);
     expect(ast.body[0]?.body).toHaveLength(1);
 
@@ -34,7 +34,10 @@ describe("Parser", () => {
     if (call.kind !== "CallExpression") {
       return;
     }
-    expect(call.callee.name).toBe("print");
+    expect(call.callee.kind).toBe("Identifier");
+    if (call.callee.kind === "Identifier") {
+      expect(call.callee.name).toBe("print");
+    }
     expect(call.args[0]).toMatchObject({
       kind: "StringLiteral",
       value: "hi",
@@ -66,7 +69,7 @@ describe("Parser", () => {
     }
     if (body[1]?.kind === "VariableDeclaration") {
       expect(body[1].mutability).toBe("const");
-      expect(body[1].typeAnnotation?.name).toBe("string");
+      expect(body[1].typeAnnotation).toMatchObject({ kind: "PrimitiveType", name: "string" });
     }
     if (body[4]?.kind === "ExpressionStatement" && body[4].expression.kind === "CallExpression") {
       const arg = body[4].expression.args[0];
@@ -217,7 +220,10 @@ describe("Parser", () => {
     expect(ast.body[0]?.name.name).toBe("add");
     expect(ast.body[0]?.params).toHaveLength(2);
     expect(ast.body[0]?.params[0]?.name.name).toBe("a");
-    expect(ast.body[0]?.params[0]?.typeAnnotation.name).toBe("i32");
+    expect(ast.body[0]?.params[0]?.typeAnnotation).toMatchObject({
+      kind: "PrimitiveType",
+      name: "i32",
+    });
     expect(ast.body[0]?.body[0]?.kind).toBe("ReturnStatement");
     if (ast.body[0]?.body[0]?.kind === "ReturnStatement") {
       expect(ast.body[0].body[0].value?.kind).toBe("BinaryExpression");
@@ -338,6 +344,70 @@ describe("Parser", () => {
         expect(body[2].body[0].operator).toBe("+=");
       }
       expect(body[2].body[1]?.kind).toBe("BreakStatement");
+    }
+  });
+
+  it("parses array types, literals, indexing, methods, and for-in", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        let numbers: i32[] = [1, 2, 3];
+        print(numbers[0]);
+        numbers[0] = 10;
+        print(numbers.length);
+        numbers.push(4);
+        for (i in numbers) {
+          print(i);
+        }
+        for (let x in numbers) {
+          print(x);
+        }
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const body = ast.body[0]?.body ?? [];
+    expect(body[0]?.kind).toBe("VariableDeclaration");
+    if (body[0]?.kind === "VariableDeclaration") {
+      expect(body[0].typeAnnotation?.kind).toBe("ArrayType");
+      if (body[0].typeAnnotation?.kind === "ArrayType") {
+        expect(body[0].typeAnnotation.element).toMatchObject({
+          kind: "PrimitiveType",
+          name: "i32",
+        });
+      }
+      expect(body[0].initializer.kind).toBe("ArrayLiteral");
+      if (body[0].initializer.kind === "ArrayLiteral") {
+        expect(body[0].initializer.elements).toHaveLength(3);
+      }
+    }
+
+    if (body[1]?.kind === "ExpressionStatement" && body[1].expression.kind === "CallExpression") {
+      expect(body[1].expression.args[0]?.kind).toBe("IndexExpression");
+    }
+
+    expect(body[2]?.kind).toBe("AssignmentStatement");
+    if (body[2]?.kind === "AssignmentStatement") {
+      expect(body[2].target.kind).toBe("IndexExpression");
+    }
+
+    if (body[3]?.kind === "ExpressionStatement" && body[3].expression.kind === "CallExpression") {
+      expect(body[3].expression.args[0]?.kind).toBe("MemberExpression");
+    }
+
+    expect(body[4]?.kind).toBe("ExpressionStatement");
+    if (body[4]?.kind === "ExpressionStatement" && body[4].expression.kind === "CallExpression") {
+      expect(body[4].expression.callee.kind).toBe("MemberExpression");
+    }
+
+    expect(body[5]?.kind).toBe("ForInStatement");
+    if (body[5]?.kind === "ForInStatement") {
+      expect(body[5].mutability).toBeNull();
+      expect(body[5].name.name).toBe("i");
+    }
+
+    expect(body[6]?.kind).toBe("ForInStatement");
+    if (body[6]?.kind === "ForInStatement") {
+      expect(body[6].mutability).toBe("let");
+      expect(body[6].name.name).toBe("x");
     }
   });
 });

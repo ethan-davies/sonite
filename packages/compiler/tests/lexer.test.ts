@@ -118,6 +118,24 @@ describe("Lexer", () => {
     ]);
   });
 
+  it("tokenizes brackets, dot, and in keyword", () => {
+    const { tokens, diagnostics } = lex(`i32[] numbers[0].push in`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens.map((t) => t.kind)).toEqual([
+      TokenKind.Identifier,
+      TokenKind.LBracket,
+      TokenKind.RBracket,
+      TokenKind.Identifier,
+      TokenKind.LBracket,
+      TokenKind.Integer,
+      TokenKind.RBracket,
+      TokenKind.Dot,
+      TokenKind.Identifier,
+      TokenKind.In,
+      TokenKind.Eof,
+    ]);
+  });
+
   it("rejects single & and |", () => {
     const amp = lex("&");
     expect(amp.diagnostics.hasErrors).toBe(true);

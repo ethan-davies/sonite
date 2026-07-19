@@ -1,18 +1,27 @@
 function main(): void {
-  let x = 42;
-  const pi = 3.14;
+  // Type annotations
+  let age: i32 = 16;
+  let name: string = "Ethan";
+  let active: bool = true;
+
+  // Type inference
+  let inferredAge = 16; // i32
+  let inferredName = "Ethan"; // string
+  let ok = true; // bool
+  const pi = 3.14; // f64
   let n: i64 = 100;
-  let ok = true;
   let c: char = 'a';
-  let name = "world";
 
-  x = 10;
+  age = 17;
 
-  print(42);
-  print(x);
+  print(age);
+  print(name);
+  print(active);
+  print(inferredAge);
+  print(inferredName);
+  print(ok);
   print(pi);
   print(n);
-  print(ok);
   print(c);
   print("Hello " + name);
   print("Hello", name);

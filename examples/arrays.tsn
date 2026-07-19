@@ -1,0 +1,33 @@
+function main(): void {
+  let numbers: i32[] = [1, 2, 3];
+  print(numbers);
+
+  const also = [4, 5];
+
+  print(numbers[0]);
+  numbers[0] = 10;
+  print(numbers[0]);
+  print(numbers.length);
+
+  numbers.push(4);
+  print(numbers.length);
+  print(numbers.includes(10));
+  print(numbers.indexOf(2));
+
+  let last = numbers.pop();
+  print(last);
+  print(numbers.length);
+
+  for (i in numbers) {
+    print(i);
+  }
+
+  for (let x in also) {
+    print(x);
+  }
+
+  let empty: i32[] = [];
+  empty.push(42);
+  print(empty[0]);
+  print(empty);
+}

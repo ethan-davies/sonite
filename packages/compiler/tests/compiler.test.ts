@@ -313,7 +313,7 @@ describe("compile pipeline", () => {
       expect(result.ir).toContain("br label %for.exit.0");
     });
 
-    it("compiles the hello, variables, arithmetic, control-flow, loops, arrays, structs, and enums examples", () => {
+    it("compiles the hello, variables, arithmetic, control-flow, loops, arrays, structs, enums, struct-methods, classes, and inheritance examples", () => {
       for (const name of [
         "hello.tsn",
         "variables.tsn",
@@ -323,12 +323,125 @@ describe("compile pipeline", () => {
         "arrays.tsn",
         "structs.tsn",
         "enums.tsn",
+        "struct-methods.tsn",
+        "classes.tsn",
+        "inheritance.tsn",
       ]) {
         const source = readFileSync(join(examplesDir, name), "utf8");
         const result = compile(source);
         expect(result.success, name).toBe(true);
         expect(result.ir, name).toContain("define i32 @main()");
       }
+    });
+
+    it("compiles struct methods with this", () => {
+      const result = compile(`
+        struct Point {
+          x: i32;
+          y: i32;
+          sum(): i32 {
+            return this.x + this.y;
+          }
+        }
+        function main(): void {
+          let p = Point { x: 2, y: 3 };
+          print(p.sum());
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("define i32 @Point__sum(ptr %this)");
+    });
+
+    it("compiles classes with new, fields, methods, and statics", () => {
+      const result = compile(`
+        class Counter {
+          value: i32;
+          static total: i32;
+          constructor(start: i32) {
+            this.value = start;
+            Counter.total = Counter.total + 1;
+          }
+          bump(): void {
+            this.value = this.value + 1;
+          }
+          static getTotal(): i32 {
+            return Counter.total;
+          }
+        }
+        function main(): void {
+          let c = new Counter(10);
+          c.bump();
+          print(c.value);
+          print(Counter.getTotal());
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("call ptr @malloc");
+      expect(result.ir).toContain("@Counter__vtable");
+      expect(result.ir).toContain("define void @Counter__constructor");
+      expect(result.ir).toContain("define void @Counter__bump");
+    });
+
+    it("compiles inheritance with virtual dispatch", () => {
+      const result = compile(`
+        abstract class Animal {
+          abstract speak(): void;
+        }
+        class Cat extends Animal {
+          constructor() { super(); }
+          speak(): void { print("meow"); }
+        }
+        function main(): void {
+          let a: Animal = new Cat();
+          a.speak();
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("@Cat__vtable");
+      expect(result.ir).toContain("define void @Cat__speak");
+    });
+
+    it("rejects private field access outside the class", () => {
+      const result = compile(`
+        class Box {
+          private secret: i32;
+          constructor() { this.secret = 1; }
+        }
+        function main(): void {
+          let b = new Box();
+          print(b.secret);
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0359")).toBe(true);
+    });
+
+    it("rejects constructing an abstract class", () => {
+      const result = compile(`
+        abstract class Shape {
+          abstract area(): i32;
+        }
+        function main(): void {
+          let s = new Shape();
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0362")).toBe(true);
+    });
+
+    it("rejects assigning to readonly outside constructor", () => {
+      const result = compile(`
+        class Item {
+          readonly id: i32;
+          constructor() { this.id = 1; }
+        }
+        function main(): void {
+          let item = new Item();
+          item.id = 2;
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0358")).toBe(true);
     });
 
     it("compiles struct declarations, literals, field access, assignment, and params", () => {

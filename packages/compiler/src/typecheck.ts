@@ -1,4 +1,7 @@
 import type {
+  ClassDeclaration,
+  ClassMethod,
+  ConstructorDeclaration,
   EnumDeclaration,
   Expression,
   FunctionDeclaration,
@@ -6,7 +9,9 @@ import type {
   Program,
   Statement,
   StructDeclaration,
+  StructMethod,
   TypeAnnotation,
+  Visibility,
 } from "./ast/nodes.js";
 import type { DiagnosticCollector, SourceSpan } from "./diagnostics/diagnostic.js";
 import { mangleSymbol } from "./modules/mangle.js";
@@ -24,12 +29,22 @@ export interface StructValueType {
   readonly name: string;
 }
 
+export interface ClassValueType {
+  readonly kind: "class";
+  readonly name: string;
+}
+
 export interface EnumValueType {
   readonly kind: "enum";
   readonly name: string;
 }
 
-export type ValueType = PrimitiveValueType | ArrayValueType | StructValueType | EnumValueType;
+export type ValueType =
+  | PrimitiveValueType
+  | ArrayValueType
+  | StructValueType
+  | ClassValueType
+  | EnumValueType;
 
 export type ReturnType = ValueType | "void";
 
@@ -38,10 +53,66 @@ export interface StructFieldDef {
   readonly type: ValueType;
 }
 
+export interface StructMethodDef {
+  readonly name: string;
+  readonly mangledName: string;
+  readonly params: ValueType[];
+  readonly returnType: ReturnType;
+  readonly decl: StructMethod;
+}
+
 export interface StructDef {
   readonly name: string;
   readonly fields: StructFieldDef[];
+  readonly methods: StructMethodDef[];
   readonly decl: StructDeclaration;
+  readonly exported: boolean;
+}
+
+export interface ClassFieldDef {
+  readonly name: string;
+  readonly type: ValueType;
+  readonly visibility: Visibility;
+  readonly isReadonly: boolean;
+  readonly isStatic: boolean;
+  /** Mangled name of the class that declared this field. */
+  readonly declaringClass: string;
+  /** LLVM field index in the instance object (0 = vtable); -1 for static. */
+  readonly fieldIndex: number;
+  readonly initializer: Expression | null;
+}
+
+export interface ClassMethodDef {
+  readonly name: string;
+  readonly mangledName: string;
+  readonly params: ValueType[];
+  readonly returnType: ReturnType;
+  readonly visibility: Visibility;
+  readonly isStatic: boolean;
+  readonly isAbstract: boolean;
+  /** Vtable slot for instance methods; -1 for static. */
+  readonly vtableSlot: number;
+  /** Mangled name of the class that provides this implementation (may be ancestor). */
+  readonly implementingClass: string;
+  readonly decl: ClassMethod | null;
+}
+
+export interface ClassDef {
+  readonly name: string;
+  readonly localName: string;
+  readonly isAbstract: boolean;
+  readonly superclass: ClassDef | null;
+  /** Instance fields in layout order (after vtable slot). */
+  readonly instanceFields: ClassFieldDef[];
+  readonly staticFields: ClassFieldDef[];
+  /** Instance methods in vtable order. */
+  readonly instanceMethods: ClassMethodDef[];
+  readonly staticMethods: ClassMethodDef[];
+  readonly constructorParams: ValueType[];
+  readonly constructorDecl: ConstructorDeclaration | null;
+  readonly constructorMangledName: string;
+  readonly vtableGlobalName: string;
+  readonly decl: ClassDeclaration;
   readonly exported: boolean;
 }
 
@@ -71,6 +142,7 @@ export interface ModuleNamespace {
   readonly functions: ReadonlyMap<string, FunctionSig>;
   readonly structs: ReadonlyMap<string, StructDef>;
   readonly enums: ReadonlyMap<string, EnumDef>;
+  readonly classes: ReadonlyMap<string, ClassDef>;
 }
 
 interface ModuleSymbols {
@@ -78,6 +150,15 @@ interface ModuleSymbols {
   readonly functions: Map<string, FunctionSig>;
   readonly structs: Map<string, StructDef>;
   readonly enums: Map<string, EnumDef>;
+  readonly classes: Map<string, ClassDef>;
+}
+
+interface MemberContext {
+  readonly thisType: ValueType;
+  readonly enclosingClass: ClassDef | null;
+  readonly enclosingStruct: StructDef | null;
+  readonly isConstructor: boolean;
+  readonly isStatic: boolean;
 }
 
 const NUMERIC_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f64"]);
@@ -85,6 +166,11 @@ const EQUALITY_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f
 
 /** Active import namespaces while type-checking a module. */
 let activeNamespaces: Map<string, ModuleNamespace> = new Map();
+/** Active class defs for the module under check (local name → def). */
+let activeClasses: Map<string, ClassDef> = new Map();
+/** All class defs by mangled name (for inheritance lookups). */
+let classesByMangled: Map<string, ClassDef> = new Map();
+let memberContext: MemberContext | null = null;
 
 /**
  * Type-check a validated single-file program.
@@ -130,6 +216,13 @@ export function typecheckModules(
     byPath.set(mod.path, symbols);
   }
 
+  classesByMangled = new Map();
+  for (const symbols of byPath.values()) {
+    for (const def of symbols.classes.values()) {
+      classesByMangled.set(def.name, def);
+    }
+  }
+
   if (diagnostics.hasErrors) {
     return;
   }
@@ -143,6 +236,7 @@ export function typecheckModules(
       ...local.functions.keys(),
       ...local.structs.keys(),
       ...local.enums.keys(),
+      ...local.classes.keys(),
     ]);
 
     for (const binding of mod.imports) {
@@ -163,6 +257,7 @@ export function typecheckModules(
         functions: exportedFunctions(imported.functions),
         structs: exportedStructs(imported.structs),
         enums: exportedEnums(imported.enums),
+        classes: exportedClasses(imported.classes),
       });
     }
 
@@ -171,14 +266,28 @@ export function typecheckModules(
     }
 
     activeNamespaces = namespaces;
+    activeClasses = local.classes;
     for (const decl of mod.ast.body) {
       if (decl.kind === "FunctionDeclaration") {
         checkFunction(decl, local.functions, local.structs, local.enums, diagnostics);
+      } else if (decl.kind === "StructDeclaration") {
+        const def = local.structs.get(decl.name.name);
+        if (def) {
+          checkStructMethods(def, local.functions, local.structs, local.enums, diagnostics);
+        }
+      } else if (decl.kind === "ClassDeclaration") {
+        const def = local.classes.get(decl.name.name);
+        if (def) {
+          checkClassMembers(def, local.functions, local.structs, local.enums, diagnostics);
+        }
       }
     }
   }
 
   activeNamespaces = new Map();
+  activeClasses = new Map();
+  classesByMangled = new Map();
+  memberContext = null;
 }
 
 function exportedFunctions(fns: Map<string, FunctionSig>): Map<string, FunctionSig> {
@@ -211,12 +320,23 @@ function exportedEnums(enums: Map<string, EnumDef>): Map<string, EnumDef> {
   return out;
 }
 
+function exportedClasses(classes: Map<string, ClassDef>): Map<string, ClassDef> {
+  const out = new Map<string, ClassDef>();
+  for (const [name, def] of classes) {
+    if (def.exported) {
+      out.set(name, def);
+    }
+  }
+  return out;
+}
+
 function collectModuleSymbols(
   mod: ResolvedModule,
   diagnostics: DiagnosticCollector,
 ): ModuleSymbols {
   const enums = collectEnums(mod.ast, mod.moduleId, diagnostics);
   const structs = collectStructs(mod.ast, mod.moduleId, enums, diagnostics);
+  const classes = collectClasses(mod.ast, mod.moduleId, structs, enums, diagnostics);
   const functions = new Map<string, FunctionSig>();
 
   for (const decl of mod.ast.body) {
@@ -246,6 +366,15 @@ function collectModuleSymbols(
     if (enums.has(fn.name.name)) {
       diagnostics.error(
         `Name '${fn.name.name}' is already used as an enum`,
+        fn.name.span,
+        "E0330",
+      );
+      continue;
+    }
+
+    if (classes.has(fn.name.name)) {
+      diagnostics.error(
+        `Name '${fn.name.name}' is already used as a class`,
         fn.name.span,
         "E0330",
       );
@@ -296,6 +425,7 @@ function collectModuleSymbols(
     functions,
     structs,
     enums,
+    classes,
   };
 }
 
@@ -305,11 +435,11 @@ function collectEnums(
   diagnostics: DiagnosticCollector,
 ): Map<string, EnumDef> {
   const enums = new Map<string, EnumDef>();
-  const structNames = new Set<string>();
+  const reservedNames = new Set<string>();
 
   for (const decl of program.body) {
-    if (decl.kind === "StructDeclaration") {
-      structNames.add(decl.name.name);
+    if (decl.kind === "StructDeclaration" || decl.kind === "ClassDeclaration") {
+      reservedNames.add(decl.name.name);
     }
   }
 
@@ -327,9 +457,9 @@ function collectEnums(
       continue;
     }
 
-    if (structNames.has(decl.name.name)) {
+    if (reservedNames.has(decl.name.name)) {
       diagnostics.error(
-        `Name '${decl.name.name}' is already used as a struct`,
+        `Name '${decl.name.name}' is already used as a struct or class`,
         decl.name.span,
         "E0330",
       );
@@ -382,6 +512,12 @@ function collectStructs(
 ): Map<string, StructDef> {
   const structs = new Map<string, StructDef>();
   const declarations: StructDeclaration[] = [];
+  const classNames = new Set<string>();
+  for (const decl of program.body) {
+    if (decl.kind === "ClassDeclaration") {
+      classNames.add(decl.name.name);
+    }
+  }
 
   for (const decl of program.body) {
     if (decl.kind !== "StructDeclaration") {
@@ -406,10 +542,20 @@ function collectStructs(
       continue;
     }
 
+    if (classNames.has(decl.name.name)) {
+      diagnostics.error(
+        `Name '${decl.name.name}' is already used as a class`,
+        decl.name.span,
+        "E0330",
+      );
+      continue;
+    }
+
     declarations.push(decl);
     structs.set(decl.name.name, {
       name: mangleSymbol(moduleId, decl.name.name),
       fields: [],
+      methods: [],
       decl,
       exported: decl.exported,
     });
@@ -417,8 +563,9 @@ function collectStructs(
 
   for (const decl of declarations) {
     const fields: StructFieldDef[] = [];
+    const methods: StructMethodDef[] = [];
     const seen = new Set<string>();
-    let fieldsOk = true;
+    let ok = true;
 
     for (const field of decl.fields) {
       if (seen.has(field.name.name)) {
@@ -427,24 +574,61 @@ function collectStructs(
           field.name.span,
           "E0329",
         );
-        fieldsOk = false;
+        ok = false;
         continue;
       }
       seen.add(field.name.name);
 
       const fieldType = resolveAnnotation(field.typeAnnotation, structs, enums, diagnostics);
       if (fieldType === null) {
-        fieldsOk = false;
+        ok = false;
         continue;
       }
       fields.push({ name: field.name.name, type: fieldType });
     }
 
-    if (fieldsOk) {
+    for (const method of decl.methods) {
+      if (seen.has(method.name.name)) {
+        diagnostics.error(
+          `Duplicate member '${method.name.name}' in struct '${decl.name.name}'`,
+          method.name.span,
+          "E0329",
+        );
+        ok = false;
+        continue;
+      }
+      seen.add(method.name.name);
+
+      const params: ValueType[] = [];
+      let paramsOk = true;
+      for (const param of method.params) {
+        const paramType = resolveAnnotation(param.typeAnnotation, structs, enums, diagnostics);
+        if (paramType === null) {
+          paramsOk = false;
+          continue;
+        }
+        params.push(paramType);
+      }
+      const returnType = resolveReturnType(method.returnType, structs, enums, diagnostics);
+      if (returnType === undefined || !paramsOk) {
+        ok = false;
+        continue;
+      }
+      methods.push({
+        name: method.name.name,
+        mangledName: mangleSymbol(moduleId, `${decl.name.name}__${method.name.name}`),
+        params,
+        returnType,
+        decl: method,
+      });
+    }
+
+    if (ok) {
       const existing = structs.get(decl.name.name)!;
       structs.set(decl.name.name, {
         name: existing.name,
         fields,
+        methods,
         decl,
         exported: decl.exported,
       });
@@ -456,6 +640,406 @@ function collectStructs(
   return structs;
 }
 
+function collectClasses(
+  program: Program,
+  moduleId: string,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+): Map<string, ClassDef> {
+  const declarations: ClassDeclaration[] = [];
+  const byLocal = new Map<string, ClassDeclaration>();
+
+  for (const decl of program.body) {
+    if (decl.kind !== "ClassDeclaration") {
+      continue;
+    }
+    if (byLocal.has(decl.name.name)) {
+      diagnostics.error(`Duplicate class '${decl.name.name}'`, decl.name.span, "E0328");
+      continue;
+    }
+    if (structs.has(decl.name.name)) {
+      diagnostics.error(
+        `Name '${decl.name.name}' is already used as a struct`,
+        decl.name.span,
+        "E0330",
+      );
+      continue;
+    }
+    if (enums.has(decl.name.name)) {
+      diagnostics.error(
+        `Name '${decl.name.name}' is already used as an enum`,
+        decl.name.span,
+        "E0330",
+      );
+      continue;
+    }
+    byLocal.set(decl.name.name, decl);
+    declarations.push(decl);
+  }
+
+  // Placeholder map so resolveAnnotation can see class names mid-build.
+  const classes = new Map<string, ClassDef>();
+  for (const decl of declarations) {
+    const mangled = mangleSymbol(moduleId, decl.name.name);
+    classes.set(decl.name.name, {
+      name: mangled,
+      localName: decl.name.name,
+      isAbstract: decl.isAbstract,
+      superclass: null,
+      instanceFields: [],
+      staticFields: [],
+      instanceMethods: [],
+      staticMethods: [],
+      constructorParams: [],
+      constructorDecl: null,
+      constructorMangledName: mangleSymbol(moduleId, `${decl.name.name}__constructor`),
+      vtableGlobalName: `${mangled}__vtable`,
+      decl,
+      exported: decl.exported,
+    });
+  }
+
+  // Temporarily expose for resolveAnnotation / superclass resolution within module.
+  const prevActive = activeClasses;
+  activeClasses = classes;
+
+  const visiting = new Set<string>();
+  const done = new Set<string>();
+
+  const finishClass = (localName: string): ClassDef | null => {
+    if (done.has(localName)) {
+      return classes.get(localName) ?? null;
+    }
+    if (visiting.has(localName)) {
+      const decl = byLocal.get(localName)!;
+      diagnostics.error(
+        `Inheritance cycle involving class '${localName}'`,
+        decl.name.span,
+        "E0350",
+      );
+      return null;
+    }
+    visiting.add(localName);
+    const decl = byLocal.get(localName)!;
+    const mangled = mangleSymbol(moduleId, localName);
+
+    let superclass: ClassDef | null = null;
+    if (decl.superclass) {
+      if (decl.superclass.namespace) {
+        const ns = activeNamespaces.get(decl.superclass.namespace);
+        if (!ns || !ns.classes.has(decl.superclass.name)) {
+          diagnostics.error(
+            `Unknown superclass '${decl.superclass.namespace}.${decl.superclass.name}'`,
+            decl.superclass.span,
+            "E0104",
+          );
+          visiting.delete(localName);
+          return null;
+        }
+        superclass = ns.classes.get(decl.superclass.name)!;
+      } else if (byLocal.has(decl.superclass.name)) {
+        superclass = finishClass(decl.superclass.name);
+        if (!superclass) {
+          visiting.delete(localName);
+          return null;
+        }
+      } else if (classes.has(decl.superclass.name)) {
+        superclass = classes.get(decl.superclass.name)!;
+      } else {
+        diagnostics.error(
+          `Unknown superclass '${decl.superclass.name}'`,
+          decl.superclass.span,
+          "E0104",
+        );
+        visiting.delete(localName);
+        return null;
+      }
+    }
+
+    const instanceFields: ClassFieldDef[] = superclass ? [...superclass.instanceFields] : [];
+    const staticFields: ClassFieldDef[] = [];
+    const fieldNames = new Set(instanceFields.map((f) => f.name));
+    const staticNames = new Set<string>();
+    const methodNames = new Set<string>();
+
+    let constructorDecl: ConstructorDeclaration | null = null;
+    const ownMethods: ClassMethod[] = [];
+    let ok = true;
+
+    for (const member of decl.members) {
+      if (member.kind === "ConstructorDeclaration") {
+        if (constructorDecl) {
+          diagnostics.error(
+            `Duplicate constructor in class '${localName}'`,
+            member.span,
+            "E0351",
+          );
+          ok = false;
+          continue;
+        }
+        constructorDecl = member;
+        continue;
+      }
+      if (member.kind === "ClassField") {
+        if (member.isStatic) {
+          if (staticNames.has(member.name.name) || methodNames.has(member.name.name)) {
+            diagnostics.error(
+              `Duplicate member '${member.name.name}' in class '${localName}'`,
+              member.name.span,
+              "E0329",
+            );
+            ok = false;
+            continue;
+          }
+          staticNames.add(member.name.name);
+          const fieldType = resolveAnnotation(member.typeAnnotation, structs, enums, diagnostics);
+          if (fieldType === null) {
+            ok = false;
+            continue;
+          }
+          staticFields.push({
+            name: member.name.name,
+            type: fieldType,
+            visibility: member.visibility,
+            isReadonly: member.isReadonly,
+            isStatic: true,
+            declaringClass: mangled,
+            fieldIndex: -1,
+            initializer: member.initializer,
+          });
+        } else {
+          if (fieldNames.has(member.name.name)) {
+            diagnostics.error(
+              `Duplicate field '${member.name.name}' in class '${localName}'`,
+              member.name.span,
+              "E0329",
+            );
+            ok = false;
+            continue;
+          }
+          if (member.initializer) {
+            diagnostics.error(
+              "Instance field initializers are not supported; initialize in the constructor",
+              member.initializer.span,
+              "E0352",
+            );
+            ok = false;
+          }
+          fieldNames.add(member.name.name);
+          const fieldType = resolveAnnotation(member.typeAnnotation, structs, enums, diagnostics);
+          if (fieldType === null) {
+            ok = false;
+            continue;
+          }
+          instanceFields.push({
+            name: member.name.name,
+            type: fieldType,
+            visibility: member.visibility,
+            isReadonly: member.isReadonly,
+            isStatic: false,
+            declaringClass: mangled,
+            fieldIndex: instanceFields.length + 1, // +1 for vtable
+            initializer: null,
+          });
+        }
+        continue;
+      }
+
+      // ClassMethod
+      if (methodNames.has(member.name.name) || staticNames.has(member.name.name)) {
+        diagnostics.error(
+          `Duplicate member '${member.name.name}' in class '${localName}'`,
+          member.name.span,
+          "E0329",
+        );
+        ok = false;
+        continue;
+      }
+      methodNames.add(member.name.name);
+      if (member.isAbstract && !decl.isAbstract) {
+        diagnostics.error(
+          `Abstract method '${member.name.name}' is only allowed in abstract classes`,
+          member.name.span,
+          "E0353",
+        );
+        ok = false;
+      }
+      if (member.isAbstract && member.isStatic) {
+        diagnostics.error(
+          `Static method '${member.name.name}' cannot be abstract`,
+          member.name.span,
+          "E0353",
+        );
+        ok = false;
+      }
+      ownMethods.push(member);
+    }
+
+    // Re-index instance fields (prefix from base may already have indices).
+    for (let i = 0; i < instanceFields.length; i += 1) {
+      const f = instanceFields[i]!;
+      instanceFields[i] = { ...f, fieldIndex: i + 1 };
+    }
+
+    const baseMethods = superclass ? [...superclass.instanceMethods] : [];
+    const instanceMethods: ClassMethodDef[] = baseMethods.map((m) => ({ ...m }));
+    const staticMethods: ClassMethodDef[] = [];
+    const slotByName = new Map(instanceMethods.map((m, i) => [m.name, i]));
+
+    for (const method of ownMethods) {
+      const params: ValueType[] = [];
+      let paramsOk = true;
+      for (const param of method.params) {
+        const paramType = resolveAnnotation(param.typeAnnotation, structs, enums, diagnostics);
+        if (paramType === null) {
+          paramsOk = false;
+          continue;
+        }
+        params.push(paramType);
+      }
+      const returnType = resolveReturnType(method.returnType, structs, enums, diagnostics);
+      if (returnType === undefined || !paramsOk) {
+        ok = false;
+        continue;
+      }
+
+      const mangledMethod = mangleSymbol(moduleId, `${localName}__${method.name.name}`);
+
+      if (method.isStatic) {
+        staticMethods.push({
+          name: method.name.name,
+          mangledName: mangledMethod,
+          params,
+          returnType,
+          visibility: method.visibility,
+          isStatic: true,
+          isAbstract: false,
+          vtableSlot: -1,
+          implementingClass: mangled,
+          decl: method,
+        });
+        continue;
+      }
+
+      const existingSlot = slotByName.get(method.name.name);
+      if (existingSlot !== undefined) {
+        const base = instanceMethods[existingSlot]!;
+        if (
+          base.params.length !== params.length ||
+          !base.params.every((p, i) => typesEqual(p, params[i]!)) ||
+          (base.returnType === "void") !== (returnType === "void") ||
+          (base.returnType !== "void" &&
+            returnType !== "void" &&
+            !typesEqual(base.returnType, returnType))
+        ) {
+          diagnostics.error(
+            `Method '${method.name.name}' overrides with incompatible signature`,
+            method.name.span,
+            "E0354",
+          );
+          ok = false;
+          continue;
+        }
+        instanceMethods[existingSlot] = {
+          name: method.name.name,
+          mangledName: mangledMethod,
+          params,
+          returnType,
+          visibility: method.visibility,
+          isStatic: false,
+          isAbstract: method.isAbstract,
+          vtableSlot: existingSlot,
+          implementingClass: mangled,
+          decl: method,
+        };
+      } else {
+        const slot = instanceMethods.length;
+        slotByName.set(method.name.name, slot);
+        instanceMethods.push({
+          name: method.name.name,
+          mangledName: mangledMethod,
+          params,
+          returnType,
+          visibility: method.visibility,
+          isStatic: false,
+          isAbstract: method.isAbstract,
+          vtableSlot: slot,
+          implementingClass: mangled,
+          decl: method,
+        });
+      }
+    }
+
+    if (!decl.isAbstract) {
+      for (const m of instanceMethods) {
+        if (m.isAbstract) {
+          diagnostics.error(
+            `Non-abstract class '${localName}' must implement abstract method '${m.name}'`,
+            decl.name.span,
+            "E0355",
+          );
+          ok = false;
+        }
+      }
+    }
+
+    const constructorParams: ValueType[] = [];
+    if (constructorDecl) {
+      for (const param of constructorDecl.params) {
+        const paramType = resolveAnnotation(param.typeAnnotation, structs, enums, diagnostics);
+        if (paramType === null) {
+          ok = false;
+          continue;
+        }
+        constructorParams.push(paramType);
+      }
+    } else if (superclass && superclass.constructorParams.length > 0) {
+      diagnostics.error(
+        `Class '${localName}' must declare a constructor that calls super(...)`,
+        decl.name.span,
+        "E0356",
+      );
+      ok = false;
+    }
+
+    visiting.delete(localName);
+    done.add(localName);
+
+    if (!ok) {
+      classes.delete(localName);
+      return null;
+    }
+
+    const def: ClassDef = {
+      name: mangled,
+      localName,
+      isAbstract: decl.isAbstract,
+      superclass,
+      instanceFields,
+      staticFields,
+      instanceMethods,
+      staticMethods,
+      constructorParams,
+      constructorDecl,
+      constructorMangledName: mangleSymbol(moduleId, `${localName}__constructor`),
+      vtableGlobalName: `${mangled}__vtable`,
+      decl,
+      exported: decl.exported,
+    };
+    classes.set(localName, def);
+    classesByMangled.set(mangled, def);
+    return def;
+  };
+
+  for (const decl of declarations) {
+    finishClass(decl.name.name);
+  }
+
+  activeClasses = prevActive;
+  return classes;
+}
+
 export function typeToString(type: ValueType | "void"): string {
   if (type === "void") {
     return "void";
@@ -463,7 +1047,7 @@ export function typeToString(type: ValueType | "void"): string {
   if (typeof type === "string") {
     return type;
   }
-  if (type.kind === "struct" || type.kind === "enum") {
+  if (type.kind === "struct" || type.kind === "enum" || type.kind === "class") {
     return type.name;
   }
   return `${typeToString(type.element)}[]`;
@@ -480,8 +1064,28 @@ export function typesEqual(a: ValueType, b: ValueType): boolean {
     if (a.kind === "struct" && b.kind === "struct") {
       return a.name === b.name;
     }
+    if (a.kind === "class" && b.kind === "class") {
+      return a.name === b.name;
+    }
     if (a.kind === "enum" && b.kind === "enum") {
       return a.name === b.name;
+    }
+  }
+  return false;
+}
+
+/** True if `from` can be assigned to a binding of type `to` (includes class upcasts). */
+export function isAssignable(from: ValueType, to: ValueType): boolean {
+  if (typesEqual(from, to)) {
+    return true;
+  }
+  if (isClassType(from) && isClassType(to)) {
+    let current: ClassDef | undefined = classesByMangled.get(from.name) ?? findClassByMangled(from.name);
+    while (current) {
+      if (current.name === to.name) {
+        return true;
+      }
+      current = current.superclass ?? undefined;
     }
   }
   return false;
@@ -493,6 +1097,10 @@ export function isArrayType(type: ValueType): type is ArrayValueType {
 
 export function isStructType(type: ValueType): type is StructValueType {
   return typeof type === "object" && type.kind === "struct";
+}
+
+export function isClassType(type: ValueType): type is ClassValueType {
+  return typeof type === "object" && type.kind === "class";
 }
 
 export function isEnumType(type: ValueType): type is EnumValueType {
@@ -514,7 +1122,7 @@ export function isIntegerType(type: ValueType): boolean {
  */
 export function annotationToValueType(
   ann: TypeAnnotation,
-  namedKinds?: ReadonlyMap<string, "struct" | "enum">,
+  namedKinds?: ReadonlyMap<string, "struct" | "enum" | "class">,
 ): ValueType | null {
   if (ann.kind === "PrimitiveType") {
     if (ann.name === "void") {
@@ -525,9 +1133,6 @@ export function annotationToValueType(
   if (ann.kind === "NamedType") {
     const key = ann.namespace ? `${ann.namespace}.${ann.name}` : ann.name;
     const kind = namedKinds?.get(key) ?? "struct";
-    // When namedKinds maps local names to mangled type keys, prefer the map's... 
-    // Actually namedKinds only stores kind; name in ValueType must be the type key.
-    // Callers that need mangled names should use resolveAnnotation instead.
     return { kind, name: key };
   }
   const element = annotationToValueType(ann.element, namedKinds);
@@ -567,6 +1172,9 @@ function resolveAnnotation(
       if (ns.structs.has(ann.name)) {
         return { kind: "struct", name: ns.structs.get(ann.name)!.name };
       }
+      if (ns.classes.has(ann.name)) {
+        return { kind: "class", name: ns.classes.get(ann.name)!.name };
+      }
       diagnostics.error(
         `Unknown type '${ann.namespace}.${ann.name}'`,
         ann.span,
@@ -579,6 +1187,9 @@ function resolveAnnotation(
     }
     if (structs.has(ann.name)) {
       return { kind: "struct", name: structs.get(ann.name)!.name };
+    }
+    if (activeClasses.has(ann.name)) {
+      return { kind: "class", name: activeClasses.get(ann.name)!.name };
     }
     diagnostics.error(`Unknown type '${ann.name}'`, ann.span, "E0104");
     return null;
@@ -652,6 +1263,211 @@ function checkFunction(
       );
     }
   }
+}
+
+function checkStructMethods(
+  def: StructDef,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+): void {
+  for (const method of def.methods) {
+    memberContext = {
+      thisType: { kind: "struct", name: def.name },
+      enclosingClass: null,
+      enclosingStruct: def,
+      isConstructor: false,
+      isStatic: false,
+    };
+    const scope = new Map<string, Binding>();
+    for (const param of method.decl.params) {
+      const paramType = resolveAnnotation(param.typeAnnotation, structs, enums, diagnostics);
+      if (paramType === null) {
+        continue;
+      }
+      if (scope.has(param.name.name)) {
+        diagnostics.error(`Duplicate parameter '${param.name.name}'`, param.name.span, "E0301");
+        continue;
+      }
+      scope.set(param.name.name, { type: paramType, mutable: false });
+    }
+    for (const stmt of method.decl.body) {
+      checkStatement(stmt, scope, functions, structs, enums, method.returnType, diagnostics, 0);
+    }
+    if (method.returnType !== "void") {
+      const last = method.decl.body[method.decl.body.length - 1];
+      if (!last || last.kind !== "ReturnStatement" || last.value === null) {
+        diagnostics.error(
+          `Method '${method.name}' must end with a return statement`,
+          method.decl.name.span,
+          "E0312",
+        );
+      }
+    }
+  }
+  memberContext = null;
+}
+
+function checkClassMembers(
+  def: ClassDef,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+): void {
+  for (const field of def.staticFields) {
+    if (field.initializer) {
+      const inferred = checkExpression(
+        field.initializer,
+        new Map(),
+        functions,
+        structs,
+        enums,
+        diagnostics,
+        false,
+        field.type,
+      );
+      if (inferred && !valueMatchesBinding(field.initializer, inferred, field.type)) {
+        diagnostics.error(
+          typeMismatchMessage(field.type, inferred),
+          field.initializer.span,
+          "E0303",
+        );
+      }
+    }
+  }
+
+  if (def.constructorDecl) {
+    memberContext = {
+      thisType: { kind: "class", name: def.name },
+      enclosingClass: def,
+      enclosingStruct: null,
+      isConstructor: true,
+      isStatic: false,
+    };
+    const scope = new Map<string, Binding>();
+    for (const param of def.constructorDecl.params) {
+      const paramType = resolveAnnotation(param.typeAnnotation, structs, enums, diagnostics);
+      if (paramType === null) {
+        continue;
+      }
+      if (scope.has(param.name.name)) {
+        diagnostics.error(`Duplicate parameter '${param.name.name}'`, param.name.span, "E0301");
+        continue;
+      }
+      scope.set(param.name.name, { type: paramType, mutable: false });
+    }
+
+    const body = def.constructorDecl.body;
+    if (def.superclass) {
+      const first = body[0];
+      const isSuperCall =
+        first?.kind === "ExpressionStatement" &&
+        first.expression.kind === "CallExpression" &&
+        first.expression.callee.kind === "SuperExpression";
+      if (!isSuperCall) {
+        diagnostics.error(
+          `Constructor of '${def.localName}' must call super(...) as its first statement`,
+          def.constructorDecl.span,
+          "E0357",
+        );
+      }
+    }
+
+    for (let i = 0; i < body.length; i += 1) {
+      const stmt = body[i]!;
+      if (
+        i > 0 &&
+        stmt.kind === "ExpressionStatement" &&
+        stmt.expression.kind === "CallExpression" &&
+        stmt.expression.callee.kind === "SuperExpression"
+      ) {
+        diagnostics.error(
+          "'super' call must be the first statement in the constructor",
+          stmt.span,
+          "E0357",
+        );
+      }
+      checkStatement(stmt, scope, functions, structs, enums, "void", diagnostics, 0);
+    }
+    memberContext = null;
+  } else if (def.superclass) {
+    // Synthesized constructor: require base to have zero-arg constructor.
+    if (def.superclass.constructorParams.length > 0) {
+      // Already diagnosed during collect.
+    }
+  }
+
+  for (const method of [...def.instanceMethods, ...def.staticMethods]) {
+    if (!method.decl || method.isAbstract || method.implementingClass !== def.name) {
+      continue;
+    }
+    memberContext = {
+      thisType: { kind: "class", name: def.name },
+      enclosingClass: def,
+      enclosingStruct: null,
+      isConstructor: false,
+      isStatic: method.isStatic,
+    };
+    const scope = new Map<string, Binding>();
+    for (const param of method.decl.params) {
+      const paramType = resolveAnnotation(param.typeAnnotation, structs, enums, diagnostics);
+      if (paramType === null) {
+        continue;
+      }
+      if (scope.has(param.name.name)) {
+        diagnostics.error(`Duplicate parameter '${param.name.name}'`, param.name.span, "E0301");
+        continue;
+      }
+      scope.set(param.name.name, { type: paramType, mutable: false });
+    }
+    const body = method.decl.body ?? [];
+    for (const stmt of body) {
+      checkStatement(stmt, scope, functions, structs, enums, method.returnType, diagnostics, 0);
+    }
+    if (method.returnType !== "void") {
+      const last = body[body.length - 1];
+      if (!last || last.kind !== "ReturnStatement" || last.value === null) {
+        diagnostics.error(
+          `Method '${method.name}' must end with a return statement`,
+          method.decl.name.span,
+          "E0312",
+        );
+      }
+    }
+  }
+  memberContext = null;
+}
+
+function findClassByMangled(typeName: string): ClassDef | undefined {
+  const fromMap = classesByMangled.get(typeName);
+  if (fromMap) {
+    return fromMap;
+  }
+  for (const def of activeClasses.values()) {
+    if (def.name === typeName) {
+      return def;
+    }
+  }
+  for (const ns of activeNamespaces.values()) {
+    for (const def of ns.classes.values()) {
+      if (def.name === typeName) {
+        return def;
+      }
+    }
+  }
+  return undefined;
+}
+
+function findClassByLocal(
+  name: string,
+  namespace: string | null,
+): ClassDef | undefined {
+  if (namespace) {
+    return activeNamespaces.get(namespace)?.classes.get(name);
+  }
+  return activeClasses.get(name);
 }
 
 function checkStatement(
@@ -1020,7 +1836,7 @@ function checkAssignment(
   }
 }
 
-/** Resolve the field type of a member lvalue (allows const struct field mutation). */
+/** Resolve the field type of a member lvalue (allows const struct/class field mutation). */
 function checkMemberLvalue(
   expr: Extract<Expression, { kind: "MemberExpression" }>,
   scope: Map<string, Binding>,
@@ -1029,34 +1845,115 @@ function checkMemberLvalue(
   enums: Map<string, EnumDef>,
   diagnostics: DiagnosticCollector,
 ): ValueType | null {
+  // Static class field: ClassName.field
+  if (expr.object.kind === "Identifier" && !scope.has(expr.object.name)) {
+    const classDef = activeClasses.get(expr.object.name);
+    if (classDef) {
+      const field = classDef.staticFields.find((f) => f.name === expr.property.name);
+      if (!field) {
+        diagnostics.error(
+          `Unknown static field '${expr.property.name}' on class '${classDef.localName}'`,
+          expr.property.span,
+          "E0324",
+        );
+        return null;
+      }
+      if (!canAccessMember(field.visibility, field.declaringClass, diagnostics, expr.property.span)) {
+        return null;
+      }
+      if (field.isReadonly) {
+        diagnostics.error(
+          `Cannot assign to readonly field '${field.name}'`,
+          expr.property.span,
+          "E0358",
+        );
+        return null;
+      }
+      return field.type;
+    }
+  }
+
   const objectType = checkExpression(expr.object, scope, functions, structs, enums, diagnostics);
   if (!objectType) {
     return null;
   }
-  if (!isStructType(objectType)) {
-    diagnostics.error(
-      `Cannot assign to field of type '${typeToString(objectType)}'`,
-      expr.object.span,
-      "E0331",
-    );
-    return null;
+
+  if (isStructType(objectType)) {
+    const def =
+      findStructByTypeName(structs, objectType.name) ?? findStructInNamespaces(objectType.name);
+    if (!def) {
+      diagnostics.error(`Unknown struct '${objectType.name}'`, expr.object.span, "E0104");
+      return null;
+    }
+    const field = def.fields.find((f) => f.name === expr.property.name);
+    if (!field) {
+      diagnostics.error(
+        `Unknown field '${expr.property.name}' on struct '${def.decl.name.name}'`,
+        expr.property.span,
+        "E0324",
+      );
+      return null;
+    }
+    return field.type;
   }
-  const def =
-    findStructByTypeName(structs, objectType.name) ?? findStructInNamespaces(objectType.name);
-  if (!def) {
-    diagnostics.error(`Unknown struct '${objectType.name}'`, expr.object.span, "E0104");
-    return null;
+
+  if (isClassType(objectType)) {
+    const def = findClassByMangled(objectType.name);
+    if (!def) {
+      diagnostics.error(`Unknown class '${objectType.name}'`, expr.object.span, "E0104");
+      return null;
+    }
+    const field = def.instanceFields.find((f) => f.name === expr.property.name);
+    if (!field) {
+      diagnostics.error(
+        `Unknown field '${expr.property.name}' on class '${def.localName}'`,
+        expr.property.span,
+        "E0324",
+      );
+      return null;
+    }
+    if (!canAccessMember(field.visibility, field.declaringClass, diagnostics, expr.property.span)) {
+      return null;
+    }
+    if (
+      field.isReadonly &&
+      !(
+        memberContext?.isConstructor &&
+        memberContext.enclosingClass?.name === field.declaringClass
+      )
+    ) {
+      diagnostics.error(
+        `Cannot assign to readonly field '${field.name}'`,
+        expr.property.span,
+        "E0358",
+      );
+      return null;
+    }
+    return field.type;
   }
-  const field = def.fields.find((f) => f.name === expr.property.name);
-  if (!field) {
-    diagnostics.error(
-      `Unknown field '${expr.property.name}' on struct '${def.decl.name.name}'`,
-      expr.property.span,
-      "E0324",
-    );
-    return null;
+
+  diagnostics.error(
+    `Cannot assign to field of type '${typeToString(objectType)}'`,
+    expr.object.span,
+    "E0331",
+  );
+  return null;
+}
+
+function canAccessMember(
+  visibility: Visibility,
+  declaringClassMangled: string,
+  diagnostics: DiagnosticCollector,
+  span: SourceSpan,
+): boolean {
+  if (visibility === "public") {
+    return true;
   }
-  return field.type;
+  if (memberContext?.enclosingClass?.name === declaringClassMangled) {
+    return true;
+  }
+  diagnostics.error("Cannot access private member", span, "E0359");
+  return false;
 }
 
 function findStructByTypeName(
@@ -1385,12 +2282,48 @@ function checkExpression(
         return { kind: "enum", name: def.name };
       }
 
+      // Static class field: ClassName.field
+      if (expr.object.kind === "Identifier" && !scope.has(expr.object.name)) {
+        const classDef =
+          activeClasses.get(expr.object.name) ??
+          (activeNamespaces.has(expr.object.name)
+            ? undefined
+            : undefined);
+        const localClass = activeClasses.get(expr.object.name);
+        if (localClass) {
+          const field = localClass.staticFields.find((f) => f.name === expr.property.name);
+          if (field) {
+            if (
+              !canAccessMember(
+                field.visibility,
+                field.declaringClass,
+                diagnostics,
+                expr.property.span,
+              )
+            ) {
+              return null;
+            }
+            return field.type;
+          }
+        }
+      }
+
       // Bare namespace member used as a value (not a call) — only enums are handled above
       if (
         expr.object.kind === "Identifier" &&
         activeNamespaces.has(expr.object.name) &&
         !scope.has(expr.object.name)
       ) {
+        const ns = activeNamespaces.get(expr.object.name)!;
+        const classDef = ns.classes.get(expr.property.name);
+        if (classDef) {
+          diagnostics.error(
+            `Class '${expr.object.name}.${expr.property.name}' cannot be used as a value; use 'new'`,
+            expr.span,
+            "E0407",
+          );
+          return null;
+        }
         diagnostics.error(
           `Namespace member '${expr.object.name}.${expr.property.name}' cannot be used as a value`,
           expr.span,
@@ -1422,6 +2355,28 @@ function checkExpression(
         }
         return field.type;
       }
+      if (isClassType(objectType)) {
+        const def = findClassByMangled(objectType.name);
+        if (!def) {
+          diagnostics.error(`Unknown class '${objectType.name}'`, expr.object.span, "E0104");
+          return null;
+        }
+        const field = def.instanceFields.find((f) => f.name === expr.property.name);
+        if (!field) {
+          diagnostics.error(
+            `Unknown field '${expr.property.name}' on class '${def.localName}'`,
+            expr.property.span,
+            "E0324",
+          );
+          return null;
+        }
+        if (
+          !canAccessMember(field.visibility, field.declaringClass, diagnostics, expr.property.span)
+        ) {
+          return null;
+        }
+        return field.type;
+      }
       if (expr.property.name === "length") {
         if (!isArrayType(objectType)) {
           diagnostics.error(
@@ -1439,6 +2394,67 @@ function checkExpression(
         "E0324",
       );
       return null;
+    }
+    case "ThisExpression": {
+      if (!memberContext || memberContext.isStatic) {
+        diagnostics.error(
+          "'this' is only allowed in instance methods and constructors",
+          expr.span,
+          "E0360",
+        );
+        return null;
+      }
+      return memberContext.thisType;
+    }
+    case "SuperExpression": {
+      diagnostics.error(
+        "'super' can only be called as super(...)",
+        expr.span,
+        "E0361",
+      );
+      return null;
+    }
+    case "NewExpression": {
+      const classDef = findClassByLocal(
+        expr.className.name,
+        expr.namespace?.name ?? null,
+      );
+      if (!classDef) {
+        const label = expr.namespace
+          ? `${expr.namespace.name}.${expr.className.name}`
+          : expr.className.name;
+        diagnostics.error(`Unknown class '${label}'`, expr.className.span, "E0104");
+        return null;
+      }
+      if (classDef.isAbstract) {
+        diagnostics.error(
+          `Cannot construct abstract class '${classDef.localName}'`,
+          expr.className.span,
+          "E0362",
+        );
+        return null;
+      }
+      if (expr.args.length !== classDef.constructorParams.length) {
+        diagnostics.error(
+          `Constructor of '${classDef.localName}' expects ${classDef.constructorParams.length} argument(s), got ${expr.args.length}`,
+          expr.span,
+          "E0315",
+        );
+        return null;
+      }
+      for (let i = 0; i < expr.args.length; i += 1) {
+        const arg = expr.args[i]!;
+        const expected = classDef.constructorParams[i]!;
+        const argType = checkExpression(arg, scope, functions, structs, enums, diagnostics);
+        if (!argType) {
+          return null;
+        }
+        if (!valueMatchesBinding(arg, argType, expected)) {
+          diagnostics.error(typeMismatchMessage(expected, argType), arg.span, "E0303");
+          return null;
+        }
+      }
+      return { kind: "class", name: classDef.name };
     }
     case "Identifier": {
       const binding = scope.get(expr.name);
@@ -1530,6 +2546,42 @@ function checkExpression(
       return left;
     }
     case "CallExpression": {
+      if (expr.callee.kind === "SuperExpression") {
+        if (!memberContext?.isConstructor || !memberContext.enclosingClass?.superclass) {
+          diagnostics.error(
+            "'super' can only be called from a subclass constructor",
+            expr.span,
+            "E0361",
+          );
+          return null;
+        }
+        const base = memberContext.enclosingClass.superclass;
+        if (expr.args.length !== base.constructorParams.length) {
+          diagnostics.error(
+            `super(...) expects ${base.constructorParams.length} argument(s), got ${expr.args.length}`,
+            expr.span,
+            "E0315",
+          );
+          return null;
+        }
+        for (let i = 0; i < expr.args.length; i += 1) {
+          const arg = expr.args[i]!;
+          const expected = base.constructorParams[i]!;
+          const argType = checkExpression(arg, scope, functions, structs, enums, diagnostics);
+          if (!argType) {
+            return null;
+          }
+          if (!valueMatchesBinding(arg, argType, expected)) {
+            diagnostics.error(typeMismatchMessage(expected, argType), arg.span, "E0303");
+            return null;
+          }
+        }
+        if (!allowVoidCall) {
+          diagnostics.error("'super' cannot be used as a value", expr.span, "E0309");
+        }
+        return null;
+      }
+
       if (expr.callee.kind === "MemberExpression") {
         const nsCall = checkNamespaceCall(
           expr,
@@ -1560,9 +2612,9 @@ function checkExpression(
           if (!argType) {
             return null;
           }
-          if (isStructType(argType)) {
+          if (isStructType(argType) || isClassType(argType)) {
             diagnostics.error(
-              `Cannot print struct value of type '${typeToString(argType)}'; print individual fields instead`,
+              `Cannot print ${argType.kind} value of type '${typeToString(argType)}'; print individual fields instead`,
               arg.span,
               "E0333",
             );
@@ -1636,21 +2688,127 @@ function checkMethodCall(
   if (expr.callee.kind !== "MemberExpression") {
     return null;
   }
+  const callee = expr.callee;
 
-  const objectType = checkExpression(expr.callee.object, scope, functions, structs, enums, diagnostics);
+  // Static method: ClassName.method(...)
+  if (callee.object.kind === "Identifier" && !scope.has(callee.object.name)) {
+    const classDef = activeClasses.get(callee.object.name);
+    if (classDef) {
+      const method = classDef.staticMethods.find((m) => m.name === callee.property.name);
+      if (!method) {
+        diagnostics.error(
+          `Unknown static method '${callee.property.name}' on class '${classDef.localName}'`,
+          callee.property.span,
+          "E0324",
+        );
+        return null;
+      }
+      if (
+        !canAccessMember(method.visibility, method.implementingClass, diagnostics, callee.property.span)
+      ) {
+        return null;
+      }
+      return checkMethodArgs(
+        method.name,
+        method.params,
+        method.returnType,
+        expr,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+        allowVoidCall,
+      );
+    }
+  }
+
+  const objectType = checkExpression(
+    callee.object,
+    scope,
+    functions,
+    structs,
+    enums,
+    diagnostics,
+  );
   if (!objectType) {
     return null;
   }
+
+  if (isStructType(objectType)) {
+    const def =
+      findStructByTypeName(structs, objectType.name) ?? findStructInNamespaces(objectType.name);
+    if (!def) {
+      diagnostics.error(`Unknown struct '${objectType.name}'`, callee.object.span, "E0104");
+      return null;
+    }
+    const method = def.methods.find((m) => m.name === callee.property.name);
+    if (!method) {
+      diagnostics.error(
+        `Unknown method '${callee.property.name}' on struct '${def.decl.name.name}'`,
+        callee.property.span,
+        "E0324",
+      );
+      return null;
+    }
+    return checkMethodArgs(
+      method.name,
+      method.params,
+      method.returnType,
+      expr,
+      scope,
+      functions,
+      structs,
+      enums,
+      diagnostics,
+      allowVoidCall,
+    );
+  }
+
+  if (isClassType(objectType)) {
+    const def = findClassByMangled(objectType.name);
+    if (!def) {
+      diagnostics.error(`Unknown class '${objectType.name}'`, callee.object.span, "E0104");
+      return null;
+    }
+    const method = def.instanceMethods.find((m) => m.name === callee.property.name);
+    if (!method) {
+      diagnostics.error(
+        `Unknown method '${callee.property.name}' on class '${def.localName}'`,
+        callee.property.span,
+        "E0324",
+      );
+      return null;
+    }
+    if (
+      !canAccessMember(method.visibility, method.implementingClass, diagnostics, callee.property.span)
+    ) {
+      return null;
+    }
+    return checkMethodArgs(
+      method.name,
+      method.params,
+      method.returnType,
+      expr,
+      scope,
+      functions,
+      structs,
+      enums,
+      diagnostics,
+      allowVoidCall,
+    );
+  }
+
   if (!isArrayType(objectType)) {
     diagnostics.error(
-      `Methods are only available on arrays, got '${typeToString(objectType)}'`,
-      expr.callee.object.span,
+      `Methods are not available on type '${typeToString(objectType)}'`,
+      callee.object.span,
       "E0326",
     );
     return null;
   }
 
-  const method = expr.callee.property.name;
+  const method = callee.property.name;
   const elementType = objectType.element;
 
   switch (method) {
@@ -1745,9 +2903,50 @@ function checkMethodCall(
       return "i32";
     }
     default:
-      diagnostics.error(`Unknown method '${method}'`, expr.callee.property.span, "E0324");
+      diagnostics.error(`Unknown method '${method}'`, callee.property.span, "E0324");
       return null;
   }
+}
+
+function checkMethodArgs(
+  name: string,
+  params: ValueType[],
+  returnType: ReturnType,
+  expr: Extract<Expression, { kind: "CallExpression" }>,
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+  allowVoidCall: boolean,
+): ValueType | null {
+  if (expr.args.length !== params.length) {
+    diagnostics.error(
+      `Method '${name}' expects ${params.length} argument(s), got ${expr.args.length}`,
+      expr.span,
+      "E0315",
+    );
+    return null;
+  }
+  for (let i = 0; i < expr.args.length; i += 1) {
+    const arg = expr.args[i]!;
+    const expected = params[i]!;
+    const argType = checkExpression(arg, scope, functions, structs, enums, diagnostics);
+    if (!argType) {
+      return null;
+    }
+    if (!valueMatchesBinding(arg, argType, expected)) {
+      diagnostics.error(typeMismatchMessage(expected, argType), arg.span, "E0303");
+      return null;
+    }
+  }
+  if (returnType === "void") {
+    if (!allowVoidCall) {
+      diagnostics.error(`Void method '${name}' cannot be used as a value`, expr.span, "E0309");
+    }
+    return null;
+  }
+  return returnType;
 }
 
 function supportsEquality(type: ValueType): boolean {
@@ -1815,7 +3014,7 @@ function valueMatchesBinding(
   inferred: ValueType,
   expected: ValueType,
 ): boolean {
-  if (typesEqual(inferred, expected)) {
+  if (isAssignable(inferred, expected)) {
     return true;
   }
   // Array literal width coercion for elements is handled per-element; here for whole value:

@@ -1,0 +1,17 @@
+struct Person {
+  name: string;
+  age: i32;
+
+  greet(): void {
+    print("Hello " + this.name);
+  }
+}
+
+function main(): void {
+  let person = Person {
+    name: "John",
+    age: 18
+  };
+  person.greet();
+  print(person.age);
+}

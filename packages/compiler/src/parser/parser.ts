@@ -8,6 +8,11 @@ import type {
   BreakStatement,
   CallExpression,
   CharLiteral,
+  ClassDeclaration,
+  ClassField,
+  ClassMember,
+  ClassMethod,
+  ConstructorDeclaration,
   ContinueStatement,
   EnumDeclaration,
   EnumVariant,
@@ -23,6 +28,8 @@ import type {
   IndexExpression,
   IntegerLiteral,
   MemberExpression,
+  NamedType,
+  NewExpression,
   Parameter,
   PrimitiveTypeName,
   Program,
@@ -33,11 +40,15 @@ import type {
   StructField,
   StructFieldInit,
   StructLiteral,
+  StructMethod,
+  SuperExpression,
+  ThisExpression,
   TopLevelDeclaration,
   TypeAnnotation,
   UnaryExpression,
   UpdateStatement,
   VariableDeclaration,
+  Visibility,
   WhileStatement,
 } from "../ast/nodes.js";
 import type { DiagnosticCollector } from "../diagnostics/diagnostic.js";
@@ -65,11 +76,12 @@ const UPDATE_OPS = new Set<TokenKind>([TokenKind.PlusPlus, TokenKind.MinusMinus]
 /**
  * Recursive-descent parser:
  *
- *   program      = importDecl* (functionDecl | structDecl | enumDecl)*
+ *   program      = importDecl* (functionDecl | structDecl | enumDecl | classDecl)*
  *   importDecl   = "import" String ("as" Ident)? ";"
  *   functionDecl = "export"? "function" Ident "(" params? ")" ":" type block
- *   structDecl   = "export"? "struct" Ident "{" structField* "}"
+ *   structDecl   = "export"? "struct" Ident "{" (structField | structMethod)* "}"
  *   enumDecl     = "export"? "enum" Ident "{" (Ident ("," Ident)* ","?)? "}"
+ *   classDecl    = "export"? "abstract"? "class" Ident ("extends" type)? "{" classMember* "}"
  *   structLiteral = (Ident | Ident "." Ident) "{" fields? "}"
  *   type         = Ident ("." Ident)? ("[" "]")*
  */
@@ -108,8 +120,29 @@ export class Parser {
 
       sawNonImport = true;
       const exported = this.match(TokenKind.Export);
+      const isAbstract = this.match(TokenKind.Abstract);
+
+      if (isAbstract && !this.check(TokenKind.Class)) {
+        this.diagnostics.error(
+          `Expected 'class' after 'abstract', found '${this.peek().lexeme}'`,
+          this.peek().span,
+          "E0103",
+        );
+        this.synchronizeToTopLevel();
+        if (this.check(TokenKind.Eof)) {
+          break;
+        }
+        continue;
+      }
 
       if (this.check(TokenKind.Struct)) {
+        if (isAbstract) {
+          this.diagnostics.error(
+            "'abstract' can only be used with classes",
+            this.peek().span,
+            "E0103",
+          );
+        }
         const decl = this.parseStructDeclaration(exported);
         if (decl) {
           body.push(decl);
@@ -117,13 +150,34 @@ export class Parser {
           break;
         }
       } else if (this.check(TokenKind.Enum)) {
+        if (isAbstract) {
+          this.diagnostics.error(
+            "'abstract' can only be used with classes",
+            this.peek().span,
+            "E0103",
+          );
+        }
         const decl = this.parseEnumDeclaration(exported);
         if (decl) {
           body.push(decl);
         } else {
           break;
         }
+      } else if (this.check(TokenKind.Class)) {
+        const decl = this.parseClassDeclaration(exported, isAbstract);
+        if (decl) {
+          body.push(decl);
+        } else {
+          break;
+        }
       } else if (this.check(TokenKind.Function)) {
+        if (isAbstract) {
+          this.diagnostics.error(
+            "'abstract' can only be used with classes",
+            this.peek().span,
+            "E0103",
+          );
+        }
         const fn = this.parseFunctionDeclaration(exported);
         if (fn) {
           body.push(fn);
@@ -131,15 +185,15 @@ export class Parser {
           break;
         }
       } else {
-        if (exported) {
+        if (exported || isAbstract) {
           this.diagnostics.error(
-            `Expected 'function', 'struct', or 'enum' after 'export', found '${this.peek().lexeme}'`,
+            `Expected 'function', 'struct', 'enum', or 'class' after modifiers, found '${this.peek().lexeme}'`,
             this.peek().span,
             "E0103",
           );
         } else {
           this.diagnostics.error(
-            `Expected 'function', 'struct', 'enum', or 'import', found '${this.peek().lexeme}'`,
+            `Expected 'function', 'struct', 'enum', 'class', or 'import', found '${this.peek().lexeme}'`,
             this.peek().span,
             "E0103",
           );
@@ -235,16 +289,26 @@ export class Parser {
     }
 
     const fields: StructField[] = [];
+    const methods: StructMethod[] = [];
     while (!this.check(TokenKind.RBrace) && !this.isAtEnd()) {
-      const field = this.parseStructField();
-      if (!field) {
-        this.synchronizeToTopLevel();
-        return null;
+      if (this.isStructMethodStart()) {
+        const method = this.parseStructMethod();
+        if (!method) {
+          this.synchronizeToTopLevel();
+          return null;
+        }
+        methods.push(method);
+      } else {
+        const field = this.parseStructField();
+        if (!field) {
+          this.synchronizeToTopLevel();
+          return null;
+        }
+        fields.push(field);
       }
-      fields.push(field);
     }
 
-    const rbrace = this.expect(TokenKind.RBrace, "Expected '}' after struct fields");
+    const rbrace = this.expect(TokenKind.RBrace, "Expected '}' after struct body");
     if (!rbrace) {
       this.synchronizeToTopLevel();
       return null;
@@ -255,7 +319,63 @@ export class Parser {
       exported,
       name,
       fields,
+      methods,
       span: { start, end: rbrace.span.end },
+    };
+  }
+
+  /** Method: Ident "(" ... vs field: Ident ":" */
+  private isStructMethodStart(): boolean {
+    return this.check(TokenKind.Identifier) && this.checkNext(TokenKind.LParen);
+  }
+
+  private parseStructMethod(): StructMethod | null {
+    const start = this.peek().span.start;
+    const nameToken = this.expect(TokenKind.Identifier, "Expected method name");
+    if (!nameToken) {
+      return null;
+    }
+
+    const name: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+
+    if (!this.expect(TokenKind.LParen, "Expected '(' after method name")) {
+      return null;
+    }
+
+    const params = this.parseParameterList();
+    if (params === null) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after parameter list")) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.Colon, "Expected ':' before return type")) {
+      return null;
+    }
+
+    const returnType = this.parseType();
+    if (!returnType) {
+      return null;
+    }
+
+    const body = this.parseBlock();
+    if (!body) {
+      return null;
+    }
+
+    return {
+      kind: "StructMethod",
+      name,
+      params,
+      returnType,
+      body: body.statements,
+      span: { start, end: body.end },
     };
   }
 
@@ -288,6 +408,290 @@ export class Parser {
       kind: "StructField",
       name,
       typeAnnotation,
+      span: { start, end },
+    };
+  }
+
+  private parseClassDeclaration(
+    exported: boolean,
+    isAbstract: boolean,
+  ): ClassDeclaration | null {
+    const start = isAbstract
+      ? this.tokens[Math.max(0, this.current - 1)]!.span.start
+      : this.peek().span.start;
+
+    if (!this.expect(TokenKind.Class, "Expected 'class'")) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const nameToken = this.expect(TokenKind.Identifier, "Expected class name");
+    if (!nameToken) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const name: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+
+    let superclass: NamedType | null = null;
+    if (this.match(TokenKind.Extends)) {
+      const superType = this.parseType();
+      if (!superType) {
+        this.synchronizeToTopLevel();
+        return null;
+      }
+      if (superType.kind !== "NamedType") {
+        this.diagnostics.error(
+          "Superclass must be a named class type",
+          superType.span,
+          "E0103",
+        );
+        this.synchronizeToTopLevel();
+        return null;
+      }
+      superclass = superType;
+    }
+
+    if (!this.expect(TokenKind.LBrace, "Expected '{' after class header")) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const members: ClassMember[] = [];
+    while (!this.check(TokenKind.RBrace) && !this.isAtEnd()) {
+      const member = this.parseClassMember();
+      if (!member) {
+        this.synchronizeToTopLevel();
+        return null;
+      }
+      members.push(member);
+    }
+
+    const rbrace = this.expect(TokenKind.RBrace, "Expected '}' after class body");
+    if (!rbrace) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    return {
+      kind: "ClassDeclaration",
+      exported,
+      isAbstract,
+      name,
+      superclass,
+      members,
+      span: { start, end: rbrace.span.end },
+    };
+  }
+
+  private parseClassMember(): ClassMember | null {
+    const start = this.peek().span.start;
+    let visibility: Visibility = "public";
+    if (this.match(TokenKind.Public)) {
+      visibility = "public";
+    } else if (this.match(TokenKind.Private)) {
+      visibility = "private";
+    }
+
+    const isAbstract = this.match(TokenKind.Abstract);
+    const isStatic = this.match(TokenKind.Static);
+    const isReadonly = this.match(TokenKind.Readonly);
+
+    if (this.check(TokenKind.Constructor)) {
+      if (isAbstract || isStatic || isReadonly) {
+        this.diagnostics.error(
+          "Constructor cannot be abstract, static, or readonly",
+          this.peek().span,
+          "E0103",
+        );
+      }
+      return this.parseConstructor(visibility, start);
+    }
+
+    // Method: name( or abstract name(
+    // Field: name:
+    if (!this.check(TokenKind.Identifier)) {
+      this.diagnostics.error(
+        `Expected class member, found '${this.peek().lexeme}'`,
+        this.peek().span,
+        "E0103",
+      );
+      return null;
+    }
+
+    if (this.checkNext(TokenKind.LParen)) {
+      return this.parseClassMethod(visibility, isStatic, isAbstract, isReadonly, start);
+    }
+
+    if (isAbstract) {
+      this.diagnostics.error("Fields cannot be abstract", this.peek().span, "E0103");
+    }
+    return this.parseClassField(visibility, isStatic, isReadonly, start);
+  }
+
+  private parseConstructor(
+    visibility: Visibility,
+    start: { line: number; column: number; offset: number },
+  ): ConstructorDeclaration | null {
+    if (!this.expect(TokenKind.Constructor, "Expected 'constructor'")) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.LParen, "Expected '(' after 'constructor'")) {
+      return null;
+    }
+
+    const params = this.parseParameterList();
+    if (params === null) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after parameter list")) {
+      return null;
+    }
+
+    const body = this.parseBlock();
+    if (!body) {
+      return null;
+    }
+
+    return {
+      kind: "ConstructorDeclaration",
+      visibility,
+      params,
+      body: body.statements,
+      span: { start, end: body.end },
+    };
+  }
+
+  private parseClassMethod(
+    visibility: Visibility,
+    isStatic: boolean,
+    isAbstract: boolean,
+    isReadonly: boolean,
+    start: { line: number; column: number; offset: number },
+  ): ClassMethod | null {
+    if (isReadonly) {
+      this.diagnostics.error("Methods cannot be readonly", this.peek().span, "E0103");
+    }
+
+    const nameToken = this.expect(TokenKind.Identifier, "Expected method name");
+    if (!nameToken) {
+      return null;
+    }
+
+    const name: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+
+    if (!this.expect(TokenKind.LParen, "Expected '(' after method name")) {
+      return null;
+    }
+
+    const params = this.parseParameterList();
+    if (params === null) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after parameter list")) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.Colon, "Expected ':' before return type")) {
+      return null;
+    }
+
+    const returnType = this.parseType();
+    if (!returnType) {
+      return null;
+    }
+
+    if (isAbstract) {
+      const semicolon = this.expect(TokenKind.Semicolon, "Expected ';' after abstract method");
+      const end = semicolon?.span.end ?? returnType.span.end;
+      return {
+        kind: "ClassMethod",
+        visibility,
+        isStatic,
+        isAbstract: true,
+        name,
+        params,
+        returnType,
+        body: null,
+        span: { start, end },
+      };
+    }
+
+    const body = this.parseBlock();
+    if (!body) {
+      return null;
+    }
+
+    return {
+      kind: "ClassMethod",
+      visibility,
+      isStatic,
+      isAbstract: false,
+      name,
+      params,
+      returnType,
+      body: body.statements,
+      span: { start, end: body.end },
+    };
+  }
+
+  private parseClassField(
+    visibility: Visibility,
+    isStatic: boolean,
+    isReadonly: boolean,
+    start: { line: number; column: number; offset: number },
+  ): ClassField | null {
+    const nameToken = this.expect(TokenKind.Identifier, "Expected field name");
+    if (!nameToken) {
+      return null;
+    }
+
+    const name: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+
+    if (!this.expect(TokenKind.Colon, "Expected ':' after field name")) {
+      return null;
+    }
+
+    const typeAnnotation = this.parseType();
+    if (!typeAnnotation) {
+      return null;
+    }
+
+    let initializer: Expression | null = null;
+    if (this.match(TokenKind.Equal)) {
+      initializer = this.parseExpression();
+      if (!initializer) {
+        return null;
+      }
+    }
+
+    const semicolon = this.expect(TokenKind.Semicolon, "Expected ';' after field");
+    const end =
+      semicolon?.span.end ?? initializer?.span.end ?? typeAnnotation.span.end;
+
+    return {
+      kind: "ClassField",
+      visibility,
+      isStatic,
+      isReadonly,
+      name,
+      typeAnnotation,
+      initializer,
       span: { start, end },
     };
   }
@@ -535,6 +939,11 @@ export class Parser {
       if (next?.kind === TokenKind.Dot && this.looksLikeMemberAssignment()) {
         return this.parseMemberAssignment(true);
       }
+    }
+
+    // this.field = ...
+    if (this.check(TokenKind.This) && this.checkNext(TokenKind.Dot) && this.looksLikeMemberAssignment()) {
+      return this.parseMemberAssignment(true);
     }
 
     return this.parseExpressionStatement();
@@ -1001,11 +1410,14 @@ export class Parser {
   private parseMemberAssignment(requireSemicolon: boolean): AssignmentStatement | null {
     const start = this.peek().span.start;
     const nameToken = this.advance();
-    let object: Expression = {
-      kind: "Identifier",
-      name: nameToken.lexeme,
-      span: nameToken.span,
-    };
+    let object: Expression =
+      nameToken.kind === TokenKind.This
+        ? { kind: "ThisExpression", span: nameToken.span }
+        : {
+            kind: "Identifier",
+            name: nameToken.lexeme,
+            span: nameToken.span,
+          };
 
     let target: MemberExpression | null = null;
     while (this.check(TokenKind.Dot)) {
@@ -1373,6 +1785,25 @@ export class Parser {
       expr = inner;
     } else if (this.check(TokenKind.LBracket)) {
       expr = this.parseArrayLiteral();
+    } else if (this.check(TokenKind.New)) {
+      expr = this.parseNewExpression();
+    } else if (this.check(TokenKind.This)) {
+      const token = this.advance();
+      const thisExpr: ThisExpression = {
+        kind: "ThisExpression",
+        span: token.span,
+      };
+      expr = thisExpr;
+    } else if (this.check(TokenKind.Super)) {
+      const token = this.advance();
+      const superExpr: SuperExpression = {
+        kind: "SuperExpression",
+        span: token.span,
+      };
+      if (this.check(TokenKind.LParen)) {
+        return this.parseCallArgs(superExpr, token.span.start);
+      }
+      expr = superExpr;
     } else if (this.check(TokenKind.Identifier) && this.checkNext(TokenKind.LParen)) {
       expr = this.parseCallExpression();
     } else if (
@@ -1445,6 +1876,78 @@ export class Parser {
     }
 
     return this.parsePostfix(expr);
+  }
+
+  private parseNewExpression(): NewExpression | null {
+    const start = this.peek().span.start;
+    if (!this.expect(TokenKind.New, "Expected 'new'")) {
+      return null;
+    }
+
+    const firstToken = this.expect(TokenKind.Identifier, "Expected class name after 'new'");
+    if (!firstToken) {
+      return null;
+    }
+
+    let namespace: Identifier | null = null;
+    let className: Identifier;
+
+    if (this.check(TokenKind.Dot)) {
+      this.advance();
+      const nameToken = this.expect(TokenKind.Identifier, "Expected class name after '.'");
+      if (!nameToken) {
+        return null;
+      }
+      namespace = {
+        kind: "Identifier",
+        name: firstToken.lexeme,
+        span: firstToken.span,
+      };
+      className = {
+        kind: "Identifier",
+        name: nameToken.lexeme,
+        span: nameToken.span,
+      };
+    } else {
+      className = {
+        kind: "Identifier",
+        name: firstToken.lexeme,
+        span: firstToken.span,
+      };
+    }
+
+    if (!this.expect(TokenKind.LParen, "Expected '(' after class name in 'new' expression")) {
+      return null;
+    }
+
+    const args: Expression[] = [];
+    if (!this.check(TokenKind.RParen)) {
+      const first = this.parseExpression();
+      if (!first) {
+        return null;
+      }
+      args.push(first);
+
+      while (this.check(TokenKind.Comma)) {
+        this.advance();
+        const arg = this.parseExpression();
+        if (!arg) {
+          return null;
+        }
+        args.push(arg);
+      }
+    }
+
+    const rparen = this.expect(TokenKind.RParen, "Expected ')' after constructor arguments");
+    const end = rparen?.span.end ?? this.peek().span.end;
+
+    return {
+      kind: "NewExpression",
+      namespace,
+      className,
+      args,
+      span: { start, end },
+    };
   }
 
   private parsePostfix(expr: Expression): Expression | null {
@@ -1655,7 +2158,7 @@ export class Parser {
   }
 
   private parseCallArgs(
-    callee: Identifier | MemberExpression,
+    callee: Identifier | MemberExpression | SuperExpression,
     start = callee.span.start,
   ): CallExpression | null {
     if (!this.expect(TokenKind.LParen, "Expected '(' after function name")) {
@@ -1777,7 +2280,9 @@ export class Parser {
         this.check(TokenKind.Export) ||
         this.check(TokenKind.Function) ||
         this.check(TokenKind.Struct) ||
-        this.check(TokenKind.Enum)
+        this.check(TokenKind.Enum) ||
+        this.check(TokenKind.Class) ||
+        this.check(TokenKind.Abstract)
       ) {
         return;
       }

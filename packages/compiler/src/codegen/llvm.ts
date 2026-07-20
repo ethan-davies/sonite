@@ -2,6 +2,9 @@ import type {
   AssignmentStatement,
   BinaryExpression,
   CallExpression,
+  ClassDeclaration,
+  ClassMethod,
+  ConstructorDeclaration,
   EnumDeclaration,
   Expression,
   ForInStatement,
@@ -9,12 +12,14 @@ import type {
   FunctionDeclaration,
   IfStatement,
   MemberExpression,
+  NewExpression,
   Parameter,
   Program,
   ReturnStatement,
   Statement,
   StructDeclaration,
   StructLiteral,
+  StructMethod,
   TypeAnnotation,
   UnaryExpression,
   UpdateStatement,
@@ -24,8 +29,8 @@ import type {
 import { mangleSymbol } from "../modules/mangle.js";
 import type { ResolvedModule } from "../modules/resolve.js";
 import {
-  annotationToValueType,
   isArrayType,
+  isClassType,
   isEnumType,
   isStructType,
   type EnumValueType,
@@ -60,10 +65,19 @@ interface StructFieldInfo {
   readonly type: ValueType;
 }
 
+interface StructMethodInfo {
+  readonly name: string;
+  readonly mangledName: string;
+  readonly params: ValueType[];
+  readonly returnType: ValueType | "void";
+  readonly decl: StructMethod;
+}
+
 interface StructInfo {
   readonly name: string;
   readonly localName: string;
   readonly fields: StructFieldInfo[];
+  readonly methods: StructMethodInfo[];
 }
 
 interface EnumInfo {
@@ -72,10 +86,46 @@ interface EnumInfo {
   readonly variants: ReadonlyMap<string, number>;
 }
 
+interface ClassFieldInfo {
+  readonly name: string;
+  readonly type: ValueType;
+  readonly fieldIndex: number;
+  readonly isStatic: boolean;
+  readonly staticGlobal: string | null;
+}
+
+interface ClassMethodInfo {
+  readonly name: string;
+  readonly mangledName: string;
+  readonly params: ValueType[];
+  readonly returnType: ValueType | "void";
+  readonly isStatic: boolean;
+  readonly isAbstract: boolean;
+  readonly vtableSlot: number;
+  readonly decl: ClassMethod | null;
+}
+
+interface ClassInfo {
+  readonly name: string;
+  readonly localName: string;
+  readonly isAbstract: boolean;
+  readonly superclass: string | null;
+  readonly fields: ClassFieldInfo[];
+  readonly staticFields: ClassFieldInfo[];
+  readonly instanceMethods: ClassMethodInfo[];
+  readonly staticMethods: ClassMethodInfo[];
+  readonly constructorParams: ValueType[];
+  readonly constructorMangledName: string;
+  readonly constructorDecl: ConstructorDeclaration | null;
+  readonly vtableGlobalName: string;
+  readonly decl: ClassDeclaration;
+}
+
 interface NamespaceInfo {
   readonly functions: ReadonlyMap<string, FunctionSig>;
   readonly structs: ReadonlyMap<string, StructInfo>;
   readonly enums: ReadonlyMap<string, EnumInfo>;
+  readonly classes: ReadonlyMap<string, ClassInfo>;
 }
 
 const COMPARISON_OPS = new Set(["==", "!=", "<", "<=", ">", ">="]);
@@ -101,14 +151,21 @@ export class LlvmCodegen {
   private localStructs = new Map<string, StructInfo>();
   private enums = new Map<string, EnumInfo>();
   private localEnums = new Map<string, EnumInfo>();
+  private classes = new Map<string, ClassInfo>();
+  private localClasses = new Map<string, ClassInfo>();
   private namespaces = new Map<string, NamespaceInfo>();
   private needsPrintf = false;
   private needsStringRuntime = false;
   private needsArrayRuntime = false;
+  private needsClassRuntime = false;
   private needsAbort = false;
   private needsSprintf = false;
   private readonly functionBodies: string[] = [];
+  private readonly globalDefs: string[] = [];
   private readonly loopStack: LoopContext[] = [];
+  /** When emitting a method/constructor, the `this` pointer SSA value. */
+  private thisPtr: string | null = null;
+  private thisType: ValueType | null = null;
 
   emit(program: Program): string {
     return this.emitModules([
@@ -135,14 +192,20 @@ export class LlvmCodegen {
     this.localStructs.clear();
     this.enums.clear();
     this.localEnums.clear();
+    this.classes.clear();
+    this.localClasses.clear();
     this.namespaces.clear();
     this.needsPrintf = false;
     this.needsStringRuntime = false;
     this.needsArrayRuntime = false;
+    this.needsClassRuntime = false;
     this.needsAbort = false;
     this.needsSprintf = false;
     this.functionBodies.length = 0;
+    this.globalDefs.length = 0;
     this.loopStack.length = 0;
+    this.thisPtr = null;
+    this.thisType = null;
 
     const moduleSymbols = new Map<
       string,
@@ -150,6 +213,7 @@ export class LlvmCodegen {
         functions: Map<string, FunctionSig>;
         structs: Map<string, StructInfo>;
         enums: Map<string, EnumInfo>;
+        classes: Map<string, ClassInfo>;
       }
     >();
 
@@ -157,6 +221,7 @@ export class LlvmCodegen {
     for (const mod of modules) {
       const localEnums = new Map<string, EnumInfo>();
       const localStructs = new Map<string, StructInfo>();
+      const localClasses = new Map<string, ClassInfo>();
       const localFns = new Map<string, FunctionSig>();
 
       for (const decl of mod.ast.body) {
@@ -173,7 +238,15 @@ export class LlvmCodegen {
         }
       }
 
-      // Resolve struct field types now that all structs in this module are registered.
+      for (const decl of mod.ast.body) {
+        if (decl.kind === "ClassDeclaration") {
+          const info = this.registerClassStub(decl, mod.moduleId);
+          localClasses.set(decl.name.name, info);
+          this.classes.set(info.name, info);
+        }
+      }
+
+      // Resolve struct field/method types.
       for (const decl of mod.ast.body) {
         if (decl.kind !== "StructDeclaration") {
           continue;
@@ -184,6 +257,7 @@ export class LlvmCodegen {
             field.typeAnnotation,
             localStructs,
             localEnums,
+            localClasses,
             new Map(),
           );
           if (!type) {
@@ -191,9 +265,65 @@ export class LlvmCodegen {
           }
           return { name: field.name.name, type };
         });
-        const updated: StructInfo = { name: info.name, localName: info.localName, fields };
+        const methods: StructMethodInfo[] = decl.methods.map((method) => {
+          const params = method.params.map((p) => {
+            const t = this.resolveAnnotationInModule(
+              p.typeAnnotation,
+              localStructs,
+              localEnums,
+              localClasses,
+              new Map(),
+            );
+            if (!t) {
+              throw new Error(`Codegen: invalid method param in '${method.name.name}'`);
+            }
+            return t;
+          });
+          const returnType =
+            method.returnType.kind === "PrimitiveType" && method.returnType.name === "void"
+              ? ("void" as const)
+              : this.resolveAnnotationInModule(
+                  method.returnType,
+                  localStructs,
+                  localEnums,
+                  localClasses,
+                  new Map(),
+                );
+          if (returnType === null) {
+            throw new Error(`Codegen: invalid method return in '${method.name.name}'`);
+          }
+          return {
+            name: method.name.name,
+            mangledName: mangleSymbol(mod.moduleId, `${decl.name.name}__${method.name.name}`),
+            params,
+            returnType,
+            decl: method,
+          };
+        });
+        const updated: StructInfo = {
+          name: info.name,
+          localName: info.localName,
+          fields,
+          methods,
+        };
         localStructs.set(decl.name.name, updated);
         this.structs.set(updated.name, updated);
+      }
+
+      // Resolve class members (inheritance within module via localClasses).
+      for (const decl of mod.ast.body) {
+        if (decl.kind !== "ClassDeclaration") {
+          continue;
+        }
+        const info = this.buildClassInfo(
+          decl,
+          mod.moduleId,
+          localStructs,
+          localEnums,
+          localClasses,
+        );
+        localClasses.set(decl.name.name, info);
+        this.classes.set(info.name, info);
       }
 
       for (const decl of mod.ast.body) {
@@ -206,6 +336,7 @@ export class LlvmCodegen {
             p.typeAnnotation,
             localStructs,
             localEnums,
+            localClasses,
             new Map(),
           );
           if (!t) {
@@ -216,7 +347,13 @@ export class LlvmCodegen {
         const returnType =
           fn.returnType.kind === "PrimitiveType" && fn.returnType.name === "void"
             ? ("void" as const)
-            : this.resolveAnnotationInModule(fn.returnType, localStructs, localEnums, new Map());
+            : this.resolveAnnotationInModule(
+                fn.returnType,
+                localStructs,
+                localEnums,
+                localClasses,
+                new Map(),
+              );
         if (returnType === null) {
           throw new Error(`Codegen: invalid return type for '${fn.name.name}'`);
         }
@@ -236,15 +373,17 @@ export class LlvmCodegen {
         functions: localFns,
         structs: localStructs,
         enums: localEnums,
+        classes: localClasses,
       });
     }
 
-    // Emit function bodies with per-module local/namespace context.
+    // Emit function/method bodies with per-module local/namespace context.
     for (const mod of modules) {
       const symbols = moduleSymbols.get(mod.path)!;
       this.localFunctions = symbols.functions;
       this.localStructs = symbols.structs;
       this.localEnums = symbols.enums;
+      this.localClasses = symbols.classes;
 
       const namespaces = new Map<string, NamespaceInfo>();
       for (const binding of mod.imports) {
@@ -283,10 +422,20 @@ export class LlvmCodegen {
             exportedEnums.set(name, info);
           }
         }
+        const exportedClasses = new Map<string, ClassInfo>();
+        for (const [name, info] of imported.classes) {
+          const cDecl = importedMod.ast.body.find(
+            (d) => d.kind === "ClassDeclaration" && d.name.name === name,
+          );
+          if (cDecl && cDecl.kind === "ClassDeclaration" && cDecl.exported) {
+            exportedClasses.set(name, info);
+          }
+        }
         namespaces.set(binding.alias, {
           functions: exportedFns,
           structs: exportedStructs,
           enums: exportedEnums,
+          classes: exportedClasses,
         });
       }
       this.namespaces = namespaces;
@@ -294,17 +443,33 @@ export class LlvmCodegen {
       for (const decl of mod.ast.body) {
         if (decl.kind === "FunctionDeclaration") {
           this.emitFunction(decl);
+        } else if (decl.kind === "StructDeclaration") {
+          const info = this.localStructs.get(decl.name.name);
+          if (info) {
+            for (const method of info.methods) {
+              this.emitStructMethod(info, method);
+            }
+          }
+        } else if (decl.kind === "ClassDeclaration") {
+          const info = this.localClasses.get(decl.name.name);
+          if (info) {
+            this.emitClassMembers(info);
+          }
         }
       }
     }
 
+    this.emitClassGlobals();
+
     const structTypeLines = this.emitStructTypeDefs();
-    const globalLines = this.emitStringGlobals();
+    const classTypeLines = this.emitClassTypeDefs();
+    const typeLines = [...structTypeLines, ...classTypeLines];
+    const globalLines = [...this.globalDefs, ...this.emitStringGlobals()];
     const declares: string[] = [];
     if (this.needsPrintf) {
       declares.push("declare i32 @printf(ptr noundef, ...) nounwind");
     }
-    if (this.needsStringRuntime || this.needsArrayRuntime) {
+    if (this.needsStringRuntime || this.needsArrayRuntime || this.needsClassRuntime) {
       declares.push("declare ptr @malloc(i64 noundef) nounwind");
     }
     if (this.needsStringRuntime) {
@@ -326,8 +491,8 @@ export class LlvmCodegen {
       "; ModuleID = 'typescript-native'",
       'source_filename = "typescript-native"',
       "",
-      ...structTypeLines,
-      structTypeLines.length > 0 ? "" : null,
+      ...typeLines,
+      typeLines.length > 0 ? "" : null,
       ...globalLines,
       globalLines.length > 0 ? "" : null,
       ...declares,
@@ -358,13 +523,210 @@ export class LlvmCodegen {
       name: mangleSymbol(moduleId, decl.name.name),
       localName: decl.name.name,
       fields: [],
+      methods: [],
     };
     this.structs.set(info.name, info);
     return info;
   }
 
-  private namedKinds(): Map<string, "struct" | "enum"> {
-    const named = new Map<string, "struct" | "enum">();
+  private registerClassStub(decl: ClassDeclaration, moduleId: string): ClassInfo {
+    const mangled = mangleSymbol(moduleId, decl.name.name);
+    return {
+      name: mangled,
+      localName: decl.name.name,
+      isAbstract: decl.isAbstract,
+      superclass: null,
+      fields: [],
+      staticFields: [],
+      instanceMethods: [],
+      staticMethods: [],
+      constructorParams: [],
+      constructorMangledName: mangleSymbol(moduleId, `${decl.name.name}__constructor`),
+      constructorDecl: null,
+      vtableGlobalName: `${mangled}__vtable`,
+      decl,
+    };
+  }
+
+  private buildClassInfo(
+    decl: ClassDeclaration,
+    moduleId: string,
+    localStructs: Map<string, StructInfo>,
+    localEnums: Map<string, EnumInfo>,
+    localClasses: Map<string, ClassInfo>,
+  ): ClassInfo {
+    const mangled = mangleSymbol(moduleId, decl.name.name);
+    let superclass: ClassInfo | null = null;
+    if (decl.superclass) {
+      if (decl.superclass.namespace) {
+        throw new Error("Codegen: cross-module superclass not resolved yet");
+      }
+      superclass = localClasses.get(decl.superclass.name) ?? null;
+      if (!superclass) {
+        throw new Error(`Codegen: unknown superclass '${decl.superclass.name}'`);
+      }
+    }
+
+    const fields: ClassFieldInfo[] = superclass
+      ? superclass.fields.map((f) => ({ ...f }))
+      : [];
+    const staticFields: ClassFieldInfo[] = [];
+    let constructorDecl: ConstructorDeclaration | null = null;
+    const ownMethods: ClassMethod[] = [];
+
+    for (const member of decl.members) {
+      if (member.kind === "ConstructorDeclaration") {
+        constructorDecl = member;
+        continue;
+      }
+      if (member.kind === "ClassField") {
+        const type = this.resolveAnnotationInModule(
+          member.typeAnnotation,
+          localStructs,
+          localEnums,
+          localClasses,
+          new Map(),
+        );
+        if (!type) {
+          throw new Error(`Codegen: invalid field type '${member.name.name}'`);
+        }
+        if (member.isStatic) {
+          staticFields.push({
+            name: member.name.name,
+            type,
+            fieldIndex: -1,
+            isStatic: true,
+            staticGlobal: mangleSymbol(moduleId, `${decl.name.name}__static_${member.name.name}`),
+          });
+        } else {
+          fields.push({
+            name: member.name.name,
+            type,
+            fieldIndex: fields.length + 1,
+            isStatic: false,
+            staticGlobal: null,
+          });
+        }
+        continue;
+      }
+      ownMethods.push(member);
+    }
+
+    for (let i = 0; i < fields.length; i += 1) {
+      fields[i] = { ...fields[i]!, fieldIndex: i + 1 };
+    }
+
+    const instanceMethods: ClassMethodInfo[] = superclass
+      ? superclass.instanceMethods.map((m) => ({ ...m }))
+      : [];
+    const staticMethods: ClassMethodInfo[] = [];
+    const slotByName = new Map(instanceMethods.map((m, i) => [m.name, i]));
+
+    for (const method of ownMethods) {
+      const params = method.params.map((p) => {
+        const t = this.resolveAnnotationInModule(
+          p.typeAnnotation,
+          localStructs,
+          localEnums,
+          localClasses,
+          new Map(),
+        );
+        if (!t) {
+          throw new Error(`Codegen: invalid method param '${method.name.name}'`);
+        }
+        return t;
+      });
+      const returnType =
+        method.returnType.kind === "PrimitiveType" && method.returnType.name === "void"
+          ? ("void" as const)
+          : this.resolveAnnotationInModule(
+              method.returnType,
+              localStructs,
+              localEnums,
+              localClasses,
+              new Map(),
+            );
+      if (returnType === null) {
+        throw new Error(`Codegen: invalid method return '${method.name.name}'`);
+      }
+      const mangledMethod = mangleSymbol(moduleId, `${decl.name.name}__${method.name.name}`);
+      if (method.isStatic) {
+        staticMethods.push({
+          name: method.name.name,
+          mangledName: mangledMethod,
+          params,
+          returnType,
+          isStatic: true,
+          isAbstract: false,
+          vtableSlot: -1,
+          decl: method,
+        });
+        continue;
+      }
+      const existing = slotByName.get(method.name.name);
+      if (existing !== undefined) {
+        instanceMethods[existing] = {
+          name: method.name.name,
+          mangledName: mangledMethod,
+          params,
+          returnType,
+          isStatic: false,
+          isAbstract: method.isAbstract,
+          vtableSlot: existing,
+          decl: method,
+        };
+      } else {
+        const slot = instanceMethods.length;
+        slotByName.set(method.name.name, slot);
+        instanceMethods.push({
+          name: method.name.name,
+          mangledName: mangledMethod,
+          params,
+          returnType,
+          isStatic: false,
+          isAbstract: method.isAbstract,
+          vtableSlot: slot,
+          decl: method,
+        });
+      }
+    }
+
+    const constructorParams: ValueType[] = [];
+    if (constructorDecl) {
+      for (const p of constructorDecl.params) {
+        const t = this.resolveAnnotationInModule(
+          p.typeAnnotation,
+          localStructs,
+          localEnums,
+          localClasses,
+          new Map(),
+        );
+        if (!t) {
+          throw new Error("Codegen: invalid constructor param");
+        }
+        constructorParams.push(t);
+      }
+    }
+
+    return {
+      name: mangled,
+      localName: decl.name.name,
+      isAbstract: decl.isAbstract,
+      superclass: superclass?.name ?? null,
+      fields,
+      staticFields,
+      instanceMethods,
+      staticMethods,
+      constructorParams,
+      constructorMangledName: mangleSymbol(moduleId, `${decl.name.name}__constructor`),
+      constructorDecl,
+      vtableGlobalName: `${mangled}__vtable`,
+      decl,
+    };
+  }
+
+  private namedKinds(): Map<string, "struct" | "enum" | "class"> {
+    const named = new Map<string, "struct" | "enum" | "class">();
     for (const info of this.localStructs.values()) {
       named.set(info.localName, "struct");
       named.set(info.name, "struct");
@@ -372,6 +734,10 @@ export class LlvmCodegen {
     for (const info of this.localEnums.values()) {
       named.set(info.localName, "enum");
       named.set(info.name, "enum");
+    }
+    for (const info of this.localClasses.values()) {
+      named.set(info.localName, "class");
+      named.set(info.name, "class");
     }
     for (const [alias, ns] of this.namespaces) {
       for (const [name, info] of ns.structs) {
@@ -382,6 +748,10 @@ export class LlvmCodegen {
         named.set(`${alias}.${name}`, "enum");
         named.set(info.name, "enum");
       }
+      for (const [name, info] of ns.classes) {
+        named.set(`${alias}.${name}`, "class");
+        named.set(info.name, "class");
+      }
     }
     return named;
   }
@@ -391,6 +761,7 @@ export class LlvmCodegen {
       ann,
       this.localStructs,
       this.localEnums,
+      this.localClasses,
       this.namespaces,
     );
   }
@@ -399,6 +770,7 @@ export class LlvmCodegen {
     ann: TypeAnnotation,
     localStructs: Map<string, StructInfo>,
     localEnums: Map<string, EnumInfo>,
+    localClasses: Map<string, ClassInfo>,
     namespaces: Map<string, NamespaceInfo>,
   ): ValueType | null {
     if (ann.kind === "PrimitiveType") {
@@ -421,6 +793,10 @@ export class LlvmCodegen {
         if (structInfo) {
           return { kind: "struct", name: structInfo.name };
         }
+        const classInfo = ns.classes.get(ann.name);
+        if (classInfo) {
+          return { kind: "class", name: classInfo.name };
+        }
         return null;
       }
       const enumInfo = localEnums.get(ann.name);
@@ -431,18 +807,9 @@ export class LlvmCodegen {
       if (structInfo) {
         return { kind: "struct", name: structInfo.name };
       }
-      // Fall back for annotationToValueType-style lookups during early register
-      const named = annotationToValueType(ann, this.namedKinds());
-      if (named && typeof named === "object" && (named.kind === "struct" || named.kind === "enum")) {
-        // Map local/qualified key to mangled if possible
-        const localS = localStructs.get(ann.name);
-        if (localS) {
-          return { kind: "struct", name: localS.name };
-        }
-        const localE = localEnums.get(ann.name);
-        if (localE) {
-          return { kind: "enum", name: localE.name };
-        }
+      const classInfo = localClasses.get(ann.name);
+      if (classInfo) {
+        return { kind: "class", name: classInfo.name };
       }
       return null;
     }
@@ -450,6 +817,7 @@ export class LlvmCodegen {
       ann.element,
       localStructs,
       localEnums,
+      localClasses,
       namespaces,
     );
     if (element === null) {
@@ -465,6 +833,224 @@ export class LlvmCodegen {
       lines.push(`%${info.name} = type { ${fieldTypes} }`);
     }
     return lines;
+  }
+
+  private emitClassTypeDefs(): string[] {
+    const lines: string[] = [];
+    for (const info of this.classes.values()) {
+      const fieldTypes = ["ptr", ...info.fields.map((f) => toLlvmType(f.type))].join(", ");
+      lines.push(`%${info.name} = type { ${fieldTypes} }`);
+      if (info.instanceMethods.length > 0) {
+        const slots = info.instanceMethods.map(() => "ptr").join(", ");
+        lines.push(`%${info.name}__vtable_type = type { ${slots} }`);
+      } else {
+        lines.push(`%${info.name}__vtable_type = type { }`);
+      }
+    }
+    return lines;
+  }
+
+  private emitClassGlobals(): void {
+    for (const info of this.classes.values()) {
+      for (const field of info.staticFields) {
+        if (!field.staticGlobal) {
+          continue;
+        }
+        const llvmTy = toLlvmType(field.type);
+        const zero = zeroInitializer(field.type);
+        this.globalDefs.push(`@${field.staticGlobal} = global ${llvmTy} ${zero}`);
+      }
+      if (info.instanceMethods.length === 0) {
+        this.globalDefs.push(
+          `@${info.vtableGlobalName} = global %${info.name}__vtable_type zeroinitializer`,
+        );
+      } else {
+        const ptrs = info.instanceMethods
+          .map((m) =>
+            m.isAbstract ? "ptr null" : `ptr @${m.mangledName}`,
+          )
+          .join(", ");
+        this.globalDefs.push(
+          `@${info.vtableGlobalName} = global %${info.name}__vtable_type { ${ptrs} }`,
+        );
+      }
+    }
+  }
+
+  private emitStructMethod(struct: StructInfo, method: StructMethodInfo): void {
+    this.locals = new Map();
+    this.tempCounter = 0;
+    this.loopStack.length = 0;
+    this.thisPtr = "%this";
+    this.thisType = { kind: "struct", name: struct.name };
+
+    const ret = method.returnType === "void" ? "void" : toLlvmType(method.returnType);
+    const params = [
+      `ptr %this`,
+      ...method.params.map((t, i) => `${toLlvmType(t)} %arg${i}`),
+    ].join(", ");
+    const lines: string[] = [];
+    lines.push(`define ${ret} @${method.mangledName}(${params}) {`);
+    lines.push("entry:");
+
+    for (let i = 0; i < method.decl.params.length; i += 1) {
+      this.emitParameter(method.decl.params[i]!, i, lines);
+    }
+
+    let terminated = false;
+    for (const stmt of method.decl.body) {
+      if (terminated) {
+        break;
+      }
+      terminated = this.emitStatement(stmt, lines);
+    }
+    if (!terminated) {
+      if (method.returnType === "void") {
+        lines.push("  ret void");
+      } else {
+        throw new Error(`Codegen: method '${method.name}' missing return`);
+      }
+    }
+    lines.push("}");
+    lines.push("");
+    this.functionBodies.push(...lines);
+    this.thisPtr = null;
+    this.thisType = null;
+  }
+
+  private emitClassMembers(info: ClassInfo): void {
+    this.emitClassConstructor(info);
+    const declaredInstance = new Set(
+      info.decl.members
+        .filter((m): m is ClassMethod => m.kind === "ClassMethod" && !m.isStatic && !m.isAbstract)
+        .map((m) => m.name.name),
+    );
+    for (const method of info.instanceMethods) {
+      if (declaredInstance.has(method.name)) {
+        this.emitClassMethod(info, method);
+      }
+    }
+    for (const method of info.staticMethods) {
+      this.emitClassMethod(info, method);
+    }
+  }
+
+  private emitClassConstructor(info: ClassInfo): void {
+    this.locals = new Map();
+    this.tempCounter = 0;
+    this.loopStack.length = 0;
+    this.thisPtr = "%this";
+    this.thisType = { kind: "class", name: info.name };
+
+    const params = [
+      `ptr %this`,
+      ...info.constructorParams.map((t, i) => `${toLlvmType(t)} %arg${i}`),
+    ].join(", ");
+    const lines: string[] = [];
+    lines.push(`define void @${info.constructorMangledName}(${params}) {`);
+    lines.push("entry:");
+
+    if (info.constructorDecl) {
+      for (let i = 0; i < info.constructorDecl.params.length; i += 1) {
+        this.emitParameter(info.constructorDecl.params[i]!, i, lines);
+      }
+      let terminated = false;
+      for (const stmt of info.constructorDecl.body) {
+        if (terminated) {
+          break;
+        }
+        terminated = this.emitStatement(stmt, lines);
+      }
+      if (!terminated) {
+        lines.push("  ret void");
+      }
+    } else {
+      if (info.superclass) {
+        const base = this.classes.get(info.superclass);
+        if (base) {
+          lines.push(`  call void @${base.constructorMangledName}(ptr %this)`);
+        }
+      }
+      lines.push("  ret void");
+    }
+
+    lines.push("}");
+    lines.push("");
+    this.functionBodies.push(...lines);
+    this.thisPtr = null;
+    this.thisType = null;
+  }
+
+  private emitClassMethod(info: ClassInfo, method: ClassMethodInfo): void {
+    if (!method.decl || method.isAbstract || !method.decl.body) {
+      return;
+    }
+    this.locals = new Map();
+    this.tempCounter = 0;
+    this.loopStack.length = 0;
+    this.thisPtr = method.isStatic ? null : "%this";
+    this.thisType = method.isStatic ? null : { kind: "class", name: info.name };
+
+    const ret = method.returnType === "void" ? "void" : toLlvmType(method.returnType);
+    const paramParts = method.isStatic
+      ? method.params.map((t, i) => `${toLlvmType(t)} %arg${i}`)
+      : [`ptr %this`, ...method.params.map((t, i) => `${toLlvmType(t)} %arg${i}`)];
+    const lines: string[] = [];
+    lines.push(`define ${ret} @${method.mangledName}(${paramParts.join(", ")}) {`);
+    lines.push("entry:");
+
+    for (let i = 0; i < method.decl.params.length; i += 1) {
+      this.emitParameter(method.decl.params[i]!, i, lines);
+    }
+
+    let terminated = false;
+    for (const stmt of method.decl.body) {
+      if (terminated) {
+        break;
+      }
+      terminated = this.emitStatement(stmt, lines);
+    }
+    if (!terminated) {
+      if (method.returnType === "void") {
+        lines.push("  ret void");
+      } else {
+        throw new Error(`Codegen: method '${method.name}' missing return`);
+      }
+    }
+    lines.push("}");
+    lines.push("");
+    this.functionBodies.push(...lines);
+    this.thisPtr = null;
+    this.thisType = null;
+  }
+
+  private emitNewExpression(expr: NewExpression, lines: string[]): EmittedValue {
+    this.needsClassRuntime = true;
+    const classInfo = expr.namespace
+      ? this.namespaces.get(expr.namespace.name)?.classes.get(expr.className.name)
+      : this.localClasses.get(expr.className.name);
+    if (!classInfo) {
+      throw new Error(`Codegen: unknown class '${expr.className.name}'`);
+    }
+    const size = classObjectByteSize(classInfo, this.structs);
+    const obj = this.nextTemp();
+    lines.push(`  ${obj} = call ptr @malloc(i64 noundef ${size})`);
+    const vtPtr = this.nextTemp();
+    lines.push(
+      `  ${vtPtr} = getelementptr inbounds %${classInfo.name}, ptr ${obj}, i32 0, i32 0`,
+    );
+    lines.push(`  store ptr @${classInfo.vtableGlobalName}, ptr ${vtPtr}`);
+
+    const args: EmittedValue[] = [];
+    for (let i = 0; i < expr.args.length; i += 1) {
+      args.push(this.emitExpression(expr.args[i]!, lines, classInfo.constructorParams[i]));
+    }
+    const argList = [
+      `ptr ${obj}`,
+      ...args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`),
+    ].join(", ");
+    lines.push(`  call void @${classInfo.constructorMangledName}(${argList})`);
+    return { llvm: obj, type: { kind: "class", name: classInfo.name } };
   }
 
   private emitFunction(fn: FunctionDeclaration): void {
@@ -906,6 +1492,10 @@ export class LlvmCodegen {
   }
 
   private emitCallStatement(call: CallExpression, lines: string[]): void {
+    if (call.callee.kind === "SuperExpression") {
+      this.emitSuperCall(call, lines);
+      return;
+    }
     if (call.callee.kind === "MemberExpression") {
       if (this.isNamespaceCallee(call)) {
         this.emitNamespaceCall(call, lines, true);
@@ -919,6 +1509,29 @@ export class LlvmCodegen {
       return;
     }
     this.emitUserCall(call, lines, true);
+  }
+
+  private emitSuperCall(call: CallExpression, lines: string[]): void {
+    if (!this.thisType || !isClassType(this.thisType)) {
+      throw new Error("Codegen: super outside class constructor");
+    }
+    const info = this.classes.get(this.thisType.name);
+    if (!info?.superclass) {
+      throw new Error("Codegen: super without superclass");
+    }
+    const base = this.classes.get(info.superclass);
+    if (!base) {
+      throw new Error("Codegen: missing superclass info");
+    }
+    const args: EmittedValue[] = [];
+    for (let i = 0; i < call.args.length; i += 1) {
+      args.push(this.emitExpression(call.args[i]!, lines, base.constructorParams[i]));
+    }
+    const argList = [
+      `ptr ${this.thisPtr}`,
+      ...args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`),
+    ].join(", ");
+    lines.push(`  call void @${base.constructorMangledName}(${argList})`);
   }
 
   private resolveDeclType(stmt: VariableDeclaration): ValueType {
@@ -956,6 +1569,23 @@ export class LlvmCodegen {
         }
         return { kind: "struct", name: def.name };
       }
+      case "NewExpression": {
+        const info = expr.namespace
+          ? this.namespaces.get(expr.namespace.name)?.classes.get(expr.className.name)
+          : this.localClasses.get(expr.className.name);
+        if (!info) {
+          throw new Error(`Codegen: unknown class '${expr.className.name}'`);
+        }
+        return { kind: "class", name: info.name };
+      }
+      case "ThisExpression": {
+        if (!this.thisType) {
+          throw new Error("Codegen: this outside method");
+        }
+        return this.thisType;
+      }
+      case "SuperExpression":
+        throw new Error("Codegen: super used as value");
       case "IndexExpression": {
         const objectType = this.inferExpressionType(expr.object);
         if (!isArrayType(objectType)) {
@@ -984,11 +1614,31 @@ export class LlvmCodegen {
         ) {
           return { kind: "enum", name: this.localEnums.get(expr.object.name)!.name };
         }
+        if (expr.object.kind === "Identifier" && !this.locals.has(expr.object.name)) {
+          const classInfo = this.localClasses.get(expr.object.name);
+          if (classInfo) {
+            const field = classInfo.staticFields.find((f) => f.name === expr.property.name);
+            if (field) {
+              return field.type;
+            }
+          }
+        }
         const objectType = this.inferExpressionType(expr.object);
         if (isStructType(objectType)) {
           const def = this.structs.get(objectType.name);
           if (!def) {
             throw new Error(`Codegen: unknown struct '${objectType.name}'`);
+          }
+          const field = def.fields.find((f) => f.name === expr.property.name);
+          if (!field) {
+            throw new Error(`Codegen: unknown field '${expr.property.name}'`);
+          }
+          return field.type;
+        }
+        if (isClassType(objectType)) {
+          const def = this.classes.get(objectType.name);
+          if (!def) {
+            throw new Error(`Codegen: unknown class '${objectType.name}'`);
           }
           const field = def.fields.find((f) => f.name === expr.property.name);
           if (!field) {
@@ -1027,6 +1677,9 @@ export class LlvmCodegen {
         return this.inferExpressionType(expr.left);
       }
       case "CallExpression": {
+        if (expr.callee.kind === "SuperExpression") {
+          throw new Error("Codegen: super call in type inference");
+        }
         if (expr.callee.kind === "MemberExpression") {
           if (this.isNamespaceCallee(expr)) {
             const ns = this.namespaces.get(
@@ -1040,8 +1693,38 @@ export class LlvmCodegen {
             }
             return sig.returnType;
           }
+          if (
+            expr.callee.object.kind === "Identifier" &&
+            !this.locals.has(expr.callee.object.name)
+          ) {
+            const classInfo = this.localClasses.get(expr.callee.object.name);
+            const methodName = expr.callee.property.name;
+            const method = classInfo?.staticMethods.find((m) => m.name === methodName);
+            if (method) {
+              if (method.returnType === "void") {
+                throw new Error("Codegen: void static method in inference");
+              }
+              return method.returnType;
+            }
+          }
           const method = expr.callee.property.name;
           const objectType = this.inferExpressionType(expr.callee.object);
+          if (isStructType(objectType)) {
+            const def = this.structs.get(objectType.name);
+            const m = def?.methods.find((x) => x.name === method);
+            if (!m || m.returnType === "void") {
+              throw new Error("Codegen: unexpected struct method in inference");
+            }
+            return m.returnType;
+          }
+          if (isClassType(objectType)) {
+            const def = this.classes.get(objectType.name);
+            const m = def?.instanceMethods.find((x) => x.name === method);
+            if (!m || m.returnType === "void") {
+              throw new Error("Codegen: unexpected class method in inference");
+            }
+            return m.returnType;
+          }
           if (!isArrayType(objectType)) {
             throw new Error("Codegen: method on non-array");
           }
@@ -1093,6 +1776,21 @@ export class LlvmCodegen {
         return this.emitArrayLiteral(expr.elements, lines, expected);
       case "StructLiteral":
         return this.emitStructLiteral(expr, lines);
+      case "NewExpression":
+        return this.emitNewExpression(expr, lines);
+      case "ThisExpression": {
+        if (!this.thisPtr || !this.thisType) {
+          throw new Error("Codegen: this outside method");
+        }
+        if (isStructType(this.thisType)) {
+          const loaded = this.nextTemp();
+          lines.push(`  ${loaded} = load %${this.thisType.name}, ptr ${this.thisPtr}`);
+          return { llvm: loaded, type: this.thisType };
+        }
+        return { llvm: this.thisPtr, type: this.thisType };
+      }
+      case "SuperExpression":
+        throw new Error("Codegen: super used as value");
       case "IndexExpression": {
         const object = this.emitExpression(expr.object, lines);
         if (!isArrayType(object.type)) {
@@ -1133,9 +1831,25 @@ export class LlvmCodegen {
           const type: EnumValueType = { kind: "enum", name: def.name };
           return { llvm: String(discriminant), type };
         }
+        if (expr.object.kind === "Identifier" && !this.locals.has(expr.object.name)) {
+          const classInfo = this.localClasses.get(expr.object.name);
+          if (classInfo) {
+            const field = classInfo.staticFields.find((f) => f.name === expr.property.name);
+            if (field?.staticGlobal) {
+              const loaded = this.nextTemp();
+              lines.push(
+                `  ${loaded} = load ${toLlvmType(field.type)}, ptr @${field.staticGlobal}`,
+              );
+              return { llvm: loaded, type: field.type };
+            }
+          }
+        }
         const objectType = this.inferExpressionType(expr.object);
         if (isStructType(objectType)) {
           return this.emitStructFieldLoad(expr, lines);
+        }
+        if (isClassType(objectType)) {
+          return this.emitClassFieldLoad(expr, lines);
         }
         if (expr.property.name !== "length") {
           throw new Error(`Codegen: unknown property '${expr.property.name}'`);
@@ -1161,6 +1875,10 @@ export class LlvmCodegen {
       case "BinaryExpression":
         return this.emitBinary(expr, lines);
       case "CallExpression":
+        if (expr.callee.kind === "SuperExpression") {
+          this.emitSuperCall(expr, lines);
+          return { llvm: "void", type: "i32" };
+        }
         if (expr.callee.kind === "MemberExpression") {
           if (this.isNamespaceCallee(expr)) {
             return this.emitNamespaceCall(expr, lines, false);
@@ -1245,20 +1963,55 @@ export class LlvmCodegen {
 
   /** Address of the field referenced by a MemberExpression (supports nested a.b.c). */
   private emitMemberFieldPtr(expr: MemberExpression, lines: string[]): string {
+    // Static class field
+    if (expr.object.kind === "Identifier" && !this.locals.has(expr.object.name)) {
+      const classInfo = this.localClasses.get(expr.object.name);
+      if (classInfo) {
+        const field = classInfo.staticFields.find((f) => f.name === expr.property.name);
+        if (field?.staticGlobal) {
+          return `@${field.staticGlobal}`;
+        }
+      }
+    }
+
     const objectType = this.inferExpressionType(expr.object);
-    if (!isStructType(objectType)) {
-      throw new Error("Codegen: member field on non-struct");
+    if (isStructType(objectType)) {
+      const structPtr = this.emitStructAddress(expr.object, objectType, lines);
+      const def = this.structs.get(objectType.name);
+      if (!def) {
+        throw new Error(`Codegen: unknown struct '${objectType.name}'`);
+      }
+      const fieldIndex = def.fields.findIndex((f) => f.name === expr.property.name);
+      if (fieldIndex < 0) {
+        throw new Error(`Codegen: unknown field '${expr.property.name}'`);
+      }
+      return this.emitStructFieldPtr(structPtr, objectType.name, fieldIndex, lines);
     }
-    const structPtr = this.emitStructAddress(expr.object, objectType, lines);
-    const def = this.structs.get(objectType.name);
-    if (!def) {
-      throw new Error(`Codegen: unknown struct '${objectType.name}'`);
+    if (isClassType(objectType)) {
+      const obj = this.emitExpression(expr.object, lines);
+      const def = this.classes.get(objectType.name);
+      if (!def) {
+        throw new Error(`Codegen: unknown class '${objectType.name}'`);
+      }
+      const field = def.fields.find((f) => f.name === expr.property.name);
+      if (!field) {
+        throw new Error(`Codegen: unknown field '${expr.property.name}'`);
+      }
+      const fieldPtr = this.nextTemp();
+      lines.push(
+        `  ${fieldPtr} = getelementptr inbounds %${def.name}, ptr ${obj.llvm}, i32 0, i32 ${field.fieldIndex}`,
+      );
+      return fieldPtr;
     }
-    const fieldIndex = def.fields.findIndex((f) => f.name === expr.property.name);
-    if (fieldIndex < 0) {
-      throw new Error(`Codegen: unknown field '${expr.property.name}'`);
-    }
-    return this.emitStructFieldPtr(structPtr, objectType.name, fieldIndex, lines);
+    throw new Error("Codegen: member field on non-struct/class");
+  }
+
+  private emitClassFieldLoad(expr: MemberExpression, lines: string[]): EmittedValue {
+    const fieldPtr = this.emitMemberFieldPtr(expr, lines);
+    const fieldType = this.inferExpressionType(expr);
+    const loaded = this.nextTemp();
+    lines.push(`  ${loaded} = load ${toLlvmType(fieldType)}, ptr ${fieldPtr}`);
+    return { llvm: loaded, type: fieldType };
   }
 
   /** Pointer to a struct value in memory (local alloca, nested field, or temp). */
@@ -1267,6 +2020,13 @@ export class LlvmCodegen {
     expected: StructValueType,
     lines: string[],
   ): string {
+    if (expr.kind === "ThisExpression") {
+      if (!this.thisPtr || !this.thisType || !isStructType(this.thisType)) {
+        throw new Error("Codegen: this is not a struct pointer");
+      }
+      return this.thisPtr;
+    }
+
     if (expr.kind === "Identifier") {
       const local = this.locals.get(expr.name);
       if (!local || !isStructType(local.type)) {
@@ -1439,13 +2199,109 @@ export class LlvmCodegen {
     if (call.callee.kind !== "MemberExpression") {
       throw new Error("Codegen: expected method call");
     }
+    const callee = call.callee;
 
-    const object = this.emitExpression(call.callee.object, lines);
+    // Static method: ClassName.method(...)
+    if (callee.object.kind === "Identifier" && !this.locals.has(callee.object.name)) {
+      const classInfo = this.localClasses.get(callee.object.name);
+      const method = classInfo?.staticMethods.find((m) => m.name === callee.property.name);
+      if (method) {
+        const args: EmittedValue[] = [];
+        for (let i = 0; i < call.args.length; i += 1) {
+          args.push(this.emitExpression(call.args[i]!, lines, method.params[i]));
+        }
+        const argList = args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`).join(", ");
+        if (method.returnType === "void") {
+          lines.push(`  call void @${method.mangledName}(${argList})`);
+          if (!asStatement) {
+            throw new Error("Codegen: void static method used as value");
+          }
+          return { llvm: "void", type: "i32" };
+        }
+        const tmp = this.nextTemp();
+        const retTy = toLlvmType(method.returnType);
+        lines.push(`  ${tmp} = call ${retTy} @${method.mangledName}(${argList})`);
+        return { llvm: tmp, type: method.returnType };
+      }
+    }
+
+    const objectType = this.inferExpressionType(callee.object);
+
+    if (isStructType(objectType)) {
+      const def = this.structs.get(objectType.name);
+      const method = def?.methods.find((m) => m.name === callee.property.name);
+      if (!def || !method) {
+        throw new Error(`Codegen: unknown struct method '${callee.property.name}'`);
+      }
+      const thisAddr = this.emitStructAddress(callee.object, objectType, lines);
+      const args: EmittedValue[] = [];
+      for (let i = 0; i < call.args.length; i += 1) {
+        args.push(this.emitExpression(call.args[i]!, lines, method.params[i]));
+      }
+      const argList = [
+        `ptr ${thisAddr}`,
+        ...args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`),
+      ].join(", ");
+      if (method.returnType === "void") {
+        lines.push(`  call void @${method.mangledName}(${argList})`);
+        if (!asStatement) {
+          throw new Error("Codegen: void struct method used as value");
+        }
+        return { llvm: "void", type: "i32" };
+      }
+      const tmp = this.nextTemp();
+      const retTy = toLlvmType(method.returnType);
+      lines.push(`  ${tmp} = call ${retTy} @${method.mangledName}(${argList})`);
+      return { llvm: tmp, type: method.returnType };
+    }
+
+    if (isClassType(objectType)) {
+      const def = this.classes.get(objectType.name);
+      const method = def?.instanceMethods.find((m) => m.name === callee.property.name);
+      if (!def || !method) {
+        throw new Error(`Codegen: unknown class method '${callee.property.name}'`);
+      }
+      const obj = this.emitExpression(callee.object, lines);
+      const args: EmittedValue[] = [];
+      for (let i = 0; i < call.args.length; i += 1) {
+        args.push(this.emitExpression(call.args[i]!, lines, method.params[i]));
+      }
+      // Virtual dispatch via vtable
+      const vtField = this.nextTemp();
+      lines.push(
+        `  ${vtField} = getelementptr inbounds %${def.name}, ptr ${obj.llvm}, i32 0, i32 0`,
+      );
+      const vt = this.nextTemp();
+      lines.push(`  ${vt} = load ptr, ptr ${vtField}`);
+      const slotPtr = this.nextTemp();
+      lines.push(
+        `  ${slotPtr} = getelementptr inbounds %${def.name}__vtable_type, ptr ${vt}, i32 0, i32 ${method.vtableSlot}`,
+      );
+      const fnPtr = this.nextTemp();
+      lines.push(`  ${fnPtr} = load ptr, ptr ${slotPtr}`);
+      const argList = [
+        `ptr ${obj.llvm}`,
+        ...args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`),
+      ].join(", ");
+      if (method.returnType === "void") {
+        lines.push(`  call void ${fnPtr}(${argList})`);
+        if (!asStatement) {
+          throw new Error("Codegen: void class method used as value");
+        }
+        return { llvm: "void", type: "i32" };
+      }
+      const tmp = this.nextTemp();
+      const retTy = toLlvmType(method.returnType);
+      lines.push(`  ${tmp} = call ${retTy} ${fnPtr}(${argList})`);
+      return { llvm: tmp, type: method.returnType };
+    }
+
+    const object = this.emitExpression(callee.object, lines);
     if (!isArrayType(object.type)) {
       throw new Error("Codegen: method on non-array");
     }
 
-    const method = call.callee.property.name;
+    const method = callee.property.name;
     const elementType = object.type.element;
 
     switch (method) {
@@ -2136,6 +2992,7 @@ function toLlvmType(type: ValueType | "void"): string {
     if (type.kind === "enum") {
       return "i32";
     }
+    // class and array are pointers
     return "ptr";
   }
   switch (type) {
@@ -2154,6 +3011,41 @@ function toLlvmType(type: ValueType | "void"): string {
     case "string":
       return "ptr";
   }
+}
+
+function zeroInitializer(type: ValueType): string {
+  if (typeof type === "object") {
+    if (type.kind === "enum") {
+      return "0";
+    }
+    return "null";
+  }
+  switch (type) {
+    case "i32":
+    case "i64":
+    case "char":
+      return "0";
+    case "f32":
+    case "f64":
+      return "0.0";
+    case "bool":
+      return "false";
+    case "string":
+      return "null";
+  }
+}
+
+function classObjectByteSize(
+  info: ClassInfo,
+  structs: Map<string, StructInfo>,
+): number {
+  let size = 8; // vtable ptr
+  for (const field of info.fields) {
+    const align = fieldAlign(field.type);
+    size = alignUp(size, align);
+    size += elementByteSize(field.type, structs);
+  }
+  return alignUp(size, 8);
 }
 
 function elementByteSize(type: ValueType, structs?: Map<string, StructInfo>): number {

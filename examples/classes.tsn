@@ -1,0 +1,30 @@
+class Person {
+  public name: string;
+  private age: i32;
+  readonly id: i32;
+  static count: i32;
+
+  constructor(name: string, age: i32) {
+    this.name = name;
+    this.age = age;
+    this.id = 1;
+    Person.count = Person.count + 1;
+  }
+
+  greet(): void {
+    print("Hello " + this.name);
+  }
+
+  static getCount(): i32 {
+    return Person.count;
+  }
+}
+
+function main(): void {
+  let person = new Person("John", 18);
+  person.greet();
+  print(person.name);
+  person.name = "Bob";
+  print(person.name);
+  print(Person.getCount());
+}

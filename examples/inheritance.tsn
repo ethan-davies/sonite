@@ -1,0 +1,23 @@
+abstract class Animal {
+  abstract speak(): void;
+
+  move(): void {
+    print("moving");
+  }
+}
+
+class Dog extends Animal {
+  constructor() {
+    super();
+  }
+
+  speak(): void {
+    print("woof");
+  }
+}
+
+function main(): void {
+  let animal: Animal = new Dog();
+  animal.speak();
+  animal.move();
+}

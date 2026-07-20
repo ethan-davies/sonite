@@ -25,14 +25,21 @@ export type BinaryOperator =
   | "&&"
   | "||";
 
+export type Visibility = "public" | "private";
+
 export type AstNode =
   | Program
   | ImportDeclaration
   | FunctionDeclaration
   | StructDeclaration
   | StructField
+  | StructMethod
   | EnumDeclaration
   | EnumVariant
+  | ClassDeclaration
+  | ClassField
+  | ClassMethod
+  | ConstructorDeclaration
   | Parameter
   | VariableDeclaration
   | AssignmentStatement
@@ -53,6 +60,9 @@ export type AstNode =
   | ArrayLiteral
   | StructLiteral
   | StructFieldInit
+  | NewExpression
+  | ThisExpression
+  | SuperExpression
   | Identifier
   | StringLiteral
   | IntegerLiteral
@@ -70,7 +80,8 @@ export type TopLevelDeclaration =
   | ImportDeclaration
   | FunctionDeclaration
   | StructDeclaration
-  | EnumDeclaration;
+  | EnumDeclaration
+  | ClassDeclaration;
 
 export interface Program extends AstNodeBase {
   readonly kind: "Program";
@@ -118,11 +129,20 @@ export interface StructField extends AstNodeBase {
   readonly typeAnnotation: TypeAnnotation;
 }
 
+export interface StructMethod extends AstNodeBase {
+  readonly kind: "StructMethod";
+  readonly name: Identifier;
+  readonly params: Parameter[];
+  readonly returnType: TypeAnnotation;
+  readonly body: Statement[];
+}
+
 export interface StructDeclaration extends AstNodeBase {
   readonly kind: "StructDeclaration";
   readonly exported: boolean;
   readonly name: Identifier;
   readonly fields: StructField[];
+  readonly methods: StructMethod[];
 }
 
 export interface EnumVariant extends AstNodeBase {
@@ -135,6 +155,48 @@ export interface EnumDeclaration extends AstNodeBase {
   readonly exported: boolean;
   readonly name: Identifier;
   readonly variants: EnumVariant[];
+}
+
+export interface ClassField extends AstNodeBase {
+  readonly kind: "ClassField";
+  readonly visibility: Visibility;
+  readonly isStatic: boolean;
+  readonly isReadonly: boolean;
+  readonly name: Identifier;
+  readonly typeAnnotation: TypeAnnotation;
+  /** Allowed for static fields; null means zero/default init at codegen. */
+  readonly initializer: Expression | null;
+}
+
+export interface ClassMethod extends AstNodeBase {
+  readonly kind: "ClassMethod";
+  readonly visibility: Visibility;
+  readonly isStatic: boolean;
+  readonly isAbstract: boolean;
+  readonly name: Identifier;
+  readonly params: Parameter[];
+  readonly returnType: TypeAnnotation;
+  /** null when abstract. */
+  readonly body: Statement[] | null;
+}
+
+export interface ConstructorDeclaration extends AstNodeBase {
+  readonly kind: "ConstructorDeclaration";
+  readonly visibility: Visibility;
+  readonly params: Parameter[];
+  readonly body: Statement[];
+}
+
+export type ClassMember = ClassField | ClassMethod | ConstructorDeclaration;
+
+export interface ClassDeclaration extends AstNodeBase {
+  readonly kind: "ClassDeclaration";
+  readonly exported: boolean;
+  readonly isAbstract: boolean;
+  readonly name: Identifier;
+  /** Local or qualified superclass name; null if none. */
+  readonly superclass: NamedType | null;
+  readonly members: ClassMember[];
 }
 
 export interface VariableDeclaration extends AstNodeBase {
@@ -217,6 +279,9 @@ export type Expression =
   | MemberExpression
   | ArrayLiteral
   | StructLiteral
+  | NewExpression
+  | ThisExpression
+  | SuperExpression
   | Identifier
   | StringLiteral
   | IntegerLiteral
@@ -224,7 +289,7 @@ export type Expression =
   | BooleanLiteral
   | CharLiteral;
 
-export type CallCallee = Identifier | MemberExpression;
+export type CallCallee = Identifier | MemberExpression | SuperExpression;
 
 export interface CallExpression extends AstNodeBase {
   readonly kind: "CallExpression";
@@ -274,6 +339,22 @@ export interface StructLiteral extends AstNodeBase {
   readonly namespace: Identifier | null;
   readonly name: Identifier;
   readonly fields: StructFieldInit[];
+}
+
+export interface NewExpression extends AstNodeBase {
+  readonly kind: "NewExpression";
+  /** Import alias when written as `new math.Person(...)`; null for bare `new Person(...)`. */
+  readonly namespace: Identifier | null;
+  readonly className: Identifier;
+  readonly args: Expression[];
+}
+
+export interface ThisExpression extends AstNodeBase {
+  readonly kind: "ThisExpression";
+}
+
+export interface SuperExpression extends AstNodeBase {
+  readonly kind: "SuperExpression";
 }
 
 export interface Identifier extends AstNodeBase {

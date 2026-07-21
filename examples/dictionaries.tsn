@@ -1,0 +1,16 @@
+interface Dictionary {
+  [key: string]: string;
+}
+
+function main(): void {
+  let colors: Dictionary = createMap();
+  colors["sky"] = "blue";
+  colors["grass"] = "green";
+
+  print(colors["sky"]);
+  print(colors["grass"]);
+
+  let scores: { [key: string]: string } = createMap();
+  scores["alice"] = "10";
+  print(scores["alice"]);
+}

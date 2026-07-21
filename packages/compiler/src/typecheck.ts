@@ -11,6 +11,7 @@ import type {
   Statement,
   StructDeclaration,
   StructMethod,
+  TypeAliasDeclaration,
   TypeAnnotation,
   TypeParameter,
   Visibility,
@@ -32,6 +33,33 @@ import { buildSubst, specializeStructDecl, substituteAnnotation } from "./generi
 import type { TypecheckInstantiations } from "./generics/monomorphize.js";
 import { mangleSymbol } from "./modules/mangle.js";
 import type { ResolvedModule } from "./modules/resolve.js";
+import {
+  advancedIsAssignable,
+  advancedTypeToString,
+  advancedTypesEqual,
+  cloneScopeWithNarrowing,
+  expandMappedType,
+  extractTypeofNarrowing,
+  indexedAccess,
+  isIntersectionType,
+  isLiteralType,
+  isMapType,
+  isObjectType,
+  isUnionType,
+  keyofType,
+  literalBaseType,
+  makeIntersection,
+  makeUnion,
+  objectShapeName,
+  typeofTagForType,
+  type ExtendedValueType,
+  type IntersectionValueType,
+  type LiteralValueType,
+  type MapValueType,
+  type ObjectValueType,
+  type TypeAliasDef,
+  type UnionValueType,
+} from "./typecheck-advanced.js";
 
 export type PrimitiveValueType = Exclude<PrimitiveTypeName, "void">;
 
@@ -67,6 +95,11 @@ export interface TypeParamValueType {
   /** Constraint interface/class mangled name when `extends` is present. */
   readonly constraintName: string | null;
   readonly constraintKind: "interface" | "class" | null;
+  /** Intersection constraint arms for multi-constraint method lookup. */
+  readonly constraintArms: readonly {
+    readonly kind: "interface" | "class";
+    readonly name: string;
+  }[];
 }
 
 export type ValueType =
@@ -76,7 +109,20 @@ export type ValueType =
   | ClassValueType
   | InterfaceValueType
   | EnumValueType
-  | TypeParamValueType;
+  | TypeParamValueType
+  | UnionValueType
+  | IntersectionValueType
+  | ObjectValueType
+  | LiteralValueType
+  | MapValueType;
+
+export type {
+  IntersectionValueType,
+  LiteralValueType,
+  MapValueType,
+  ObjectValueType,
+  UnionValueType,
+};
 
 export type ReturnType = ValueType | "void";
 
@@ -149,6 +195,8 @@ export interface InterfaceDef {
   readonly methods: InterfaceMethodDef[];
   /** Mangled interface name → starting slot offset within this itable. */
   readonly baseItableOffsets: ReadonlyMap<string, number>;
+  /** Index signature value type when `[key: string]: T` is present. */
+  readonly indexType: ValueType | null;
   readonly decl: InterfaceDeclaration;
   readonly exported: boolean;
 }
@@ -202,6 +250,7 @@ export interface ModuleNamespace {
   readonly enums: ReadonlyMap<string, EnumDef>;
   readonly classes: ReadonlyMap<string, ClassDef>;
   readonly interfaces: ReadonlyMap<string, InterfaceDef>;
+  readonly typeAliases: ReadonlyMap<string, TypeAliasDef>;
 }
 
 interface ModuleSymbols {
@@ -212,10 +261,12 @@ interface ModuleSymbols {
   readonly enums: Map<string, EnumDef>;
   readonly classes: Map<string, ClassDef>;
   readonly interfaces: Map<string, InterfaceDef>;
+  readonly typeAliases: Map<string, TypeAliasDef>;
   readonly genericStructs: Map<string, GenericStructTemplate>;
   readonly genericClasses: Map<string, GenericClassTemplate>;
   readonly genericInterfaces: Map<string, GenericInterfaceTemplate>;
   readonly genericFunctions: Map<string, GenericFunctionTemplate>;
+  readonly genericTypeAliases: Map<string, TypeAliasDeclaration>;
 }
 
 interface MemberContext {
@@ -227,7 +278,7 @@ interface MemberContext {
 }
 
 const NUMERIC_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f64"]);
-const EQUALITY_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f64", "bool", "char"]);
+const EQUALITY_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f64", "bool", "char", "string"]);
 
 /** Active import namespaces while type-checking a module. */
 let activeNamespaces: Map<string, ModuleNamespace> = new Map();
@@ -235,6 +286,16 @@ let activeNamespaces: Map<string, ModuleNamespace> = new Map();
 let activeClasses: Map<string, ClassDef> = new Map();
 /** Active interface defs for the module under check (local name → def). */
 let activeInterfaces: Map<string, InterfaceDef> = new Map();
+/** Active type aliases for the module under check. */
+let activeTypeAliases: Map<string, TypeAliasDef> = new Map();
+/** Generic type alias templates. */
+let activeGenericTypeAliases: Map<string, TypeAliasDeclaration> = new Map();
+/** Synthetic object structs registered during resolution. */
+let syntheticObjectStructs: Map<string, StructDef> = new Map();
+/** Alias expansion stack for cycle detection. */
+let aliasExpandStack: string[] = [];
+/** Active function sigs for typeof type queries. */
+let activeFunctions: Map<string, FunctionSig> = new Map();
 /** All class defs by mangled name (for inheritance lookups). */
 let classesByMangled: Map<string, ClassDef> = new Map();
 /** All interface defs by mangled name. */
@@ -335,10 +396,12 @@ export function typecheckModules(
       ...local.enums.keys(),
       ...local.classes.keys(),
       ...local.interfaces.keys(),
+      ...local.typeAliases.keys(),
       ...local.genericStructs.keys(),
       ...local.genericClasses.keys(),
       ...local.genericInterfaces.keys(),
       ...local.genericFunctions.keys(),
+      ...local.genericTypeAliases.keys(),
     ]);
 
     for (const binding of mod.imports) {
@@ -361,6 +424,7 @@ export function typecheckModules(
         enums: exportedEnums(imported.enums),
         classes: exportedClasses(imported.classes),
         interfaces: exportedInterfaces(imported.interfaces),
+        typeAliases: exportedTypeAliases(imported.typeAliases),
       });
     }
 
@@ -371,6 +435,8 @@ export function typecheckModules(
     activeNamespaces = namespaces;
     activeClasses = local.classes;
     activeInterfaces = local.interfaces;
+    activeTypeAliases = local.typeAliases;
+    activeGenericTypeAliases = local.genericTypeAliases;
     activeGenericStructs = local.genericStructs;
     activeGenericClasses = local.genericClasses;
     activeGenericInterfaces = local.genericInterfaces;
@@ -381,6 +447,9 @@ export function typecheckModules(
     specializedClasses = new Map();
     specializedInterfaces = new Map();
     specializedFunctions = new Map();
+    syntheticObjectStructs = new Map();
+    aliasExpandStack = [];
+    activeFunctions = local.functions;
 
     for (const decl of mod.ast.body) {
       if (decl.kind === "FunctionDeclaration") {
@@ -414,6 +483,10 @@ export function typecheckModules(
   activeNamespaces = new Map();
   activeClasses = new Map();
   activeInterfaces = new Map();
+  activeTypeAliases = new Map();
+  activeGenericTypeAliases = new Map();
+  syntheticObjectStructs = new Map();
+  aliasExpandStack = [];
   classesByMangled = new Map();
   interfacesByMangled = new Map();
   memberContext = null;
@@ -477,6 +550,16 @@ function exportedInterfaces(interfaces: Map<string, InterfaceDef>): Map<string, 
   return out;
 }
 
+function exportedTypeAliases(aliases: Map<string, TypeAliasDef>): Map<string, TypeAliasDef> {
+  const out = new Map<string, TypeAliasDef>();
+  for (const [name, def] of aliases) {
+    if (def.exported) {
+      out.set(name, def);
+    }
+  }
+  return out;
+}
+
 function collectModuleSymbols(
   mod: ResolvedModule,
   diagnostics: DiagnosticCollector,
@@ -486,6 +569,7 @@ function collectModuleSymbols(
   const genericClasses = new Map<string, GenericClassTemplate>();
   const genericInterfaces = new Map<string, GenericInterfaceTemplate>();
   const genericFunctions = new Map<string, GenericFunctionTemplate>();
+  const genericTypeAliases = new Map<string, TypeAliasDeclaration>();
 
   for (const decl of mod.ast.body) {
     if (decl.kind === "StructDeclaration" && decl.typeParams.length > 0) {
@@ -520,10 +604,15 @@ function collectModuleSymbols(
           modulePath: mod.path,
         });
       }
+    } else if (decl.kind === "TypeAliasDeclaration" && decl.typeParams.length > 0) {
+      if (validateTypeParamList(decl.typeParams, diagnostics)) {
+        genericTypeAliases.set(decl.name.name, decl);
+      }
     }
   }
 
   const structs = collectStructs(mod.ast, mod.moduleId, enums, diagnostics, genericStructs);
+  const typeAliases = collectTypeAliases(mod.ast, mod.moduleId, diagnostics, genericTypeAliases);
   const interfaces = collectInterfaces(
     mod.ast,
     mod.moduleId,
@@ -545,8 +634,10 @@ function collectModuleSymbols(
 
   const prevClasses = activeClasses;
   const prevInterfaces = activeInterfaces;
+  const prevAliases = activeTypeAliases;
   activeClasses = classes;
   activeInterfaces = interfaces;
+  activeTypeAliases = typeAliases;
 
   for (const decl of mod.ast.body) {
     if (decl.kind !== "FunctionDeclaration" || decl.typeParams.length > 0) {
@@ -554,9 +645,9 @@ function collectModuleSymbols(
     }
     const fn = decl;
 
-    if (fn.name.name === "print") {
+    if (fn.name.name === "print" || fn.name.name === "createMap") {
       diagnostics.error(
-        "Cannot redefine builtin function 'print'",
+        `Cannot redefine builtin function '${fn.name.name}'`,
         fn.name.span,
         "E0310",
       );
@@ -640,6 +731,7 @@ function collectModuleSymbols(
 
   activeClasses = prevClasses;
   activeInterfaces = prevInterfaces;
+  activeTypeAliases = prevAliases;
 
   return {
     moduleId: mod.moduleId,
@@ -649,11 +741,41 @@ function collectModuleSymbols(
     enums,
     classes,
     interfaces,
+    typeAliases,
     genericStructs,
     genericClasses,
     genericInterfaces,
     genericFunctions,
+    genericTypeAliases,
   };
+}
+
+function collectTypeAliases(
+  program: Program,
+  moduleId: string,
+  diagnostics: DiagnosticCollector,
+  genericTypeAliases: Map<string, TypeAliasDeclaration>,
+): Map<string, TypeAliasDef> {
+  const aliases = new Map<string, TypeAliasDef>();
+  for (const decl of program.body) {
+    if (decl.kind !== "TypeAliasDeclaration") {
+      continue;
+    }
+    if (decl.typeParams.length > 0) {
+      continue;
+    }
+    if (aliases.has(decl.name.name) || genericTypeAliases.has(decl.name.name)) {
+      diagnostics.error(`Duplicate type alias '${decl.name.name}'`, decl.name.span, "E0328");
+      continue;
+    }
+    aliases.set(decl.name.name, {
+      name: mangleSymbol(moduleId, decl.name.name),
+      localName: decl.name.name,
+      decl,
+      exported: decl.exported,
+    });
+  }
+  return aliases;
 }
 
 function collectEnums(
@@ -968,6 +1090,7 @@ function collectInterfaces(
       bases: [],
       methods: [],
       baseItableOffsets: new Map([[mangled, 0]]),
+      indexType: null,
       decl,
       exported: decl.exported,
     });
@@ -1114,12 +1237,22 @@ function collectInterfaces(
       return null;
     }
 
+    let indexType: ValueType | null = null;
+    if (decl.indexSignature) {
+      indexType = resolveAnnotation(decl.indexSignature.valueType, structs, enums, diagnostics);
+      if (indexType === null) {
+        interfaces.delete(localName);
+        return null;
+      }
+    }
+
     const def: InterfaceDef = {
       name: mangled,
       localName,
       bases,
       methods,
       baseItableOffsets,
+      indexType,
       decl,
       exported: decl.exported,
     };
@@ -1640,53 +1773,28 @@ export function typeToString(type: ValueType | "void"): string {
   if (type === "void") {
     return "void";
   }
-  if (typeof type === "string") {
-    return type;
-  }
-  if (type.kind === "array") {
-    return `${typeToString(type.element)}[]`;
-  }
-  if (type.kind === "typeParam") {
-    return type.constraintName
-      ? `${type.name} extends ${type.constraintName}`
-      : type.name;
-  }
-  return type.name;
+  return advancedTypeToString(type);
 }
 
 export function typesEqual(a: ValueType, b: ValueType): boolean {
-  if (typeof a === "string" && typeof b === "string") {
-    return a === b;
-  }
-  if (typeof a === "object" && typeof b === "object") {
-    if (a.kind === "array" && b.kind === "array") {
-      return typesEqual(a.element, b.element);
-    }
-    if (a.kind === "typeParam" && b.kind === "typeParam") {
-      return a.name === b.name;
-    }
-    if (a.kind === "struct" && b.kind === "struct") {
-      return a.name === b.name;
-    }
-    if (a.kind === "class" && b.kind === "class") {
-      return a.name === b.name;
-    }
-    if (a.kind === "interface" && b.kind === "interface") {
-      return a.name === b.name;
-    }
-    if (a.kind === "enum" && b.kind === "enum") {
-      return a.name === b.name;
-    }
-  }
-  return false;
+  return advancedTypesEqual(a, b);
 }
 
 /** True if `from` can be assigned to a binding of type `to` (includes class/interface upcasts). */
 export function isAssignable(from: ValueType, to: ValueType): boolean {
-  if (typesEqual(from, to)) {
+  return advancedIsAssignable(from, to, baseIsAssignable);
+}
+
+function baseIsAssignable(from: ExtendedValueType, to: ExtendedValueType): boolean {
+  if (advancedTypesEqual(from, to)) {
     return true;
   }
-  if (isClassType(from) && isClassType(to)) {
+  if (
+    typeof from === "object" &&
+    typeof to === "object" &&
+    from.kind === "class" &&
+    to.kind === "class"
+  ) {
     let current: ClassDef | undefined = classesByMangled.get(from.name) ?? findClassByMangled(from.name);
     while (current) {
       if (current.name === to.name) {
@@ -1695,16 +1803,33 @@ export function isAssignable(from: ValueType, to: ValueType): boolean {
       current = current.superclass ?? undefined;
     }
   }
-  if (isClassType(from) && isInterfaceType(to)) {
+  if (
+    typeof from === "object" &&
+    typeof to === "object" &&
+    from.kind === "class" &&
+    to.kind === "interface"
+  ) {
     const cls = classesByMangled.get(from.name) ?? findClassByMangled(from.name);
     const iface = interfacesByMangled.get(to.name) ?? findInterfaceByMangled(to.name);
     if (cls && iface && classSatisfiesInterface(cls, iface)) {
       return true;
     }
   }
-  if (isInterfaceType(from) && isInterfaceType(to)) {
+  if (
+    typeof from === "object" &&
+    typeof to === "object" &&
+    from.kind === "interface" &&
+    to.kind === "interface"
+  ) {
     const fromIface = interfacesByMangled.get(from.name) ?? findInterfaceByMangled(from.name);
     if (fromIface && fromIface.baseItableOffsets.has(to.name)) {
+      return true;
+    }
+  }
+  // Map / interface with index signature
+  if (isMapType(from) && typeof to === "object" && to.kind === "interface") {
+    const iface = interfacesByMangled.get(to.name) ?? findInterfaceByMangled(to.name);
+    if (iface?.indexType && advancedIsAssignable(from.valueType, iface.indexType, baseIsAssignable)) {
       return true;
     }
   }
@@ -1761,22 +1886,74 @@ export function annotationToValueType(
   ann: TypeAnnotation,
   namedKinds?: ReadonlyMap<string, "struct" | "enum" | "class" | "interface">,
 ): ValueType | null {
-  if (ann.kind === "PrimitiveType") {
-    if (ann.name === "void") {
-      return null;
+  switch (ann.kind) {
+    case "PrimitiveType":
+      if (ann.name === "void") {
+        return null;
+      }
+      return ann.name;
+    case "NamedType": {
+      const key = ann.namespace ? `${ann.namespace}.${ann.name}` : ann.name;
+      const kind = namedKinds?.get(key) ?? "struct";
+      return { kind, name: key };
     }
-    return ann.name;
+    case "ArrayType": {
+      const element = annotationToValueType(ann.element, namedKinds);
+      if (element === null) {
+        return null;
+      }
+      return { kind: "array", element };
+    }
+    case "UnionType": {
+      const arms: ValueType[] = [];
+      for (const t of ann.types) {
+        const vt = annotationToValueType(t, namedKinds);
+        if (vt === null) {
+          return null;
+        }
+        arms.push(vt);
+      }
+      return makeUnion(arms) as ValueType;
+    }
+    case "IntersectionType": {
+      const arms: ValueType[] = [];
+      for (const t of ann.types) {
+        const vt = annotationToValueType(t, namedKinds);
+        if (vt === null) {
+          return null;
+        }
+        arms.push(vt);
+      }
+      return makeIntersection(arms) as ValueType;
+    }
+    case "LiteralType":
+      return { kind: "literal", value: ann.value, literalKind: ann.literalKind };
+    case "ObjectType": {
+      const fields = [];
+      for (const f of ann.fields) {
+        const ft = annotationToValueType(f.typeAnnotation, namedKinds);
+        if (ft === null) {
+          return null;
+        }
+        fields.push({ name: f.name.name, type: ft, readonly: f.readonly });
+      }
+      let indexType: ValueType | null = null;
+      if (ann.indexSignature) {
+        indexType = annotationToValueType(ann.indexSignature.valueType, namedKinds);
+        if (indexType === null) {
+          return null;
+        }
+      }
+      return {
+        kind: "object",
+        name: objectShapeName(fields, indexType),
+        fields,
+        indexType,
+      };
+    }
+    default:
+      return null;
   }
-  if (ann.kind === "NamedType") {
-    const key = ann.namespace ? `${ann.namespace}.${ann.name}` : ann.name;
-    const kind = namedKinds?.get(key) ?? "struct";
-    return { kind, name: key };
-  }
-  const element = annotationToValueType(ann.element, namedKinds);
-  if (element === null) {
-    return null;
-  }
-  return { kind: "array", element };
 }
 
 function resolveAnnotation(
@@ -1785,90 +1962,403 @@ function resolveAnnotation(
   enums: Map<string, EnumDef>,
   diagnostics: DiagnosticCollector,
 ): ValueType | null {
-  if (ann.kind === "PrimitiveType") {
-    if (ann.name === "void") {
-      diagnostics.error(
-        "'void' cannot be used as a value type",
-        ann.span,
-        "E0302",
-      );
-      return null;
-    }
-    return ann.name;
-  }
-  if (ann.kind === "NamedType") {
-    // Type parameter in scope (template body).
-    if (ann.namespace === null && ann.typeArgs.length === 0 && activeTypeParams.has(ann.name)) {
-      return activeTypeParams.get(ann.name)!;
-    }
-
-    // Generic instantiation: Foo<T, U>
-    if (ann.typeArgs.length > 0) {
-      return resolveGenericNamedType(ann, structs, enums, diagnostics);
-    }
-
-    if (ann.namespace) {
-      const ns = activeNamespaces.get(ann.namespace);
-      if (!ns) {
-        diagnostics.error(`Unknown namespace '${ann.namespace}'`, ann.span, "E0406");
+  switch (ann.kind) {
+    case "PrimitiveType": {
+      if (ann.name === "void") {
+        diagnostics.error("'void' cannot be used as a value type", ann.span, "E0302");
         return null;
       }
-      if (ns.enums.has(ann.name)) {
-        return { kind: "enum", name: ns.enums.get(ann.name)!.name };
+      return ann.name;
+    }
+    case "ArrayType": {
+      const element = resolveAnnotation(ann.element, structs, enums, diagnostics);
+      if (element === null) {
+        return null;
       }
-      if (ns.structs.has(ann.name)) {
-        return { kind: "struct", name: ns.structs.get(ann.name)!.name };
+      return { kind: "array", element };
+    }
+    case "UnionType": {
+      const arms: ValueType[] = [];
+      for (const t of ann.types) {
+        const vt = resolveAnnotation(t, structs, enums, diagnostics);
+        if (vt === null) {
+          return null;
+        }
+        arms.push(vt);
       }
-      if (ns.classes.has(ann.name)) {
-        return { kind: "class", name: ns.classes.get(ann.name)!.name };
+      return makeUnion(arms) as ValueType;
+    }
+    case "IntersectionType": {
+      const arms: ValueType[] = [];
+      for (const t of ann.types) {
+        const vt = resolveAnnotation(t, structs, enums, diagnostics);
+        if (vt === null) {
+          return null;
+        }
+        arms.push(vt);
       }
-      if (ns.interfaces.has(ann.name)) {
-        return { kind: "interface", name: ns.interfaces.get(ann.name)!.name };
+      return makeIntersection(arms) as ValueType;
+    }
+    case "LiteralType":
+      return { kind: "literal", value: ann.value, literalKind: ann.literalKind };
+    case "ObjectType":
+      return resolveObjectType(ann, structs, enums, diagnostics);
+    case "KeyofType": {
+      const inner = resolveAnnotation(ann.type, structs, enums, diagnostics);
+      if (inner === null) {
+        return null;
       }
+      // Expand struct/class to object-like for keyof
+      const expanded = expandForKeyof(inner, structs);
+      const keys = keyofType(expanded ?? inner);
+      if (keys === null) {
+        diagnostics.error(
+          `keyof cannot be applied to type '${typeToString(inner)}'`,
+          ann.span,
+          "E0391",
+        );
+        return null;
+      }
+      return keys as ValueType;
+    }
+    case "TypeofType": {
+      return resolveTypeofType(ann.expression, structs, enums, diagnostics);
+    }
+    case "ConditionalType": {
+      const check = resolveAnnotation(ann.checkType, structs, enums, diagnostics);
+      const ext = resolveAnnotation(ann.extendsType, structs, enums, diagnostics);
+      if (check === null || ext === null) {
+        return null;
+      }
+      if (isAssignable(check, ext)) {
+        return resolveAnnotation(ann.trueType, structs, enums, diagnostics);
+      }
+      return resolveAnnotation(ann.falseType, structs, enums, diagnostics);
+    }
+    case "MappedType": {
+      const constraint = resolveAnnotation(ann.constraint, structs, enums, diagnostics);
+      if (constraint === null) {
+        return null;
+      }
+      const keysType = isUnionType(constraint) || isLiteralType(constraint)
+        ? constraint
+        : keyofType(expandForKeyof(constraint, structs) ?? constraint);
+      if (keysType === null) {
+        diagnostics.error("Mapped type constraint must yield string keys", ann.span, "E0392");
+        return null;
+      }
+      const keyLits: string[] = [];
+      const collect = (t: ValueType): boolean => {
+        if (isLiteralType(t) && t.literalKind === "string") {
+          keyLits.push(String(t.value));
+          return true;
+        }
+        if (isUnionType(t)) {
+          return t.arms.every((a) => collect(a as ValueType));
+        }
+        return false;
+      };
+      if (!collect(keysType as ValueType)) {
+        diagnostics.error("Mapped type constraint must be string literal keys", ann.span, "E0392");
+        return null;
+      }
+      const mapped = expandMappedType(
+        keyLits,
+        (key) => {
+          const prev = activeTypeParams;
+          activeTypeParams = new Map(prev);
+          activeTypeParams.set(ann.typeParam.name, {
+            kind: "typeParam",
+            name: ann.typeParam.name,
+            constraintName: null,
+            constraintKind: null,
+            constraintArms: [],
+          });
+          // Substitute K with literal in value type via temporary: resolve with NamedType K
+          // by binding K as a literal through a hack — resolve value with subst
+          const subst = new Map([[ann.typeParam.name, {
+            kind: "LiteralType" as const,
+            value: key,
+            literalKind: "string" as const,
+            span: ann.span,
+          }]]);
+          const valueAnn = substituteAnnotation(ann.type, subst);
+          const result = resolveAnnotation(valueAnn, structs, enums, diagnostics);
+          activeTypeParams = prev;
+          return result;
+        },
+        ann.readonly,
+      );
+      return mapped as ValueType | null;
+    }
+    case "IndexedAccessType": {
+      const obj = resolveAnnotation(ann.objectType, structs, enums, diagnostics);
+      const idx = resolveAnnotation(ann.indexType, structs, enums, diagnostics);
+      if (obj === null || idx === null) {
+        return null;
+      }
+      const result = indexedAccess(expandForKeyof(obj, structs) ?? obj, idx);
+      if (result === null) {
+        diagnostics.error(
+          `Index signature type cannot be resolved for '${typeToString(obj)}[${typeToString(idx)}]'`,
+          ann.span,
+          "E0393",
+        );
+        return null;
+      }
+      return result as ValueType;
+    }
+    case "NamedType":
+      return resolveNamedType(ann, structs, enums, diagnostics);
+  }
+}
+
+function expandForKeyof(
+  type: ValueType,
+  structs: Map<string, StructDef>,
+): ValueType | null {
+  if (isObjectType(type)) {
+    return type;
+  }
+  if (isStructType(type)) {
+    const def =
+      [...structs.values()].find((s) => s.name === type.name) ??
+      [...specializedStructs.values()].find((s) => s.name === type.name) ??
+      [...syntheticObjectStructs.values()].find((s) => s.name === type.name);
+    if (!def) {
+      return null;
+    }
+    return {
+      kind: "object",
+      name: type.name,
+      fields: def.fields.map((f) => ({ name: f.name, type: f.type, readonly: false })),
+      indexType: null,
+    };
+  }
+  return null;
+}
+
+function resolveObjectType(
+  ann: Extract<TypeAnnotation, { kind: "ObjectType" }>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+): ValueType | null {
+  const fields: { name: string; type: ValueType; readonly: boolean }[] = [];
+  for (const f of ann.fields) {
+    const ft = resolveAnnotation(f.typeAnnotation, structs, enums, diagnostics);
+    if (ft === null) {
+      return null;
+    }
+    fields.push({ name: f.name.name, type: ft, readonly: f.readonly });
+  }
+  let indexType: ValueType | null = null;
+  if (ann.indexSignature) {
+    indexType = resolveAnnotation(ann.indexSignature.valueType, structs, enums, diagnostics);
+    if (indexType === null) {
+      return null;
+    }
+  }
+  // Pure index signature object → map type
+  if (fields.length === 0 && indexType) {
+    return { kind: "map", valueType: indexType };
+  }
+  const name = objectShapeName(fields, indexType);
+  const mangled = mangleSymbol(activeModuleId, name);
+  if (!syntheticObjectStructs.has(name) && !structs.has(name)) {
+    const def: StructDef = {
+      name: mangled,
+      fields: fields.map((f) => ({ name: f.name, type: f.type })),
+      methods: [],
+      decl: {
+        kind: "StructDeclaration",
+        exported: false,
+        name: { kind: "Identifier", name, span: ann.span },
+        typeParams: [],
+        fields: fields.map((f) => ({
+          kind: "StructField" as const,
+          name: { kind: "Identifier" as const, name: f.name, span: ann.span },
+          typeAnnotation: valueTypeToLocalAnnotation(f.type),
+          span: ann.span,
+        })),
+        methods: [],
+        span: ann.span,
+      },
+      exported: false,
+    };
+    syntheticObjectStructs.set(name, def);
+    structs.set(name, def);
+  }
+  return {
+    kind: "object",
+    name: mangled,
+    fields,
+    indexType,
+  };
+}
+
+function resolveTypeofType(
+  expression: Expression,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+): ValueType | null {
+  if (expression.kind === "CallExpression" && expression.callee.kind === "Identifier") {
+    const sig = activeFunctions.get(expression.callee.name);
+    if (!sig) {
       diagnostics.error(
-        `Unknown type '${ann.namespace}.${ann.name}'`,
-        ann.span,
-        "E0104",
+        `Unknown function '${expression.callee.name}' in typeof type query`,
+        expression.span,
+        "E0394",
       );
       return null;
     }
-    if (enums.has(ann.name)) {
-      return { kind: "enum", name: enums.get(ann.name)!.name };
-    }
-    if (structs.has(ann.name)) {
-      return { kind: "struct", name: structs.get(ann.name)!.name };
-    }
-    if (specializedStructs.has(ann.name)) {
-      return { kind: "struct", name: specializedStructs.get(ann.name)!.name };
-    }
-    if (activeClasses.has(ann.name)) {
-      return { kind: "class", name: activeClasses.get(ann.name)!.name };
-    }
-    if (specializedClasses.has(ann.name)) {
-      return { kind: "class", name: specializedClasses.get(ann.name)!.name };
-    }
-    if (activeInterfaces.has(ann.name)) {
-      return { kind: "interface", name: activeInterfaces.get(ann.name)!.name };
-    }
-    if (specializedInterfaces.has(ann.name)) {
-      return { kind: "interface", name: specializedInterfaces.get(ann.name)!.name };
-    }
-    if (activeGenericStructs.has(ann.name) || activeGenericClasses.has(ann.name) || activeGenericInterfaces.has(ann.name)) {
-      diagnostics.error(
-        `Generic type '${ann.name}' requires type arguments`,
-        ann.span,
-        "E0382",
-      );
+    if (sig.returnType === "void") {
+      diagnostics.error("'typeof' of a void function is not a value type", expression.span, "E0394");
       return null;
     }
-    diagnostics.error(`Unknown type '${ann.name}'`, ann.span, "E0104");
+    return sig.returnType;
+  }
+  if (expression.kind === "Identifier") {
+    const sig = activeFunctions.get(expression.name);
+    if (sig && sig.returnType !== "void" && sig.params.length === 0) {
+      // Bare identifier referring to a zero-arg function type is unusual; treat as error
+    }
+    diagnostics.error(
+      `'typeof ${expression.name}' in a type position only supports call expressions (e.g. typeof foo())`,
+      expression.span,
+      "E0394",
+    );
     return null;
   }
-  const element = resolveAnnotation(ann.element, structs, enums, diagnostics);
-  if (element === null) {
+  diagnostics.error(
+    "'typeof' type query supports call expressions only",
+    expression.span,
+    "E0394",
+  );
+  return null;
+}
+
+function resolveNamedType(
+  ann: Extract<TypeAnnotation, { kind: "NamedType" }>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+): ValueType | null {
+  // Type parameter in scope (template body).
+  if (ann.namespace === null && ann.typeArgs.length === 0 && activeTypeParams.has(ann.name)) {
+    return activeTypeParams.get(ann.name)!;
+  }
+
+  // Type alias (non-generic)
+  if (ann.namespace === null && ann.typeArgs.length === 0 && activeTypeAliases.has(ann.name)) {
+    return expandTypeAlias(activeTypeAliases.get(ann.name)!, [], structs, enums, diagnostics, ann.span);
+  }
+
+  // Generic instantiation: Foo<T, U>
+  if (ann.typeArgs.length > 0) {
+    return resolveGenericNamedType(ann, structs, enums, diagnostics);
+  }
+
+  if (ann.namespace) {
+    const ns = activeNamespaces.get(ann.namespace);
+    if (!ns) {
+      diagnostics.error(`Unknown namespace '${ann.namespace}'`, ann.span, "E0406");
+      return null;
+    }
+    if (ns.typeAliases.has(ann.name)) {
+      return expandTypeAlias(ns.typeAliases.get(ann.name)!, [], structs, enums, diagnostics, ann.span);
+    }
+    if (ns.enums.has(ann.name)) {
+      return { kind: "enum", name: ns.enums.get(ann.name)!.name };
+    }
+    if (ns.structs.has(ann.name)) {
+      return { kind: "struct", name: ns.structs.get(ann.name)!.name };
+    }
+    if (ns.classes.has(ann.name)) {
+      return { kind: "class", name: ns.classes.get(ann.name)!.name };
+    }
+    if (ns.interfaces.has(ann.name)) {
+      const iface = ns.interfaces.get(ann.name)!;
+      if (iface.indexType && iface.methods.length === 0) {
+        return { kind: "map", valueType: iface.indexType };
+      }
+      return { kind: "interface", name: iface.name };
+    }
+    diagnostics.error(`Unknown type '${ann.namespace}.${ann.name}'`, ann.span, "E0104");
     return null;
   }
-  return { kind: "array", element };
+  if (enums.has(ann.name)) {
+    return { kind: "enum", name: enums.get(ann.name)!.name };
+  }
+  if (structs.has(ann.name)) {
+    return { kind: "struct", name: structs.get(ann.name)!.name };
+  }
+  if (specializedStructs.has(ann.name)) {
+    return { kind: "struct", name: specializedStructs.get(ann.name)!.name };
+  }
+  if (syntheticObjectStructs.has(ann.name)) {
+    return { kind: "object", name: syntheticObjectStructs.get(ann.name)!.name, fields: syntheticObjectStructs.get(ann.name)!.fields.map((f) => ({ name: f.name, type: f.type, readonly: false })), indexType: null };
+  }
+  if (activeClasses.has(ann.name)) {
+    return { kind: "class", name: activeClasses.get(ann.name)!.name };
+  }
+  if (specializedClasses.has(ann.name)) {
+    return { kind: "class", name: specializedClasses.get(ann.name)!.name };
+  }
+  if (activeInterfaces.has(ann.name)) {
+    const iface = activeInterfaces.get(ann.name)!;
+    if (iface.indexType && iface.methods.length === 0) {
+      return { kind: "map", valueType: iface.indexType };
+    }
+    return { kind: "interface", name: iface.name };
+  }
+  if (specializedInterfaces.has(ann.name)) {
+    return { kind: "interface", name: specializedInterfaces.get(ann.name)!.name };
+  }
+  if (
+    activeGenericStructs.has(ann.name) ||
+    activeGenericClasses.has(ann.name) ||
+    activeGenericInterfaces.has(ann.name) ||
+    activeGenericTypeAliases.has(ann.name)
+  ) {
+    diagnostics.error(`Generic type '${ann.name}' requires type arguments`, ann.span, "E0382");
+    return null;
+  }
+  diagnostics.error(`Unknown type '${ann.name}'`, ann.span, "E0104");
+  return null;
+}
+
+function expandTypeAlias(
+  alias: TypeAliasDef,
+  typeArgs: TypeAnnotation[],
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+  span: SourceSpan,
+): ValueType | null {
+  const key = `${alias.localName}<${typeArgs.length}>`;
+  if (aliasExpandStack.includes(alias.localName)) {
+    diagnostics.error(`Circular type alias '${alias.localName}'`, span, "E0395");
+    return null;
+  }
+  aliasExpandStack.push(alias.localName);
+  const decl = alias.decl;
+  if (decl.typeParams.length !== typeArgs.length) {
+    diagnostics.error(
+      `Type alias '${alias.localName}' expects ${decl.typeParams.length} type argument(s), got ${typeArgs.length}`,
+      span,
+      "E0381",
+    );
+    aliasExpandStack.pop();
+    return null;
+  }
+  const subst = buildSubst(decl.typeParams, typeArgs);
+  const expanded = substituteAnnotation(decl.type, subst);
+  const result = resolveAnnotation(expanded, structs, enums, diagnostics);
+  aliasExpandStack.pop();
+  void key;
+  return result;
 }
 
 function resolveGenericNamedType(
@@ -1883,12 +2373,23 @@ function resolveGenericNamedType(
     if (vt === null) {
       return null;
     }
-    // Re-encode for mangling (prefer original annotation when not a type param).
     resolvedArgs.push(
       arg.kind === "NamedType" && activeTypeParams.has(arg.name)
         ? valueTypeToLocalAnnotation(vt)
         : arg,
     );
+  }
+
+  // Generic type alias
+  if (activeGenericTypeAliases.has(ann.name)) {
+    const decl = activeGenericTypeAliases.get(ann.name)!;
+    const aliasDef: TypeAliasDef = {
+      name: mangleSymbol(activeModuleId, ann.name),
+      localName: ann.name,
+      decl,
+      exported: decl.exported,
+    };
+    return expandTypeAlias(aliasDef, resolvedArgs, structs, enums, diagnostics, ann.span);
   }
 
   const structTpl = activeGenericStructs.get(ann.name);
@@ -1934,6 +2435,7 @@ function bindTypeParams(
   for (const tp of typeParams) {
     let constraintName: string | null = null;
     let constraintKind: "interface" | "class" | null = null;
+    const constraintArms: { kind: "interface" | "class"; name: string }[] = [];
     if (tp.constraint) {
       const c = resolveAnnotation(tp.constraint, structs, enums, diagnostics);
       if (c === null) {
@@ -1942,12 +2444,35 @@ function bindTypeParams(
       if (isInterfaceType(c)) {
         constraintName = c.name;
         constraintKind = "interface";
+        constraintArms.push({ kind: "interface", name: c.name });
       } else if (isClassType(c)) {
         constraintName = c.name;
         constraintKind = "class";
+        constraintArms.push({ kind: "class", name: c.name });
+      } else if (isIntersectionType(c)) {
+        for (const arm of c.arms) {
+          if (typeof arm === "object" && arm.kind === "interface") {
+            constraintArms.push({ kind: "interface", name: arm.name });
+          } else if (typeof arm === "object" && arm.kind === "class") {
+            constraintArms.push({ kind: "class", name: arm.name });
+          } else if (!(typeof arm === "object" && arm.kind === "object")) {
+            diagnostics.error(
+              `Type parameter constraint intersection arms must be classes, interfaces, or object types`,
+              tp.constraint.span,
+              "E0383",
+            );
+            return null;
+          }
+        }
+        if (constraintArms.length === 1) {
+          constraintName = constraintArms[0]!.name;
+          constraintKind = constraintArms[0]!.kind;
+        }
+      } else if (isObjectType(c)) {
+        // Structural constraint OK
       } else {
         diagnostics.error(
-          `Type parameter constraint must be a class or interface`,
+          `Type parameter constraint must be a class, interface, intersection, or object type`,
           tp.constraint.span,
           "E0383",
         );
@@ -1959,6 +2484,7 @@ function bindTypeParams(
       name: tp.name.name,
       constraintName,
       constraintKind,
+      constraintArms,
     });
   }
   return map;
@@ -2112,27 +2638,7 @@ function instantiateGenericClass(
   for (let i = 0; i < tpl.decl.typeParams.length; i += 1) {
     subst.set(tpl.decl.typeParams[i]!.name.name, typeArgs[i]!);
   }
-  const sub = (ann: TypeAnnotation): TypeAnnotation => {
-    if (ann.kind === "PrimitiveType") {
-      return ann;
-    }
-    if (ann.kind === "ArrayType") {
-      return { kind: "ArrayType", element: sub(ann.element), span: ann.span };
-    }
-    if (ann.namespace === null && ann.typeArgs.length === 0 && subst.has(ann.name)) {
-      return subst.get(ann.name)!;
-    }
-    if (ann.typeArgs.length === 0) {
-      return ann;
-    }
-    return {
-      kind: "NamedType",
-      namespace: ann.namespace,
-      name: ann.name,
-      typeArgs: ann.typeArgs.map(sub),
-      span: ann.span,
-    };
-  };
+  const sub = (ann: TypeAnnotation): TypeAnnotation => substituteAnnotation(ann, subst);
 
   const instanceFields: ClassFieldDef[] = [];
   const staticFields: ClassFieldDef[] = [];
@@ -2262,27 +2768,7 @@ function instantiateGenericInterface(
   for (let i = 0; i < tpl.decl.typeParams.length; i += 1) {
     subst.set(tpl.decl.typeParams[i]!.name.name, typeArgs[i]!);
   }
-  const sub = (ann: TypeAnnotation): TypeAnnotation => {
-    if (ann.kind === "PrimitiveType") {
-      return ann;
-    }
-    if (ann.kind === "ArrayType") {
-      return { kind: "ArrayType", element: sub(ann.element), span: ann.span };
-    }
-    if (ann.namespace === null && ann.typeArgs.length === 0 && subst.has(ann.name)) {
-      return subst.get(ann.name)!;
-    }
-    if (ann.typeArgs.length === 0) {
-      return ann;
-    }
-    return {
-      kind: "NamedType",
-      namespace: ann.namespace,
-      name: ann.name,
-      typeArgs: ann.typeArgs.map(sub),
-      span: ann.span,
-    };
-  };
+  const sub = (ann: TypeAnnotation): TypeAnnotation => substituteAnnotation(ann, subst);
 
   const methods: InterfaceMethodDef[] = [];
   for (const method of tpl.decl.methods) {
@@ -2307,12 +2793,19 @@ function instantiateGenericInterface(
   }
 
   const mangled = mangleSymbol(tpl.moduleId, instanceLocal);
+  let indexType: ValueType | null = null;
+  if (tpl.decl.indexSignature) {
+    const substMap = buildSubst(tpl.decl.typeParams, typeArgs);
+    const valueAnn = substituteAnnotation(tpl.decl.indexSignature.valueType, substMap);
+    indexType = resolveAnnotation(valueAnn, structs, enums, diagnostics);
+  }
   const def: InterfaceDef = {
     name: mangled,
     localName: instanceLocal,
     bases: [],
     methods,
     baseItableOffsets: new Map([[mangled, 0]]),
+    indexType,
     decl: {
       ...tpl.decl,
       name: { kind: "Identifier", name: instanceLocal, span: tpl.decl.name.span },
@@ -2382,7 +2875,13 @@ function checkGenericStructTemplate(
     const returnType = resolveReturnType(method.returnType, structs, enums, diagnostics);
     if (returnType !== undefined) {
       memberContext = {
-        thisType: { kind: "typeParam", name: "Self", constraintName: null, constraintKind: null },
+        thisType: {
+          kind: "typeParam",
+          name: "Self",
+          constraintName: null,
+          constraintKind: null,
+          constraintArms: [],
+        },
         enclosingClass: null,
         enclosingStruct: null,
         isConstructor: false,
@@ -2451,84 +2950,108 @@ function localNameFromMangled(mangled: string): string {
  * so resolveAnnotation / monomorphize mangling work under compileFile.
  */
 function valueTypeToLocalAnnotation(type: ValueType): TypeAnnotation {
+  const span = {
+    start: { line: 1, column: 1, offset: 0 },
+    end: { line: 1, column: 1, offset: 0 },
+  };
   if (typeof type === "string") {
     return valueTypeToAnnotation(type);
   }
-  if (type.kind === "array") {
-    return {
-      kind: "ArrayType",
-      element: valueTypeToLocalAnnotation(type.element),
-      span: {
-        start: { line: 1, column: 1, offset: 0 },
-        end: { line: 1, column: 1, offset: 0 },
-      },
-    };
+  switch (type.kind) {
+    case "array":
+      return {
+        kind: "ArrayType",
+        element: valueTypeToLocalAnnotation(type.element),
+        span,
+      };
+    case "typeParam":
+      return valueTypeToAnnotation(type);
+    case "union":
+      return {
+        kind: "UnionType",
+        types: type.arms.map((a) => valueTypeToLocalAnnotation(a as ValueType)),
+        span,
+      };
+    case "intersection":
+      return {
+        kind: "IntersectionType",
+        types: type.arms.map((a) => valueTypeToLocalAnnotation(a as ValueType)),
+        span,
+      };
+    case "literal":
+      return {
+        kind: "LiteralType",
+        value: type.value,
+        literalKind: type.literalKind,
+        span,
+      };
+    case "object":
+      return {
+        kind: "ObjectType",
+        fields: type.fields.map((f) => ({
+          kind: "ObjectTypeField" as const,
+          readonly: f.readonly,
+          name: { kind: "Identifier" as const, name: f.name, span },
+          typeAnnotation: valueTypeToLocalAnnotation(f.type as ValueType),
+          span,
+        })),
+        indexSignature: type.indexType
+          ? {
+              kind: "ObjectIndexSignature" as const,
+              keyName: { kind: "Identifier" as const, name: "key", span },
+              keyType: { kind: "PrimitiveType" as const, name: "string" as const, span },
+              valueType: valueTypeToLocalAnnotation(type.indexType as ValueType),
+              span,
+            }
+          : null,
+        span,
+      };
+    case "map":
+      return {
+        kind: "ObjectType",
+        fields: [],
+        indexSignature: {
+          kind: "ObjectIndexSignature",
+          keyName: { kind: "Identifier", name: "key", span },
+          keyType: { kind: "PrimitiveType", name: "string", span },
+          valueType: valueTypeToLocalAnnotation(type.valueType as ValueType),
+          span,
+        },
+        span,
+      };
+    case "class": {
+      const cls =
+        classesByMangled.get(type.name) ??
+        findClassByMangled(type.name) ??
+        specializedClasses.get(localNameFromMangled(type.name));
+      const local = cls?.localName ?? localNameFromMangled(type.name);
+      return { kind: "NamedType", namespace: null, name: local, typeArgs: [], span };
+    }
+    case "interface": {
+      const iface =
+        interfacesByMangled.get(type.name) ??
+        findInterfaceByMangled(type.name) ??
+        specializedInterfaces.get(localNameFromMangled(type.name));
+      const local = iface?.localName ?? localNameFromMangled(type.name);
+      return { kind: "NamedType", namespace: null, name: local, typeArgs: [], span };
+    }
+    case "struct": {
+      const local = localNameFromMangled(type.name);
+      const def =
+        specializedStructs.get(local) ??
+        [...specializedStructs.values()].find((d) => d.name === type.name);
+      const name = def?.decl.name.name ?? local;
+      return { kind: "NamedType", namespace: null, name, typeArgs: [], span };
+    }
+    case "enum":
+      return {
+        kind: "NamedType",
+        namespace: null,
+        name: localNameFromMangled(type.name),
+        typeArgs: [],
+        span,
+      };
   }
-  if (type.kind === "typeParam") {
-    return valueTypeToAnnotation(type);
-  }
-  if (type.kind === "class") {
-    const cls =
-      classesByMangled.get(type.name) ??
-      findClassByMangled(type.name) ??
-      specializedClasses.get(localNameFromMangled(type.name));
-    const local = cls?.localName ?? localNameFromMangled(type.name);
-    return {
-      kind: "NamedType",
-      namespace: null,
-      name: local,
-      typeArgs: [],
-      span: {
-        start: { line: 1, column: 1, offset: 0 },
-        end: { line: 1, column: 1, offset: 0 },
-      },
-    };
-  }
-  if (type.kind === "interface") {
-    const iface =
-      interfacesByMangled.get(type.name) ??
-      findInterfaceByMangled(type.name) ??
-      specializedInterfaces.get(localNameFromMangled(type.name));
-    const local = iface?.localName ?? localNameFromMangled(type.name);
-    return {
-      kind: "NamedType",
-      namespace: null,
-      name: local,
-      typeArgs: [],
-      span: {
-        start: { line: 1, column: 1, offset: 0 },
-        end: { line: 1, column: 1, offset: 0 },
-      },
-    };
-  }
-  if (type.kind === "struct") {
-    const local = localNameFromMangled(type.name);
-    const def =
-      specializedStructs.get(local) ??
-      [...specializedStructs.values()].find((d) => d.name === type.name);
-    const name = def?.decl.name.name ?? local;
-    return {
-      kind: "NamedType",
-      namespace: null,
-      name,
-      typeArgs: [],
-      span: {
-        start: { line: 1, column: 1, offset: 0 },
-        end: { line: 1, column: 1, offset: 0 },
-      },
-    };
-  }
-  // enum
-  return {
-    kind: "NamedType",
-    namespace: null,
-    name: localNameFromMangled(type.name),
-    typeArgs: [],
-    span: {
-      start: { line: 1, column: 1, offset: 0 },
-      end: { line: 1, column: 1, offset: 0 },
-    },
-  };
 }
 
 function inferTypeArgs(
@@ -2547,7 +3070,7 @@ function inferTypeArgs(
       }
       return unify(ann.element, concrete.element);
     }
-    if (ann.namespace === null && ann.typeArgs.length === 0) {
+    if (ann.kind === "NamedType" && ann.namespace === null && ann.typeArgs.length === 0) {
       const isParam = typeParams.some((tp) => tp.name.name === ann.name);
       if (isParam) {
         const existing = solutions.get(ann.name);
@@ -2665,27 +3188,7 @@ function checkGenericFunctionCall(
   for (let i = 0; i < tpl.decl.typeParams.length; i += 1) {
     subst.set(tpl.decl.typeParams[i]!.name.name, typeArgs[i]!);
   }
-  const sub = (ann: TypeAnnotation): TypeAnnotation => {
-    if (ann.kind === "PrimitiveType") {
-      return ann;
-    }
-    if (ann.kind === "ArrayType") {
-      return { kind: "ArrayType", element: sub(ann.element), span: ann.span };
-    }
-    if (ann.namespace === null && ann.typeArgs.length === 0 && subst.has(ann.name)) {
-      return subst.get(ann.name)!;
-    }
-    if (ann.typeArgs.length === 0) {
-      return ann;
-    }
-    return {
-      kind: "NamedType",
-      namespace: ann.namespace,
-      name: ann.name,
-      typeArgs: ann.typeArgs.map(sub),
-      span: ann.span,
-    };
-  };
+  const sub = (ann: TypeAnnotation): TypeAnnotation => substituteAnnotation(ann, subst);
 
   if (expr.args.length !== tpl.decl.params.length) {
     diagnostics.error(
@@ -3169,18 +3672,25 @@ function checkStatement(
           "E0316",
         );
       }
+      const narrowing = extractTypeofNarrowing(stmt.condition);
+      const thenScope = cloneScopeWithNarrowing(scope, narrowing) as Map<string, Binding>;
+      const elseNarrowing = narrowing
+        ? { ...narrowing, positive: !narrowing.positive }
+        : null;
+      const elseScope = cloneScopeWithNarrowing(scope, elseNarrowing) as Map<string, Binding>;
+
       for (const s of stmt.consequent) {
-        checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+        checkStatement(s, thenScope, functions, structs, enums, returnType, diagnostics, loopDepth);
       }
       if (stmt.alternate === null) {
         return;
       }
       if (Array.isArray(stmt.alternate)) {
         for (const s of stmt.alternate) {
-          checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+          checkStatement(s, elseScope, functions, structs, enums, returnType, diagnostics, loopDepth);
         }
       } else {
-        checkStatement(stmt.alternate, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+        checkStatement(stmt.alternate, elseScope, functions, structs, enums, returnType, diagnostics, loopDepth);
       }
       return;
     }
@@ -3351,10 +3861,43 @@ function checkAssignment(
     return;
   }
 
-  // Index assignment: arr[i] = value — allowed even if arr is const
+  // Index assignment: arr[i] = value / map[key] = value — allowed even if container is const
   const objectType = checkExpression(stmt.target.object, scope, functions, structs, enums, diagnostics);
   const indexType = checkExpression(stmt.target.index, scope, functions, structs, enums, diagnostics);
   if (!objectType || !indexType) {
+    return;
+  }
+  if (isMapType(objectType) || (isObjectType(objectType) && objectType.indexType)) {
+    if (indexType !== "string" && !(isLiteralType(indexType) && indexType.literalKind === "string")) {
+      diagnostics.error(
+        `Map index must be a string, got '${typeToString(indexType)}'`,
+        stmt.target.index.span,
+        "E0320",
+      );
+      return;
+    }
+    const elementType = (
+      isMapType(objectType) ? objectType.valueType : objectType.indexType
+    ) as ValueType;
+    if (stmt.operator === "+=" || stmt.operator === "-=") {
+      diagnostics.error(
+        `Operator '${stmt.operator}' is not supported on map elements`,
+        stmt.target.span,
+        "E0306",
+      );
+      return;
+    }
+    const valueType = checkExpression(stmt.value, scope, functions, structs, enums, diagnostics);
+    if (!valueType) {
+      return;
+    }
+    if (!valueMatchesBinding(stmt.value, valueType, elementType)) {
+      diagnostics.error(
+        typeMismatchMessage(elementType, valueType),
+        stmt.value.span,
+        "E0303",
+      );
+    }
     return;
   }
   if (!isArrayType(objectType)) {
@@ -3639,12 +4182,30 @@ function checkExpression(
 ): ValueType | null {
   switch (expr.kind) {
     case "IntegerLiteral":
+      if (expectedType && isLiteralType(expectedType) && expectedType.literalKind === "number") {
+        return { kind: "literal", value: expr.value, literalKind: "number" };
+      }
+      if (expectedType && isUnionType(expectedType)) {
+        const lit: LiteralValueType = { kind: "literal", value: expr.value, literalKind: "number" };
+        if (isAssignable(lit, expectedType)) {
+          return lit;
+        }
+      }
       return "i32";
     case "FloatLiteral":
       return "f64";
     case "BooleanLiteral":
       return "bool";
     case "StringLiteral":
+      if (expectedType && isLiteralType(expectedType) && expectedType.literalKind === "string") {
+        return { kind: "literal", value: expr.value, literalKind: "string" };
+      }
+      if (expectedType && isUnionType(expectedType)) {
+        const lit: LiteralValueType = { kind: "literal", value: expr.value, literalKind: "string" };
+        if (isAssignable(lit, expectedType)) {
+          return lit;
+        }
+      }
       return "string";
     case "CharLiteral":
       return "char";
@@ -3862,6 +4423,17 @@ function checkExpression(
       if (!objectType || !indexType) {
         return null;
       }
+      if (isMapType(objectType) || (isObjectType(objectType) && objectType.indexType)) {
+        if (indexType !== "string" && !(isLiteralType(indexType) && indexType.literalKind === "string")) {
+          diagnostics.error(
+            `Map index must be a string, got '${typeToString(indexType)}'`,
+            expr.index.span,
+            "E0320",
+          );
+          return null;
+        }
+        return (isMapType(objectType) ? objectType.valueType : objectType.indexType) as ValueType;
+      }
       if (!isArrayType(objectType)) {
         diagnostics.error(
           `Cannot index into type '${typeToString(objectType)}'`,
@@ -3975,6 +4547,18 @@ function checkExpression(
       if (!objectType) {
         return null;
       }
+      if (isObjectType(objectType)) {
+        const field = objectType.fields.find((f) => f.name === expr.property.name);
+        if (!field) {
+          diagnostics.error(
+            `Unknown field '${expr.property.name}' on object type`,
+            expr.property.span,
+            "E0324",
+          );
+          return null;
+        }
+        return field.type as ValueType;
+      }
       if (isStructType(objectType)) {
         const def =
           findStructByTypeName(structs, objectType.name) ??
@@ -4025,9 +4609,12 @@ function checkExpression(
         return null;
       }
       if (expr.property.name === "length") {
+        if (objectType === "string") {
+          return "i32";
+        }
         if (!isArrayType(objectType)) {
           diagnostics.error(
-            `Property 'length' is only available on arrays, got '${typeToString(objectType)}'`,
+            `Property 'length' is only available on arrays and strings, got '${typeToString(objectType)}'`,
             expr.span,
             "E0323",
           );
@@ -4246,6 +4833,26 @@ function checkExpression(
       }
       return operand;
     }
+    case "TypeofExpression": {
+      const operand = checkExpression(expr.operand, scope, functions, structs, enums, diagnostics);
+      if (!operand) {
+        return null;
+      }
+      const tag = typeofTagForType(operand);
+      if (tag === null && isUnionType(operand)) {
+        // typeof on a union is still string at runtime
+        return "string";
+      }
+      if (tag === null) {
+        diagnostics.error(
+          `typeof is not supported for type '${typeToString(operand)}'`,
+          expr.span,
+          "E0396",
+        );
+        return null;
+      }
+      return "string";
+    }
     case "BinaryExpression": {
       const left = checkExpression(expr.left, scope, functions, structs, enums, diagnostics);
       const right = checkExpression(expr.right, scope, functions, structs, enums, diagnostics);
@@ -4378,6 +4985,30 @@ function checkExpression(
           }
         }
         return null;
+      }
+
+      if (expr.callee.name === "createMap") {
+        if (expr.args.length !== 0) {
+          diagnostics.error("'createMap' expects no arguments", expr.span, "E0315");
+          return null;
+        }
+        if (expectedType && isMapType(expectedType)) {
+          return expectedType;
+        }
+        if (expectedType && isObjectType(expectedType) && expectedType.indexType) {
+          return { kind: "map", valueType: expectedType.indexType };
+        }
+        if (
+          expectedType &&
+          typeof expectedType === "object" &&
+          expectedType.kind === "interface"
+        ) {
+          const iface = findInterfaceByMangled(expectedType.name);
+          if (iface?.indexType && iface.methods.length === 0) {
+            return { kind: "map", valueType: iface.indexType };
+          }
+        }
+        return { kind: "map", valueType: "string" };
       }
 
       const sig = functions.get(expr.callee.name);
@@ -4621,42 +5252,46 @@ function checkMethodCall(
     );
   }
 
-  if (
-    typeof objectType === "object" &&
-    objectType.kind === "typeParam" &&
-    objectType.constraintKind === "interface" &&
-    objectType.constraintName
-  ) {
-    const def = findInterfaceByMangled(objectType.constraintName);
-    if (!def) {
+  if (typeof objectType === "object" && objectType.kind === "typeParam") {
+    const arms =
+      objectType.constraintArms.length > 0
+        ? objectType.constraintArms
+        : objectType.constraintName && objectType.constraintKind
+          ? [{ kind: objectType.constraintKind, name: objectType.constraintName }]
+          : [];
+    if (arms.length > 0) {
+      for (const arm of arms) {
+        if (arm.kind !== "interface") {
+          continue;
+        }
+        const def = findInterfaceByMangled(arm.name);
+        if (!def) {
+          continue;
+        }
+        const method = def.methods.find((m) => m.name === callee.property.name);
+        if (!method) {
+          continue;
+        }
+        return checkMethodArgs(
+          method.name,
+          method.params,
+          method.returnType,
+          expr,
+          scope,
+          functions,
+          structs,
+          enums,
+          diagnostics,
+          allowVoidCall,
+        );
+      }
       diagnostics.error(
-        `Unknown constraint interface '${objectType.constraintName}'`,
-        callee.object.span,
-        "E0104",
-      );
-      return null;
-    }
-    const method = def.methods.find((m) => m.name === callee.property.name);
-    if (!method) {
-      diagnostics.error(
-        `Unknown method '${callee.property.name}' on constraint '${def.localName}'`,
+        `Unknown method '${callee.property.name}' on constraint '${typeToString(objectType)}'`,
         callee.property.span,
         "E0324",
       );
       return null;
     }
-    return checkMethodArgs(
-      method.name,
-      method.params,
-      method.returnType,
-      expr,
-      scope,
-      functions,
-      structs,
-      enums,
-      diagnostics,
-      allowVoidCall,
-    );
   }
 
   if (!isArrayType(objectType)) {
@@ -4818,7 +5453,8 @@ function checkGenericMethodCall(
       : `${method.name.name}__${typeArgs.map((a) => {
           if (a.kind === "PrimitiveType") return a.name;
           if (a.kind === "ArrayType") return `arr`;
-          return a.name;
+          if (a.kind === "NamedType") return a.name;
+          return a.kind;
         }).join("__")}`;
 
   instantiationCollector.methodCallRewrites.set(expr.span.start.offset, methodLocalName);
@@ -4981,6 +5617,19 @@ function valueMatchesBinding(
 ): boolean {
   if (isAssignable(inferred, expected)) {
     return true;
+  }
+  // Literal values against literal / union-of-literals targets
+  if (value.kind === "StringLiteral") {
+    const lit: LiteralValueType = { kind: "literal", value: value.value, literalKind: "string" };
+    if (isAssignable(lit, expected)) {
+      return true;
+    }
+  }
+  if (value.kind === "IntegerLiteral") {
+    const lit: LiteralValueType = { kind: "literal", value: value.value, literalKind: "number" };
+    if (isAssignable(lit, expected)) {
+      return true;
+    }
   }
   // Array literal width coercion for elements is handled per-element; here for whole value:
   if (value.kind === "IntegerLiteral" && (expected === "i32" || expected === "i64")) {

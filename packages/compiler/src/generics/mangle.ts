@@ -5,17 +5,46 @@
 import type { TypeAnnotation } from "../ast/nodes.js";
 
 export function mangleTypeAnnotation(ann: TypeAnnotation): string {
-  if (ann.kind === "PrimitiveType") {
-    return ann.name;
+  switch (ann.kind) {
+    case "PrimitiveType":
+      return ann.name;
+    case "ArrayType":
+      return `arr__${mangleTypeAnnotation(ann.element)}`;
+    case "NamedType": {
+      const base = ann.namespace ? `${ann.namespace}_${ann.name}` : ann.name;
+      if (ann.typeArgs.length === 0) {
+        return base;
+      }
+      return mangleInstance(base, ann.typeArgs);
+    }
+    case "UnionType":
+      return `union__${ann.types.map(mangleTypeAnnotation).join("__or__")}`;
+    case "IntersectionType":
+      return `inter__${ann.types.map(mangleTypeAnnotation).join("__and__")}`;
+    case "ObjectType": {
+      const fields = ann.fields
+        .map((f) => `${f.name.name}__${mangleTypeAnnotation(f.typeAnnotation)}`)
+        .join("__");
+      const idx = ann.indexSignature
+        ? `__idx__${mangleTypeAnnotation(ann.indexSignature.valueType)}`
+        : "";
+      return `obj__${fields}${idx}`;
+    }
+    case "LiteralType":
+      return ann.literalKind === "string"
+        ? `litstr__${String(ann.value).replace(/[^a-zA-Z0-9]/g, "_")}`
+        : `litnum__${ann.value}`;
+    case "KeyofType":
+      return `keyof__${mangleTypeAnnotation(ann.type)}`;
+    case "TypeofType":
+      return "typeof";
+    case "ConditionalType":
+      return `cond__${mangleTypeAnnotation(ann.checkType)}__${mangleTypeAnnotation(ann.extendsType)}`;
+    case "MappedType":
+      return `mapped__${mangleTypeAnnotation(ann.constraint)}__${mangleTypeAnnotation(ann.type)}`;
+    case "IndexedAccessType":
+      return `idxacc__${mangleTypeAnnotation(ann.objectType)}__${mangleTypeAnnotation(ann.indexType)}`;
   }
-  if (ann.kind === "ArrayType") {
-    return `arr__${mangleTypeAnnotation(ann.element)}`;
-  }
-  const base = ann.namespace ? `${ann.namespace}_${ann.name}` : ann.name;
-  if (ann.typeArgs.length === 0) {
-    return base;
-  }
-  return mangleInstance(base, ann.typeArgs);
 }
 
 /** `Array` + [i32, string] → `Array__i32__string` */

@@ -76,9 +76,12 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 - A single top-level `function main(): void` with no parameters (return type required)
 - Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`, arrays `T[]`, `struct`, `enum`, `class`, and `interface` types
 - Generics: type parameters on structs, classes, interfaces, functions, and methods; constraints (`T extends I`); nested type arguments; call-site inference; compile-time monomorphization (no runtime generics)
+- Type aliases (`type Name = ...`), including generic aliases, unions (`|`), intersections (`&`), literal types, `keyof` / `typeof` type operators, conditional and mapped types
+- Control-flow narrowing via `typeof` checks on union values
+- Index signatures (`[key: string]: T`) as string-keyed maps
 - Struct declarations, literals (`Person { name: "...", age: 16 }`), field access, field assignment, and instance methods
 - Classes: `new`, constructors, instance/static fields and methods, `public`/`private`, `readonly`, inheritance (`extends`), and `abstract` classes (heap reference types)
-- Interfaces: method-only contracts with `implements` / `extends`, compile-time compliance checks, and fat-pointer dynamic dispatch when typed as an interface
+- Interfaces: method contracts with `implements` / `extends`, optional index signatures, compile-time compliance checks, and fat-pointer dynamic dispatch when typed as an interface
 - `let` / `const` variables with optional annotations and inference (`5` → `i32`, `3.14` → `f64`)
 - Reassignment for `let` only (`=`, `+=`, `-=`, `++`, `--` on numeric lets)
 - Arrays: literals `[1, 2, 3]`, indexing, element assignment, `.length`, `.push` / `.pop` / `.includes` / `.indexOf`
@@ -86,10 +89,12 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 - `print(...)` of printable values; multiple args are joined with spaces
 - String concatenation with `+`
 - Comparisons (`== != < <= > >=`) and logical ops (`&& || !`)
+- Value-position `typeof` expression (returns `"string" | "number" | "boolean" | "object"`)
 - Control flow: `if` / `elseif` / `else`, `while`, C-style `for`, element `for (i in arr)`, `break`, `continue`
 - `//` line comments and `/* */` block comments
 
 `print` is a builtin. It is lowered to libc `printf` in the generated LLVM IR.
+`createMap()` is a builtin that allocates an empty string-keyed map (for index-signature types).
 
 ### Examples
 
@@ -107,6 +112,11 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 | [`examples/inheritance.tsn`](./examples/inheritance.tsn) | Abstract classes, `extends`, virtual methods |
 | [`examples/interfaces.tsn`](./examples/interfaces.tsn) | Interfaces, `implements`, itable dispatch |
 | [`examples/generics.tsn`](./examples/generics.tsn) | Generic structs/classes/functions/methods, constraints, inference |
+| [`examples/type-aliases.tsn`](./examples/type-aliases.tsn) | Type aliases and literal unions |
+| [`examples/unions.tsn`](./examples/unions.tsn) | Union types and typeof narrowing |
+| [`examples/multi-constraints.tsn`](./examples/multi-constraints.tsn) | Multi-constraints (`T extends A & B`) |
+| [`examples/dictionaries.tsn`](./examples/dictionaries.tsn) | Index signatures as string-keyed maps |
+| [`examples/type-operators.tsn`](./examples/type-operators.tsn) | `keyof` / `typeof` / conditionals / mapped types / `T[K]` |
 
 ## Development
 

@@ -1,0 +1,13 @@
+function getValue(): i32 | string {
+  return "hello";
+}
+
+function main(): void {
+  let value: i32 | string = getValue();
+
+  if (typeof value == "string") {
+    print(value.length);
+  } else {
+    print(value + 10);
+  }
+}

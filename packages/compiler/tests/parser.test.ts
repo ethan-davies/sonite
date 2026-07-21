@@ -766,4 +766,118 @@ describe("Parser", () => {
       }
     }
   });
+
+  it("parses type aliases, unions, intersections, and object types", () => {
+    const { ast, diagnostics } = parse(`
+      type UserId = i32;
+      type Pair<A, B> = {
+        first: A;
+        second: B;
+      };
+      type StringOrNumber = string | i32;
+      type Person = User & {
+        age: i32;
+      };
+      function main(): void {}
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(ast.body[0]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      name: { name: "UserId" },
+      type: { kind: "PrimitiveType", name: "i32" },
+    });
+    expect(ast.body[1]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      name: { name: "Pair" },
+      typeParams: [{ name: { name: "A" } }, { name: { name: "B" } }],
+      type: { kind: "ObjectType" },
+    });
+    expect(ast.body[2]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      type: { kind: "UnionType" },
+    });
+    expect(ast.body[3]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      type: { kind: "IntersectionType" },
+    });
+  });
+
+  it("parses literal unions, keyof, conditional, and mapped types", () => {
+    const { ast, diagnostics } = parse(`
+      type Direction = "north" | "south";
+      type StatusCode = 200 | 404;
+      type Keys = keyof Person;
+      type Result<T> = T extends string ? string : i32;
+      type ReadonlyPerson = {
+        readonly [K in keyof Person]: Person[K];
+      };
+      function main(): void {}
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(ast.body[0]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      type: { kind: "UnionType" },
+    });
+    expect(ast.body[2]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      type: { kind: "KeyofType" },
+    });
+    expect(ast.body[3]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      type: { kind: "ConditionalType" },
+    });
+    expect(ast.body[4]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      type: { kind: "MappedType", readonly: true },
+    });
+  });
+
+  it("parses interface index signatures and typeof expressions", () => {
+    const { ast, diagnostics } = parse(`
+      interface Dictionary {
+        [key: string]: string;
+      }
+      function main(): void {
+        let x: i32 = 1;
+        let t: string = typeof x;
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(ast.body[0]).toMatchObject({
+      kind: "InterfaceDeclaration",
+      indexSignature: {
+        kind: "InterfaceIndexSignature",
+        valueType: { kind: "PrimitiveType", name: "string" },
+      },
+    });
+    const main = ast.body[1];
+    expect(main?.kind).toBe("FunctionDeclaration");
+    if (main?.kind === "FunctionDeclaration") {
+      const decl = main.body[1];
+      expect(decl?.kind).toBe("VariableDeclaration");
+      if (decl?.kind === "VariableDeclaration") {
+        expect(decl.initializer).toMatchObject({ kind: "TypeofExpression" });
+      }
+    }
+  });
+
+  it("parses multi-constraint type parameters and indexed access types", () => {
+    const { ast, diagnostics } = parse(`
+      function useBoth<T extends A & B>(value: T): void {}
+      type Name = Person["name"];
+      function main(): void {}
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const fn = ast.body[0];
+    expect(fn?.kind).toBe("FunctionDeclaration");
+    if (fn?.kind === "FunctionDeclaration") {
+      expect(fn.typeParams[0]).toMatchObject({
+        constraint: { kind: "IntersectionType" },
+      });
+    }
+    expect(ast.body[1]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      type: { kind: "IndexedAccessType" },
+    });
+  });
 });

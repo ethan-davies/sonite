@@ -1,0 +1,61 @@
+type Person = {
+  name: string;
+  age: i32;
+};
+
+type Keys = keyof Person;
+type Name = Person["name"];
+type Age = Person["age"];
+
+type IsString<T> = T extends string ? string : i32;
+type NameResult = IsString<Name>;
+type AgeResult = IsString<Age>;
+
+type Pair<A, B> = {
+  first: A;
+  second: B;
+};
+type FirstOfPair = Pair<string, i32>["first"];
+
+type ReadonlyPerson = {
+  readonly [K in keyof Person]: Person[K];
+};
+type ReadonlyName = ReadonlyPerson["name"];
+
+struct Point {
+  x: i32;
+  y: i32;
+}
+
+function createPoint(): Point {
+  return Point { x: 3, y: 4 };
+}
+
+type PointType = typeof createPoint();
+
+function main(): void {
+  let key: Keys = "name";
+  print(key);
+
+  let name: Name = "Ada";
+  print(name);
+
+  let age: Age = 36;
+  print(age);
+
+  let asString: NameResult = "ok";
+  print(asString);
+
+  let asNumber: AgeResult = 7;
+  print(asNumber);
+
+  let first: FirstOfPair = "hello";
+  print(first);
+
+  let roName: ReadonlyName = "Lovelace";
+  print(roName);
+
+  let point: PointType = createPoint();
+  print(point.x);
+  print(point.y);
+}

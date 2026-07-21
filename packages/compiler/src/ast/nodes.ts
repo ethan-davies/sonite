@@ -42,6 +42,8 @@ export type AstNode =
   | ConstructorDeclaration
   | InterfaceDeclaration
   | InterfaceMethodSignature
+  | InterfaceIndexSignature
+  | TypeAliasDeclaration
   | TypeParameter
   | Parameter
   | VariableDeclaration
@@ -58,6 +60,7 @@ export type AstNode =
   | CallExpression
   | BinaryExpression
   | UnaryExpression
+  | TypeofExpression
   | IndexExpression
   | MemberExpression
   | ArrayLiteral
@@ -85,7 +88,8 @@ export type TopLevelDeclaration =
   | StructDeclaration
   | EnumDeclaration
   | ClassDeclaration
-  | InterfaceDeclaration;
+  | InterfaceDeclaration
+  | TypeAliasDeclaration;
 
 export interface Program extends AstNodeBase {
   readonly kind: "Program";
@@ -225,6 +229,13 @@ export interface InterfaceMethodSignature extends AstNodeBase {
   readonly returnType: TypeAnnotation;
 }
 
+export interface InterfaceIndexSignature extends AstNodeBase {
+  readonly kind: "InterfaceIndexSignature";
+  readonly keyName: Identifier;
+  readonly keyType: TypeAnnotation;
+  readonly valueType: TypeAnnotation;
+}
+
 export interface InterfaceDeclaration extends AstNodeBase {
   readonly kind: "InterfaceDeclaration";
   readonly exported: boolean;
@@ -233,6 +244,15 @@ export interface InterfaceDeclaration extends AstNodeBase {
   /** Interfaces this interface extends. */
   readonly bases: NamedType[];
   readonly methods: InterfaceMethodSignature[];
+  readonly indexSignature: InterfaceIndexSignature | null;
+}
+
+export interface TypeAliasDeclaration extends AstNodeBase {
+  readonly kind: "TypeAliasDeclaration";
+  readonly exported: boolean;
+  readonly name: Identifier;
+  readonly typeParams: TypeParameter[];
+  readonly type: TypeAnnotation;
 }
 
 export interface VariableDeclaration extends AstNodeBase {
@@ -311,6 +331,7 @@ export type Expression =
   | CallExpression
   | BinaryExpression
   | UnaryExpression
+  | TypeofExpression
   | IndexExpression
   | MemberExpression
   | ArrayLiteral
@@ -345,6 +366,11 @@ export interface BinaryExpression extends AstNodeBase {
 export interface UnaryExpression extends AstNodeBase {
   readonly kind: "UnaryExpression";
   readonly operator: "-" | "!";
+  readonly operand: Expression;
+}
+
+export interface TypeofExpression extends AstNodeBase {
+  readonly kind: "TypeofExpression";
   readonly operand: Expression;
 }
 
@@ -433,7 +459,19 @@ export interface CharLiteral extends AstNodeBase {
   readonly raw: string;
 }
 
-export type TypeAnnotation = PrimitiveType | ArrayType | NamedType;
+export type TypeAnnotation =
+  | PrimitiveType
+  | ArrayType
+  | NamedType
+  | UnionType
+  | IntersectionType
+  | ObjectType
+  | LiteralType
+  | KeyofType
+  | TypeofType
+  | ConditionalType
+  | MappedType
+  | IndexedAccessType;
 
 export interface PrimitiveType extends AstNodeBase {
   readonly kind: "PrimitiveType";
@@ -451,4 +489,73 @@ export interface NamedType extends AstNodeBase {
   readonly namespace: string | null;
   readonly name: string;
   readonly typeArgs: TypeAnnotation[];
+}
+
+export interface UnionType extends AstNodeBase {
+  readonly kind: "UnionType";
+  readonly types: TypeAnnotation[];
+}
+
+export interface IntersectionType extends AstNodeBase {
+  readonly kind: "IntersectionType";
+  readonly types: TypeAnnotation[];
+}
+
+export interface ObjectTypeField extends AstNodeBase {
+  readonly kind: "ObjectTypeField";
+  readonly readonly: boolean;
+  readonly name: Identifier;
+  readonly typeAnnotation: TypeAnnotation;
+}
+
+export interface ObjectIndexSignature extends AstNodeBase {
+  readonly kind: "ObjectIndexSignature";
+  readonly keyName: Identifier;
+  readonly keyType: TypeAnnotation;
+  readonly valueType: TypeAnnotation;
+}
+
+export interface ObjectType extends AstNodeBase {
+  readonly kind: "ObjectType";
+  readonly fields: ObjectTypeField[];
+  readonly indexSignature: ObjectIndexSignature | null;
+}
+
+export interface LiteralType extends AstNodeBase {
+  readonly kind: "LiteralType";
+  readonly value: string | number;
+  readonly literalKind: "string" | "number";
+}
+
+export interface KeyofType extends AstNodeBase {
+  readonly kind: "KeyofType";
+  readonly type: TypeAnnotation;
+}
+
+export interface TypeofType extends AstNodeBase {
+  readonly kind: "TypeofType";
+  /** Expression whose type is queried (identifier or call). */
+  readonly expression: Expression;
+}
+
+export interface ConditionalType extends AstNodeBase {
+  readonly kind: "ConditionalType";
+  readonly checkType: TypeAnnotation;
+  readonly extendsType: TypeAnnotation;
+  readonly trueType: TypeAnnotation;
+  readonly falseType: TypeAnnotation;
+}
+
+export interface MappedType extends AstNodeBase {
+  readonly kind: "MappedType";
+  readonly readonly: boolean;
+  readonly typeParam: Identifier;
+  readonly constraint: TypeAnnotation;
+  readonly type: TypeAnnotation;
+}
+
+export interface IndexedAccessType extends AstNodeBase {
+  readonly kind: "IndexedAccessType";
+  readonly objectType: TypeAnnotation;
+  readonly indexType: TypeAnnotation;
 }

@@ -130,13 +130,15 @@ export class Lexer {
           this.advance();
           return this.makeToken(TokenKind.AmpAmp, "&&", start);
         }
-        break;
+        return this.makeToken(TokenKind.Amp, ch, start);
       case "|":
         if (this.peek() === "|") {
           this.advance();
           return this.makeToken(TokenKind.PipePipe, "||", start);
         }
-        break;
+        return this.makeToken(TokenKind.Pipe, ch, start);
+      case "?":
+        return this.makeToken(TokenKind.Question, ch, start);
     }
 
     this.diagnostics.error(`Unexpected character '${ch}'`, span(start, this.location()), "E0001");

@@ -56,36 +56,100 @@ function rewriteType(
   ann: TypeAnnotation,
   typeRewrites: ReadonlyMap<number, string>,
 ): TypeAnnotation {
-  if (ann.kind === "PrimitiveType") {
-    return ann;
+  switch (ann.kind) {
+    case "PrimitiveType":
+    case "LiteralType":
+      return ann;
+    case "ArrayType":
+      return {
+        kind: "ArrayType",
+        element: rewriteType(ann.element, typeRewrites),
+        span: ann.span,
+      };
+    case "NamedType": {
+      const rewritten = typeRewrites.get(ann.span.start.offset);
+      if (rewritten) {
+        return {
+          kind: "NamedType",
+          namespace: null,
+          name: rewritten,
+          typeArgs: [],
+          span: ann.span,
+        };
+      }
+      if (ann.typeArgs.length === 0) {
+        return ann;
+      }
+      return {
+        kind: "NamedType",
+        namespace: ann.namespace,
+        name: ann.name,
+        typeArgs: [],
+        span: ann.span,
+      };
+    }
+    case "UnionType":
+      return {
+        kind: "UnionType",
+        types: ann.types.map((t) => rewriteType(t, typeRewrites)),
+        span: ann.span,
+      };
+    case "IntersectionType":
+      return {
+        kind: "IntersectionType",
+        types: ann.types.map((t) => rewriteType(t, typeRewrites)),
+        span: ann.span,
+      };
+    case "ObjectType":
+      return {
+        kind: "ObjectType",
+        fields: ann.fields.map((f) => ({
+          ...f,
+          typeAnnotation: rewriteType(f.typeAnnotation, typeRewrites),
+        })),
+        indexSignature: ann.indexSignature
+          ? {
+              ...ann.indexSignature,
+              keyType: rewriteType(ann.indexSignature.keyType, typeRewrites),
+              valueType: rewriteType(ann.indexSignature.valueType, typeRewrites),
+            }
+          : null,
+        span: ann.span,
+      };
+    case "KeyofType":
+      return {
+        kind: "KeyofType",
+        type: rewriteType(ann.type, typeRewrites),
+        span: ann.span,
+      };
+    case "TypeofType":
+      return ann;
+    case "ConditionalType":
+      return {
+        kind: "ConditionalType",
+        checkType: rewriteType(ann.checkType, typeRewrites),
+        extendsType: rewriteType(ann.extendsType, typeRewrites),
+        trueType: rewriteType(ann.trueType, typeRewrites),
+        falseType: rewriteType(ann.falseType, typeRewrites),
+        span: ann.span,
+      };
+    case "MappedType":
+      return {
+        kind: "MappedType",
+        readonly: ann.readonly,
+        typeParam: ann.typeParam,
+        constraint: rewriteType(ann.constraint, typeRewrites),
+        type: rewriteType(ann.type, typeRewrites),
+        span: ann.span,
+      };
+    case "IndexedAccessType":
+      return {
+        kind: "IndexedAccessType",
+        objectType: rewriteType(ann.objectType, typeRewrites),
+        indexType: rewriteType(ann.indexType, typeRewrites),
+        span: ann.span,
+      };
   }
-  if (ann.kind === "ArrayType") {
-    return {
-      kind: "ArrayType",
-      element: rewriteType(ann.element, typeRewrites),
-      span: ann.span,
-    };
-  }
-  const rewritten = typeRewrites.get(ann.span.start.offset);
-  if (rewritten) {
-    return {
-      kind: "NamedType",
-      namespace: null,
-      name: rewritten,
-      typeArgs: [],
-      span: ann.span,
-    };
-  }
-  if (ann.typeArgs.length === 0) {
-    return ann;
-  }
-  return {
-    kind: "NamedType",
-    namespace: ann.namespace,
-    name: ann.name,
-    typeArgs: [],
-    span: ann.span,
-  };
 }
 
 function rewriteExpression(expr: Expression, inst: TypecheckInstantiations): Expression {
@@ -143,6 +207,8 @@ function rewriteExpression(expr: Expression, inst: TypecheckInstantiations): Exp
         right: rewriteExpression(expr.right, inst),
       };
     case "UnaryExpression":
+      return { ...expr, operand: rewriteExpression(expr.operand, inst) };
+    case "TypeofExpression":
       return { ...expr, operand: rewriteExpression(expr.operand, inst) };
     case "IndexExpression":
       return {

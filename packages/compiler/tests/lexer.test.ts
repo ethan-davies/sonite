@@ -167,14 +167,33 @@ describe("Lexer", () => {
     ]);
   });
 
-  it("rejects single & and |", () => {
-    const amp = lex("&");
-    expect(amp.diagnostics.hasErrors).toBe(true);
-    expect(amp.diagnostics.diagnostics[0]?.code).toBe("E0001");
+  it("tokenizes single & | and ?", () => {
+    const { tokens, diagnostics } = lex(`& | ? && ||`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens.map((t) => t.kind)).toEqual([
+      TokenKind.Amp,
+      TokenKind.Pipe,
+      TokenKind.Question,
+      TokenKind.AmpAmp,
+      TokenKind.PipePipe,
+      TokenKind.Eof,
+    ]);
+  });
 
-    const pipe = lex("|");
-    expect(pipe.diagnostics.hasErrors).toBe(true);
-    expect(pipe.diagnostics.diagnostics[0]?.code).toBe("E0001");
+  it("tokenizes type, keyof, and typeof keywords", () => {
+    const { tokens, diagnostics } = lex(`type Keys = keyof T; typeof x`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens.map((t) => t.kind)).toEqual([
+      TokenKind.Type,
+      TokenKind.Identifier,
+      TokenKind.Equal,
+      TokenKind.Keyof,
+      TokenKind.Identifier,
+      TokenKind.Semicolon,
+      TokenKind.Typeof,
+      TokenKind.Identifier,
+      TokenKind.Eof,
+    ]);
   });
 
   it("tokenizes identifiers with underscores", () => {

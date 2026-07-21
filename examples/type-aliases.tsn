@@ -1,0 +1,16 @@
+type UserId = i32;
+
+type Direction = "north" | "south" | "east" | "west";
+
+type StatusCode = 200 | 404 | 500;
+
+function main(): void {
+  let id: UserId = 21;
+  print(id);
+
+  let direction: Direction = "north";
+  print(direction);
+
+  let code: StatusCode = 200;
+  print(code);
+}

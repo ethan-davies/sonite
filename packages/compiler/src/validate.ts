@@ -76,7 +76,9 @@ function validateModule(
             ? main.returnType.namespace
               ? `${main.returnType.namespace}.${main.returnType.name}`
               : main.returnType.name
-            : "array";
+            : main.returnType.kind === "ArrayType"
+              ? "array"
+              : main.returnType.kind;
       diagnostics.error(
         `Entry function 'main' must return 'void', found '${found}'`,
         main.returnType.span,

@@ -12,6 +12,7 @@ export enum TokenKind {
   Enum = "enum",
   Class = "class",
   Interface = "interface",
+  Type = "type",
   This = "this",
   New = "new",
   Extends = "extends",
@@ -39,6 +40,8 @@ export enum TokenKind {
   Break = "break",
   Continue = "continue",
   In = "in",
+  Keyof = "keyof",
+  Typeof = "typeof",
 
   LParen = "(",
   RParen = ")",
@@ -67,8 +70,11 @@ export enum TokenKind {
   LessEqual = "<=",
   Greater = ">",
   GreaterEqual = ">=",
+  Amp = "&",
   AmpAmp = "&&",
+  Pipe = "|",
   PipePipe = "||",
+  Question = "?",
 
   Eof = "Eof",
   Invalid = "Invalid",
@@ -88,6 +94,7 @@ export const KEYWORDS: ReadonlyMap<string, TokenKind> = new Map([
   ["enum", TokenKind.Enum],
   ["class", TokenKind.Class],
   ["interface", TokenKind.Interface],
+  ["type", TokenKind.Type],
   ["this", TokenKind.This],
   ["new", TokenKind.New],
   ["extends", TokenKind.Extends],
@@ -115,4 +122,6 @@ export const KEYWORDS: ReadonlyMap<string, TokenKind> = new Map([
   ["break", TokenKind.Break],
   ["continue", TokenKind.Continue],
   ["in", TokenKind.In],
+  ["keyof", TokenKind.Keyof],
+  ["typeof", TokenKind.Typeof],
 ]);

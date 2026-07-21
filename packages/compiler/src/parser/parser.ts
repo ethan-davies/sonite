@@ -12,6 +12,7 @@ import type {
   ClassField,
   ClassMember,
   ClassMethod,
+  ConditionalType,
   ConstructorDeclaration,
   ContinueStatement,
   EnumDeclaration,
@@ -25,13 +26,22 @@ import type {
   Identifier,
   IfStatement,
   ImportDeclaration,
+  IndexedAccessType,
   IndexExpression,
   IntegerLiteral,
   InterfaceDeclaration,
+  InterfaceIndexSignature,
   InterfaceMethodSignature,
+  IntersectionType,
+  KeyofType,
+  LiteralType,
+  MappedType,
   MemberExpression,
   NamedType,
   NewExpression,
+  ObjectIndexSignature,
+  ObjectType,
+  ObjectTypeField,
   Parameter,
   PrimitiveTypeName,
   Program,
@@ -46,9 +56,13 @@ import type {
   SuperExpression,
   ThisExpression,
   TopLevelDeclaration,
+  TypeAliasDeclaration,
   TypeAnnotation,
+  TypeofExpression,
+  TypeofType,
   TypeParameter,
   UnaryExpression,
+  UnionType,
   UpdateStatement,
   VariableDeclaration,
   Visibility,
@@ -79,18 +93,13 @@ const UPDATE_OPS = new Set<TokenKind>([TokenKind.PlusPlus, TokenKind.MinusMinus]
 /**
  * Recursive-descent parser:
  *
- *   program      = importDecl* (functionDecl | structDecl | enumDecl | classDecl | interfaceDecl)*
- *   importDecl   = "import" String ("as" Ident)? ";"
- *   functionDecl = "export"? "function" Ident typeParams? "(" params? ")" ":" type block
- *   structDecl   = "export"? "struct" Ident typeParams? "{" (structField | structMethod)* "}"
- *   enumDecl     = "export"? "enum" Ident "{" (Ident ("," Ident)* ","?)? "}"
- *   classDecl    = "export"? "abstract"? "class" Ident typeParams? ("extends" type)? ("implements" type ("," type)*)? "{" classMember* "}"
- *   interfaceDecl = "export"? "interface" Ident typeParams? ("extends" type ("," type)*)? "{" ifaceMethod* "}"
- *   structLiteral = (Ident | Ident "." Ident) typeArgs? "{" fields? "}"
- *   type         = Ident ("." Ident)? typeArgs? ("[" "]")*
- *   typeParams   = "<" typeParam ("," typeParam)* ">"
- *   typeParam    = Ident ("extends" type)?
- *   typeArgs     = "<" type ("," type)* ">"
+ *   program      = importDecl* (functionDecl | structDecl | enumDecl | classDecl | interfaceDecl | typeAlias)*
+ *   type         = unionType
+ *   unionType    = intersectionType ("|" intersectionType)*
+ *   intersection = conditionalType ("&" conditionalType)*
+ *   conditional  = postfixType ("extends" type "?" type ":" type)?
+ *   postfix      = primaryType ("[]" | "[" type "]")*
+ *   primary      = primitive | named | object | literal | keyof | typeof | "(" type ")"
  */
 export class Parser {
   private readonly tokens: Token[];
@@ -184,6 +193,20 @@ export class Parser {
         } else {
           break;
         }
+      } else if (this.check(TokenKind.Type)) {
+        if (isAbstract) {
+          this.diagnostics.error(
+            "'abstract' can only be used with classes",
+            this.peek().span,
+            "E0103",
+          );
+        }
+        const decl = this.parseTypeAliasDeclaration(exported);
+        if (decl) {
+          body.push(decl);
+        } else {
+          break;
+        }
       } else if (this.check(TokenKind.Class)) {
         const decl = this.parseClassDeclaration(exported, isAbstract);
         if (decl) {
@@ -208,13 +231,13 @@ export class Parser {
       } else {
         if (exported || isAbstract) {
           this.diagnostics.error(
-            `Expected 'function', 'struct', 'enum', 'class', or 'interface' after modifiers, found '${this.peek().lexeme}'`,
+            `Expected 'function', 'struct', 'enum', 'class', 'interface', or 'type' after modifiers, found '${this.peek().lexeme}'`,
             this.peek().span,
             "E0103",
           );
         } else {
           this.diagnostics.error(
-            `Expected 'function', 'struct', 'enum', 'class', 'interface', or 'import', found '${this.peek().lexeme}'`,
+            `Expected 'function', 'struct', 'enum', 'class', 'interface', 'type', or 'import', found '${this.peek().lexeme}'`,
             this.peek().span,
             "E0103",
           );
@@ -607,7 +630,25 @@ export class Parser {
     }
 
     const methods: InterfaceMethodSignature[] = [];
+    let indexSignature: InterfaceIndexSignature | null = null;
     while (!this.check(TokenKind.RBrace) && !this.isAtEnd()) {
+      if (this.check(TokenKind.LBracket)) {
+        const idx = this.parseInterfaceIndexSignature();
+        if (!idx) {
+          this.synchronizeToTopLevel();
+          return null;
+        }
+        if (indexSignature) {
+          this.diagnostics.error(
+            "Interfaces may only declare one index signature",
+            idx.span,
+            "E0371",
+          );
+        } else {
+          indexSignature = idx;
+        }
+        continue;
+      }
       const method = this.parseInterfaceMethod();
       if (method === "skipped") {
         continue;
@@ -632,7 +673,100 @@ export class Parser {
       typeParams,
       bases,
       methods,
+      indexSignature,
       span: { start, end: rbrace.span.end },
+    };
+  }
+
+  private parseInterfaceIndexSignature(): InterfaceIndexSignature | null {
+    const start = this.peek().span.start;
+    if (!this.expect(TokenKind.LBracket, "Expected '['")) {
+      return null;
+    }
+    const keyToken = this.expect(TokenKind.Identifier, "Expected index parameter name");
+    if (!keyToken) {
+      return null;
+    }
+    if (!this.expect(TokenKind.Colon, "Expected ':' after index parameter name")) {
+      return null;
+    }
+    const keyType = this.parseType();
+    if (!keyType) {
+      return null;
+    }
+    if (!this.expect(TokenKind.RBracket, "Expected ']' after index signature key type")) {
+      return null;
+    }
+    if (!this.expect(TokenKind.Colon, "Expected ':' after index signature")) {
+      return null;
+    }
+    const valueType = this.parseType();
+    if (!valueType) {
+      return null;
+    }
+    const semi = this.expect(TokenKind.Semicolon, "Expected ';' after index signature");
+    if (!semi) {
+      return null;
+    }
+    return {
+      kind: "InterfaceIndexSignature",
+      keyName: { kind: "Identifier", name: keyToken.lexeme, span: keyToken.span },
+      keyType,
+      valueType,
+      span: { start, end: semi.span.end },
+    };
+  }
+
+  private parseTypeAliasDeclaration(exported: boolean): TypeAliasDeclaration | null {
+    const start = this.peek().span.start;
+
+    if (!this.expect(TokenKind.Type, "Expected 'type'")) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const nameToken = this.expect(TokenKind.Identifier, "Expected type alias name");
+    if (!nameToken) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const name: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+
+    const typeParams = this.parseTypeParameterList();
+    if (typeParams === null) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    if (!this.expect(TokenKind.Equal, "Expected '=' after type alias name")) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const type = this.parseType();
+    if (!type) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    const semi = this.expect(TokenKind.Semicolon, "Expected ';' after type alias");
+    if (!semi) {
+      this.synchronizeToTopLevel();
+      return null;
+    }
+
+    return {
+      kind: "TypeAliasDeclaration",
+      exported,
+      name,
+      typeParams,
+      type,
+      span: { start, end: semi.span.end },
     };
   }
 
@@ -1986,6 +2120,20 @@ export class Parser {
   }
 
   private parseUnary(): Expression | null {
+    if (this.check(TokenKind.Typeof)) {
+      const opToken = this.advance();
+      const operand = this.parseUnary();
+      if (!operand) {
+        return null;
+      }
+      const typeofExpr: TypeofExpression = {
+        kind: "TypeofExpression",
+        operand,
+        span: { start: opToken.span.start, end: operand.span.end },
+      };
+      return typeofExpr;
+    }
+
     if (this.check(TokenKind.Minus) || this.check(TokenKind.Bang)) {
       const opToken = this.advance();
       const operand = this.parseUnary();
@@ -2453,62 +2601,427 @@ export class Parser {
   }
 
   private parseType(): TypeAnnotation | null {
+    return this.parseUnionType();
+  }
+
+  private parseUnionType(): TypeAnnotation | null {
+    const first = this.parseIntersectionType();
+    if (!first) {
+      return null;
+    }
+    if (!this.check(TokenKind.Pipe)) {
+      return first;
+    }
+    const types: TypeAnnotation[] = [first];
+    while (this.match(TokenKind.Pipe)) {
+      const next = this.parseIntersectionType();
+      if (!next) {
+        return null;
+      }
+      types.push(next);
+    }
+    const union: UnionType = {
+      kind: "UnionType",
+      types,
+      span: { start: first.span.start, end: types[types.length - 1]!.span.end },
+    };
+    return union;
+  }
+
+  private parseIntersectionType(): TypeAnnotation | null {
+    const first = this.parseConditionalType();
+    if (!first) {
+      return null;
+    }
+    if (!this.check(TokenKind.Amp)) {
+      return first;
+    }
+    const types: TypeAnnotation[] = [first];
+    while (this.match(TokenKind.Amp)) {
+      const next = this.parseConditionalType();
+      if (!next) {
+        return null;
+      }
+      types.push(next);
+    }
+    const intersection: IntersectionType = {
+      kind: "IntersectionType",
+      types,
+      span: { start: first.span.start, end: types[types.length - 1]!.span.end },
+    };
+    return intersection;
+  }
+
+  private parseConditionalType(): TypeAnnotation | null {
+    const checkType = this.parsePostfixType();
+    if (!checkType) {
+      return null;
+    }
+    if (!this.check(TokenKind.Extends)) {
+      return checkType;
+    }
+    // Only parse as conditional when `extends` is followed by type `?` true `:` false
+    // Look ahead carefully: type params also use extends, but those are handled elsewhere.
+    this.advance(); // extends
+    const extendsType = this.parseType();
+    if (!extendsType) {
+      return null;
+    }
+    if (!this.match(TokenKind.Question)) {
+      // Bare `T extends U` is not valid as a standalone type; treat as error recovery
+      // by returning checkType and reporting.
+      this.diagnostics.error(
+        "Expected '?' after 'extends' clause in conditional type",
+        this.peek().span,
+        "E0103",
+      );
+      return null;
+    }
+    const trueType = this.parseType();
+    if (!trueType) {
+      return null;
+    }
+    if (!this.expect(TokenKind.Colon, "Expected ':' in conditional type")) {
+      return null;
+    }
+    const falseType = this.parseType();
+    if (!falseType) {
+      return null;
+    }
+    const conditional: ConditionalType = {
+      kind: "ConditionalType",
+      checkType,
+      extendsType,
+      trueType,
+      falseType,
+      span: { start: checkType.span.start, end: falseType.span.end },
+    };
+    return conditional;
+  }
+
+  private parsePostfixType(): TypeAnnotation | null {
+    let type = this.parsePrimaryType();
+    if (!type) {
+      return null;
+    }
+    for (;;) {
+      if (this.check(TokenKind.LBracket)) {
+        // Could be `[]` array or `[Type]` indexed access
+        if (this.checkNext(TokenKind.RBracket)) {
+          this.advance(); // [
+          const rbracket = this.advance(); // ]
+          type = {
+            kind: "ArrayType",
+            element: type,
+            span: { start: type.span.start, end: rbracket.span.end },
+          };
+          continue;
+        }
+        this.advance(); // [
+        const indexType = this.parseType();
+        if (!indexType) {
+          return null;
+        }
+        const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after indexed access type");
+        if (!rbracket) {
+          return null;
+        }
+        const indexed: IndexedAccessType = {
+          kind: "IndexedAccessType",
+          objectType: type,
+          indexType,
+          span: { start: type.span.start, end: rbracket.span.end },
+        };
+        type = indexed;
+        continue;
+      }
+      break;
+    }
+    return type;
+  }
+
+  private parsePrimaryType(): TypeAnnotation | null {
+    if (this.check(TokenKind.LParen)) {
+      this.advance();
+      const inner = this.parseType();
+      if (!inner) {
+        return null;
+      }
+      if (!this.expect(TokenKind.RParen, "Expected ')' after type")) {
+        return null;
+      }
+      return inner;
+    }
+
+    if (this.check(TokenKind.Keyof)) {
+      const start = this.advance().span.start;
+      const type = this.parsePostfixType();
+      if (!type) {
+        return null;
+      }
+      const keyofType: KeyofType = {
+        kind: "KeyofType",
+        type,
+        span: { start, end: type.span.end },
+      };
+      return keyofType;
+    }
+
+    if (this.check(TokenKind.Typeof)) {
+      const start = this.advance().span.start;
+      const expression = this.parseTypeofTypeExpression();
+      if (!expression) {
+        return null;
+      }
+      const typeofType: TypeofType = {
+        kind: "TypeofType",
+        expression,
+        span: { start, end: expression.span.end },
+      };
+      return typeofType;
+    }
+
+    if (this.check(TokenKind.LBrace)) {
+      return this.parseObjectOrMappedType();
+    }
+
+    if (this.check(TokenKind.String)) {
+      const token = this.advance();
+      const lit: LiteralType = {
+        kind: "LiteralType",
+        value: token.value ?? "",
+        literalKind: "string",
+        span: token.span,
+      };
+      return lit;
+    }
+
+    if (this.check(TokenKind.Integer)) {
+      const token = this.advance();
+      const lit: LiteralType = {
+        kind: "LiteralType",
+        value: Number(token.lexeme),
+        literalKind: "number",
+        span: token.span,
+      };
+      return lit;
+    }
+
     const token = this.expect(TokenKind.Identifier, "Expected a type name");
     if (!token) {
       return null;
     }
 
-    let type: TypeAnnotation;
     if (PRIMITIVE_TYPES.has(token.lexeme)) {
-      type = {
+      return {
         kind: "PrimitiveType",
         name: token.lexeme as PrimitiveTypeName,
         span: token.span,
       };
-    } else {
-      let namespace: string | null = null;
-      let nameLexeme = token.lexeme;
-      let nameEnd = token.span.end;
+    }
 
-      if (this.check(TokenKind.Dot)) {
+    let namespace: string | null = null;
+    let nameLexeme = token.lexeme;
+    let nameEnd = token.span.end;
+
+    if (this.check(TokenKind.Dot)) {
+      this.advance();
+      const nameToken = this.expect(TokenKind.Identifier, "Expected type name after '.'");
+      if (!nameToken) {
+        return null;
+      }
+      namespace = token.lexeme;
+      nameLexeme = nameToken.lexeme;
+      nameEnd = nameToken.span.end;
+    }
+
+    const typeArgs = this.parseTypeArgumentListInTypePosition();
+    if (typeArgs === null) {
+      return null;
+    }
+    const end = typeArgs.length > 0 ? this.previous().span.end : nameEnd;
+    return {
+      kind: "NamedType",
+      namespace,
+      name: nameLexeme,
+      typeArgs,
+      span: { start: token.span.start, end },
+    };
+  }
+
+  /** Parse identifier or call used in `typeof` type position. */
+  private parseTypeofTypeExpression(): Expression | null {
+    const nameToken = this.expect(TokenKind.Identifier, "Expected identifier after 'typeof'");
+    if (!nameToken) {
+      return null;
+    }
+    let expr: Expression = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+    // Optional call: typeof createPerson()
+    if (this.check(TokenKind.LParen)) {
+      this.advance();
+      const args: Expression[] = [];
+      if (!this.check(TokenKind.RParen)) {
+        do {
+          const arg = this.parseExpression();
+          if (!arg) {
+            return null;
+          }
+          args.push(arg);
+        } while (this.match(TokenKind.Comma));
+      }
+      const rparen = this.expect(TokenKind.RParen, "Expected ')' after typeof call arguments");
+      if (!rparen) {
+        return null;
+      }
+      expr = {
+        kind: "CallExpression",
+        callee: expr as Identifier,
+        typeArgs: [],
+        args,
+        span: { start: nameToken.span.start, end: rparen.span.end },
+      };
+    }
+    return expr;
+  }
+
+  private parseObjectOrMappedType(): TypeAnnotation | null {
+    const start = this.peek().span.start;
+    if (!this.expect(TokenKind.LBrace, "Expected '{'")) {
+      return null;
+    }
+
+    // Mapped type: { readonly? [K in Type]: Type }
+    if (
+      (this.check(TokenKind.Readonly) && this.checkNext(TokenKind.LBracket)) ||
+      (this.check(TokenKind.LBracket) && this.checkAhead(2, TokenKind.In))
+    ) {
+      const isReadonly = this.match(TokenKind.Readonly);
+      if (!this.expect(TokenKind.LBracket, "Expected '[' in mapped type")) {
+        return null;
+      }
+      const paramToken = this.expect(TokenKind.Identifier, "Expected type parameter in mapped type");
+      if (!paramToken) {
+        return null;
+      }
+      if (!this.expect(TokenKind.In, "Expected 'in' in mapped type")) {
+        return null;
+      }
+      const constraint = this.parseType();
+      if (!constraint) {
+        return null;
+      }
+      if (!this.expect(TokenKind.RBracket, "Expected ']' after mapped type key")) {
+        return null;
+      }
+      if (!this.expect(TokenKind.Colon, "Expected ':' after mapped type key")) {
+        return null;
+      }
+      const valueType = this.parseType();
+      if (!valueType) {
+        return null;
+      }
+      if (!this.expect(TokenKind.Semicolon, "Expected ';' after mapped type member") && !this.check(TokenKind.RBrace)) {
+        // allow missing semicolon before }
+      }
+      this.match(TokenKind.Semicolon);
+      const rbrace = this.expect(TokenKind.RBrace, "Expected '}' after mapped type");
+      if (!rbrace) {
+        return null;
+      }
+      const mapped: MappedType = {
+        kind: "MappedType",
+        readonly: isReadonly,
+        typeParam: { kind: "Identifier", name: paramToken.lexeme, span: paramToken.span },
+        constraint,
+        type: valueType,
+        span: { start, end: rbrace.span.end },
+      };
+      return mapped;
+    }
+
+    const fields: ObjectTypeField[] = [];
+    let indexSignature: ObjectIndexSignature | null = null;
+
+    while (!this.check(TokenKind.RBrace) && !this.isAtEnd()) {
+      if (this.check(TokenKind.LBracket)) {
+        const idxStart = this.peek().span.start;
         this.advance();
-        const nameToken = this.expect(TokenKind.Identifier, "Expected type name after '.'");
-        if (!nameToken) {
+        const keyToken = this.expect(TokenKind.Identifier, "Expected index parameter name");
+        if (!keyToken) {
           return null;
         }
-        namespace = token.lexeme;
-        nameLexeme = nameToken.lexeme;
-        nameEnd = nameToken.span.end;
+        if (!this.expect(TokenKind.Colon, "Expected ':' after index parameter name")) {
+          return null;
+        }
+        const keyType = this.parseType();
+        if (!keyType) {
+          return null;
+        }
+        if (!this.expect(TokenKind.RBracket, "Expected ']' after index key type")) {
+          return null;
+        }
+        if (!this.expect(TokenKind.Colon, "Expected ':' after index signature")) {
+          return null;
+        }
+        const valueType = this.parseType();
+        if (!valueType) {
+          return null;
+        }
+        let end = valueType.span.end;
+        if (this.check(TokenKind.Semicolon)) {
+          end = this.advance().span.end;
+        }
+        indexSignature = {
+          kind: "ObjectIndexSignature",
+          keyName: { kind: "Identifier", name: keyToken.lexeme, span: keyToken.span },
+          keyType,
+          valueType,
+          span: { start: idxStart, end },
+        };
+        continue;
       }
 
-      const typeArgs = this.parseTypeArgumentListInTypePosition();
-      if (typeArgs === null) {
+      const isReadonly = this.match(TokenKind.Readonly);
+      const nameToken = this.expect(TokenKind.Identifier, "Expected property name");
+      if (!nameToken) {
         return null;
       }
-      const end = typeArgs.length > 0 ? this.previous().span.end : nameEnd;
-      type = {
-        kind: "NamedType",
-        namespace,
-        name: nameLexeme,
-        typeArgs,
-        span: { start: token.span.start, end },
-      };
-    }
-
-    while (this.check(TokenKind.LBracket)) {
-      this.advance();
-      const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after '[' in array type");
-      if (!rbracket) {
+      if (!this.expect(TokenKind.Colon, "Expected ':' after property name")) {
         return null;
       }
-      type = {
-        kind: "ArrayType",
-        element: type,
-        span: { start: type.span.start, end: rbracket.span.end },
-      };
+      const typeAnnotation = this.parseType();
+      if (!typeAnnotation) {
+        return null;
+      }
+      const semi = this.expect(TokenKind.Semicolon, "Expected ';' after property");
+      if (!semi) {
+        return null;
+      }
+      fields.push({
+        kind: "ObjectTypeField",
+        readonly: isReadonly,
+        name: { kind: "Identifier", name: nameToken.lexeme, span: nameToken.span },
+        typeAnnotation,
+        span: { start: nameToken.span.start, end: semi.span.end },
+      });
     }
 
-    return type;
+    const rbrace = this.expect(TokenKind.RBrace, "Expected '}' after object type");
+    if (!rbrace) {
+      return null;
+    }
+
+    const objectType: ObjectType = {
+      kind: "ObjectType",
+      fields,
+      indexSignature,
+      span: { start, end: rbrace.span.end },
+    };
+    return objectType;
   }
 
   /**
@@ -2714,6 +3227,7 @@ export class Parser {
         this.check(TokenKind.Enum) ||
         this.check(TokenKind.Class) ||
         this.check(TokenKind.Interface) ||
+        this.check(TokenKind.Type) ||
         this.check(TokenKind.Abstract)
       ) {
         return;

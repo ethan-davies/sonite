@@ -328,6 +328,11 @@ describe("compile pipeline", () => {
         "inheritance.tsn",
         "interfaces.tsn",
         "generics.tsn",
+        "type-aliases.tsn",
+        "unions.tsn",
+        "multi-constraints.tsn",
+        "dictionaries.tsn",
+        "type-operators.tsn",
       ]) {
         const source = readFileSync(join(examplesDir, name), "utf8");
         const result = compile(source);
@@ -1316,6 +1321,152 @@ function main(): void {
     });
     expect(result.success).toBe(false);
     expect(result.diagnostics.some((d) => d.code === "E0307")).toBe(true);
+  });
+});
+
+describe("type aliases and advanced types", () => {
+  it("compiles type aliases and literal unions", () => {
+    const result = compile(`
+      type UserId = i32;
+      type Direction = "north" | "south";
+      function main(): void {
+        let id: UserId = 21;
+        let direction: Direction = "north";
+        print(id);
+        print(direction);
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("define i32 @main()");
+  });
+
+  it("rejects invalid literal assignments", () => {
+    const result = compile(`
+      type Direction = "north" | "south";
+      function main(): void {
+        let direction: Direction = "up";
+      }
+    `);
+    expect(result.success).toBe(false);
+    expect(result.diagnostics.some((d) => d.code === "E0303")).toBe(true);
+  });
+
+  it("narrows unions with typeof", () => {
+    const result = compile(`
+      function getValue(): i32 | string {
+        return "hi";
+      }
+      function main(): void {
+        let value: i32 | string = getValue();
+        if (typeof value == "string") {
+          print(value.length);
+        } else {
+          print(value + 10);
+        }
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("%__Union");
+  });
+
+  it("supports intersection constraints", () => {
+    const result = compile(`
+      interface A { a(): void; }
+      interface B { b(): void; }
+      class C implements A, B {
+        a(): void { print("a"); }
+        b(): void { print("b"); }
+      }
+      function test<T extends A & B>(value: T): void {
+        value.a();
+        value.b();
+      }
+      function main(): void {
+        test(new C());
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("supports index signatures as maps", () => {
+    const result = compile(`
+      interface Dictionary {
+        [key: string]: string;
+      }
+      function main(): void {
+        let d: Dictionary = createMap();
+        d["hello"] = "world";
+        print(d["hello"]);
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("__tsn_map_new");
+    expect(result.ir).toContain("__tsn_map_set");
+    expect(result.ir).toContain("__tsn_map_get");
+  });
+
+  it("expands keyof and conditional types", () => {
+    const result = compile(`
+      type Person = {
+        name: string;
+        age: i32;
+      };
+      type Keys = keyof Person;
+      type Result<T> = T extends string ? string : i32;
+      function main(): void {
+        let k: Keys = "name";
+        let r: Result<string> = "ok";
+        print(k);
+        print(r);
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("expands indexed access, mapped types, and generic alias projections", () => {
+    const result = compile(`
+      type Person = {
+        name: string;
+        age: i32;
+      };
+      type Name = Person["name"];
+      type ReadonlyPerson = {
+        readonly [K in keyof Person]: Person[K];
+      };
+      type ReadonlyName = ReadonlyPerson["name"];
+      type Pair<A, B> = {
+        first: A;
+        second: B;
+      };
+      type First = Pair<string, i32>["first"];
+      function main(): void {
+        let name: Name = "Ada";
+        let ro: ReadonlyName = "Lovelace";
+        let first: First = "hello";
+        print(name);
+        print(ro);
+        print(first);
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("expands typeof createPerson() type queries", () => {
+    const result = compile(`
+      struct Point {
+        x: i32;
+        y: i32;
+      }
+      function createPerson(): Point {
+        return Point { x: 1, y: 2 };
+      }
+      type Person = typeof createPerson();
+      function main(): void {
+        let p: Person = createPerson();
+        print(p.x);
+      }
+    `);
+    expect(result.success).toBe(true);
   });
 });
 

@@ -3,12 +3,18 @@ import type {
   ClassDeclaration,
   ClassField,
   ClassMethod,
+  ConditionalType,
   ConstructorDeclaration,
   Expression,
   FunctionDeclaration,
+  IndexedAccessType,
   InterfaceDeclaration,
   InterfaceMethodSignature,
+  IntersectionType,
+  KeyofType,
+  MappedType,
   NamedType,
+  ObjectType,
   Parameter,
   PrimitiveType,
   Statement,
@@ -17,39 +23,126 @@ import type {
   StructMethod,
   TypeAnnotation,
   TypeParameter,
+  TypeofType,
+  UnionType,
 } from "../ast/nodes.js";
 
 /** Map from type-parameter name → concrete (or further generic) annotation. */
 export type TypeSubst = ReadonlyMap<string, TypeAnnotation>;
 
 export function substituteAnnotation(ann: TypeAnnotation, subst: TypeSubst): TypeAnnotation {
-  if (ann.kind === "PrimitiveType") {
-    return ann;
+  switch (ann.kind) {
+    case "PrimitiveType":
+    case "LiteralType":
+      return ann;
+    case "ArrayType": {
+      const element = substituteAnnotation(ann.element, subst);
+      const result: ArrayType = {
+        kind: "ArrayType",
+        element,
+        span: ann.span,
+      };
+      return result;
+    }
+    case "NamedType": {
+      if (ann.namespace === null && ann.typeArgs.length === 0 && subst.has(ann.name)) {
+        return subst.get(ann.name)!;
+      }
+      if (ann.typeArgs.length === 0) {
+        return ann;
+      }
+      const typeArgs = ann.typeArgs.map((a) => substituteAnnotation(a, subst));
+      const result: NamedType = {
+        kind: "NamedType",
+        namespace: ann.namespace,
+        name: ann.name,
+        typeArgs,
+        span: ann.span,
+      };
+      return result;
+    }
+    case "UnionType": {
+      const result: UnionType = {
+        kind: "UnionType",
+        types: ann.types.map((t) => substituteAnnotation(t, subst)),
+        span: ann.span,
+      };
+      return result;
+    }
+    case "IntersectionType": {
+      const result: IntersectionType = {
+        kind: "IntersectionType",
+        types: ann.types.map((t) => substituteAnnotation(t, subst)),
+        span: ann.span,
+      };
+      return result;
+    }
+    case "ObjectType": {
+      const result: ObjectType = {
+        kind: "ObjectType",
+        fields: ann.fields.map((f) => ({
+          ...f,
+          typeAnnotation: substituteAnnotation(f.typeAnnotation, subst),
+        })),
+        indexSignature: ann.indexSignature
+          ? {
+              ...ann.indexSignature,
+              keyType: substituteAnnotation(ann.indexSignature.keyType, subst),
+              valueType: substituteAnnotation(ann.indexSignature.valueType, subst),
+            }
+          : null,
+        span: ann.span,
+      };
+      return result;
+    }
+    case "KeyofType": {
+      const result: KeyofType = {
+        kind: "KeyofType",
+        type: substituteAnnotation(ann.type, subst),
+        span: ann.span,
+      };
+      return result;
+    }
+    case "TypeofType": {
+      const result: TypeofType = {
+        kind: "TypeofType",
+        expression: substExpression(ann.expression, subst),
+        span: ann.span,
+      };
+      return result;
+    }
+    case "ConditionalType": {
+      const result: ConditionalType = {
+        kind: "ConditionalType",
+        checkType: substituteAnnotation(ann.checkType, subst),
+        extendsType: substituteAnnotation(ann.extendsType, subst),
+        trueType: substituteAnnotation(ann.trueType, subst),
+        falseType: substituteAnnotation(ann.falseType, subst),
+        span: ann.span,
+      };
+      return result;
+    }
+    case "MappedType": {
+      const result: MappedType = {
+        kind: "MappedType",
+        readonly: ann.readonly,
+        typeParam: ann.typeParam,
+        constraint: substituteAnnotation(ann.constraint, subst),
+        type: substituteAnnotation(ann.type, subst),
+        span: ann.span,
+      };
+      return result;
+    }
+    case "IndexedAccessType": {
+      const result: IndexedAccessType = {
+        kind: "IndexedAccessType",
+        objectType: substituteAnnotation(ann.objectType, subst),
+        indexType: substituteAnnotation(ann.indexType, subst),
+        span: ann.span,
+      };
+      return result;
+    }
   }
-  if (ann.kind === "ArrayType") {
-    const element = substituteAnnotation(ann.element, subst);
-    const result: ArrayType = {
-      kind: "ArrayType",
-      element,
-      span: ann.span,
-    };
-    return result;
-  }
-  if (ann.namespace === null && ann.typeArgs.length === 0 && subst.has(ann.name)) {
-    return subst.get(ann.name)!;
-  }
-  if (ann.typeArgs.length === 0) {
-    return ann;
-  }
-  const typeArgs = ann.typeArgs.map((a) => substituteAnnotation(a, subst));
-  const result: NamedType = {
-    kind: "NamedType",
-    namespace: ann.namespace,
-    name: ann.name,
-    typeArgs,
-    span: ann.span,
-  };
-  return result;
 }
 
 export function buildSubst(
@@ -104,6 +197,8 @@ function substExpression(expr: Expression, subst: TypeSubst): Expression {
         right: substExpression(expr.right, subst),
       };
     case "UnaryExpression":
+      return { ...expr, operand: substExpression(expr.operand, subst) };
+    case "TypeofExpression":
       return { ...expr, operand: substExpression(expr.operand, subst) };
     case "IndexExpression":
       return {
@@ -321,6 +416,13 @@ export function specializeInterfaceDecl(
         returnType: substituteAnnotation(m.returnType, subst),
       }),
     ),
+    indexSignature: decl.indexSignature
+      ? {
+          ...decl.indexSignature,
+          keyType: substituteAnnotation(decl.indexSignature.keyType, subst),
+          valueType: substituteAnnotation(decl.indexSignature.valueType, subst),
+        }
+      : null,
     span: decl.span,
   };
 }

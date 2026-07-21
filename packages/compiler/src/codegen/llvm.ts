@@ -22,6 +22,7 @@ import type {
   StructLiteral,
   StructMethod,
   TypeAnnotation,
+  TypeAliasDeclaration,
   UnaryExpression,
   UpdateStatement,
   VariableDeclaration,
@@ -31,6 +32,7 @@ import { mangleSymbol } from "../modules/mangle.js";
 import type { ResolvedModule } from "../modules/resolve.js";
 import {
   isArrayType,
+  isAssignable,
   isClassType,
   isEnumType,
   isInterfaceType,
@@ -40,6 +42,14 @@ import {
   type StructValueType,
   type ValueType,
 } from "../typecheck.js";
+import {
+  isLiteralType,
+  isMapType,
+  isObjectType,
+  isUnionType,
+  typeofTagForType,
+} from "../typecheck-advanced.js";
+import { substituteAnnotation } from "../generics/substitute.js";
 
 interface LocalBinding {
   readonly ptr: string;
@@ -184,6 +194,12 @@ export class LlvmCodegen {
   private needsClassRuntime = false;
   private needsAbort = false;
   private needsSprintf = false;
+  private needsUnionRuntime = false;
+  private needsMapRuntime = false;
+  /** Local type alias expansions (local name → annotation). */
+  private typeAliases = new Map<string, TypeAnnotation>();
+  /** Generic type aliases (local name → declaration) for expanding `Alias<T>` in annotations. */
+  private genericTypeAliases = new Map<string, TypeAliasDeclaration>();
   private readonly functionBodies: string[] = [];
   private readonly globalDefs: string[] = [];
   private readonly loopStack: LoopContext[] = [];
@@ -229,6 +245,10 @@ export class LlvmCodegen {
     this.needsClassRuntime = false;
     this.needsAbort = false;
     this.needsSprintf = false;
+    this.needsUnionRuntime = false;
+    this.needsMapRuntime = false;
+    this.typeAliases = new Map();
+    this.genericTypeAliases = new Map();
     this.functionBodies.length = 0;
     this.globalDefs.length = 0;
     this.loopStack.length = 0;
@@ -258,6 +278,16 @@ export class LlvmCodegen {
         if (decl.kind === "EnumDeclaration") {
           const info = this.registerEnum(decl, mod.moduleId);
           localEnums.set(decl.name.name, info);
+        }
+      }
+
+      for (const decl of mod.ast.body) {
+        if (decl.kind === "TypeAliasDeclaration") {
+          if (decl.typeParams.length === 0) {
+            this.typeAliases.set(decl.name.name, decl.type);
+          } else {
+            this.genericTypeAliases.set(decl.name.name, decl);
+          }
         }
       }
 
@@ -549,13 +579,25 @@ export class LlvmCodegen {
     const structTypeLines = this.emitStructTypeDefs();
     const interfaceTypeLines = this.emitInterfaceTypeDefs();
     const classTypeLines = this.emitClassTypeDefs();
-    const typeLines = [...structTypeLines, ...interfaceTypeLines, ...classTypeLines];
+    const unionTypeLines = this.needsUnionRuntime ? ["%__Union = type { i32, ptr }"] : [];
+    const typeLines = [
+      ...structTypeLines,
+      ...interfaceTypeLines,
+      ...classTypeLines,
+      ...unionTypeLines,
+    ];
     const globalLines = [...this.globalDefs, ...this.emitStringGlobals()];
     const declares: string[] = [];
     if (this.needsPrintf) {
       declares.push("declare i32 @printf(ptr noundef, ...) nounwind");
     }
-    if (this.needsStringRuntime || this.needsArrayRuntime || this.needsClassRuntime) {
+    if (
+      this.needsStringRuntime ||
+      this.needsArrayRuntime ||
+      this.needsClassRuntime ||
+      this.needsUnionRuntime ||
+      this.needsMapRuntime
+    ) {
       declares.push("declare ptr @malloc(i64 noundef) nounwind");
     }
     if (this.needsStringRuntime) {
@@ -563,7 +605,7 @@ export class LlvmCodegen {
       declares.push("declare ptr @strcpy(ptr noundef, ptr noundef) nounwind");
       declares.push("declare ptr @strcat(ptr noundef, ptr noundef) nounwind");
     }
-    if (this.needsArrayRuntime) {
+    if (this.needsArrayRuntime || this.needsMapRuntime) {
       declares.push("declare ptr @realloc(ptr noundef, i64 noundef) nounwind");
     }
     if (this.needsSprintf) {
@@ -572,6 +614,14 @@ export class LlvmCodegen {
     if (this.needsAbort) {
       declares.push("declare void @abort() noreturn nounwind");
     }
+    if (this.needsMapRuntime) {
+      declares.push(...this.emitMapRuntimeDecls());
+    }
+
+    const runtimeFns = [
+      ...(this.needsUnionRuntime ? this.emitUnionRuntimeFns() : []),
+      ...(this.needsMapRuntime ? this.emitMapRuntimeFns() : []),
+    ];
 
     return [
       "; ModuleID = 'typescript-native'",
@@ -583,6 +633,8 @@ export class LlvmCodegen {
       globalLines.length > 0 ? "" : null,
       ...declares,
       declares.length > 0 ? "" : null,
+      ...runtimeFns,
+      runtimeFns.length > 0 ? "" : null,
       ...this.functionBodies,
       "",
     ]
@@ -1000,71 +1052,328 @@ export class LlvmCodegen {
     localInterfaces: Map<string, InterfaceInfo>,
     namespaces: Map<string, NamespaceInfo>,
   ): ValueType | null {
-    if (ann.kind === "PrimitiveType") {
-      if (ann.name === "void") {
-        return null;
-      }
-      return ann.name;
-    }
-    if (ann.kind === "NamedType") {
-      if (ann.typeArgs.length > 0) {
-        throw new Error(
-          `Codegen: unexpected type arguments on '${ann.name}' (monomorphize should have removed them)`,
-        );
-      }
-      if (ann.namespace) {
-        const ns = namespaces.get(ann.namespace);
-        if (!ns) {
+    switch (ann.kind) {
+      case "PrimitiveType":
+        if (ann.name === "void") {
           return null;
         }
-        const enumInfo = ns.enums.get(ann.name);
+        return ann.name;
+      case "ArrayType": {
+        const element = this.resolveAnnotationInModule(
+          ann.element,
+          localStructs,
+          localEnums,
+          localClasses,
+          localInterfaces,
+          namespaces,
+        );
+        if (element === null) {
+          return null;
+        }
+        return { kind: "array", element };
+      }
+      case "UnionType": {
+        const arms: ValueType[] = [];
+        for (const t of ann.types) {
+          const vt = this.resolveAnnotationInModule(
+            t,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          if (vt === null) {
+            return null;
+          }
+          arms.push(vt);
+        }
+        if (arms.every((a) => isLiteralType(a) && a.literalKind === "string")) {
+          return "string";
+        }
+        if (arms.every((a) => isLiteralType(a) && a.literalKind === "number")) {
+          return "i32";
+        }
+        return { kind: "union", arms };
+      }
+      case "IntersectionType": {
+        // Prefer first object/struct-like arm for lowering
+        for (const t of ann.types) {
+          const vt = this.resolveAnnotationInModule(
+            t,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          if (vt && typeof vt === "object" && (vt.kind === "object" || vt.kind === "struct")) {
+            return vt;
+          }
+        }
+        const arms: ValueType[] = [];
+        for (const t of ann.types) {
+          const vt = this.resolveAnnotationInModule(
+            t,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          if (vt === null) {
+            return null;
+          }
+          arms.push(vt);
+        }
+        return { kind: "intersection", arms };
+      }
+      case "LiteralType":
+        return { kind: "literal", value: ann.value, literalKind: ann.literalKind };
+      case "ObjectType": {
+        // Lower to named struct if registered, else treat as object with mangled name
+        const fieldNames = ann.fields.map((f) => f.name.name).join("_");
+        const name = `Obj__${fieldNames || "empty"}`;
+        const existing = localStructs.get(name);
+        if (existing) {
+          return { kind: "struct", name: existing.name };
+        }
+        const fields = [];
+        for (const f of ann.fields) {
+          const ft = this.resolveAnnotationInModule(
+            f.typeAnnotation,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          if (ft === null) {
+            return null;
+          }
+          fields.push({ name: f.name.name, type: ft, readonly: f.readonly });
+        }
+        let indexType: ValueType | null = null;
+        if (ann.indexSignature) {
+          indexType = this.resolveAnnotationInModule(
+            ann.indexSignature.valueType,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+        }
+        if (fields.length === 0 && indexType) {
+          return { kind: "map", valueType: indexType };
+        }
+        return { kind: "object", name, fields, indexType };
+      }
+      case "KeyofType":
+      case "TypeofType":
+      case "ConditionalType":
+      case "MappedType":
+      case "IndexedAccessType": {
+        // Expand type-level operators using the same rules as typecheck where possible.
+        if (ann.kind === "KeyofType") {
+          const inner = this.resolveAnnotationInModule(
+            ann.type,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          if (inner && isObjectType(inner)) {
+            const arms = inner.fields.map((f) => ({
+              kind: "literal" as const,
+              value: f.name,
+              literalKind: "string" as const,
+            }));
+            if (arms.length === 0) {
+              return "string";
+            }
+            if (arms.length === 1) {
+              return arms[0]!;
+            }
+            // Same lowering as string-literal UnionType annotations.
+            return "string";
+          }
+          if (inner && isStructType(inner)) {
+            const info = [...localStructs.values()].find((s) => s.name === inner.name);
+            if (info) {
+              const arms = info.fields.map((f) => ({
+                kind: "literal" as const,
+                value: f.name,
+                literalKind: "string" as const,
+              }));
+              if (arms.length === 0) {
+                return "string";
+              }
+              if (arms.length === 1) {
+                return arms[0]!;
+              }
+              return "string";
+            }
+          }
+          return "string";
+        }
+        if (ann.kind === "TypeofType") {
+          if (ann.expression.kind === "CallExpression" && ann.expression.callee.kind === "Identifier") {
+            const sig = this.localFunctions.get(ann.expression.callee.name);
+            if (sig && sig.returnType !== "void") {
+              return sig.returnType;
+            }
+          }
+          return "i32";
+        }
+        if (ann.kind === "ConditionalType") {
+          const check = this.resolveAnnotationInModule(
+            ann.checkType,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          const ext = this.resolveAnnotationInModule(
+            ann.extendsType,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          const branch =
+            check && ext && isAssignable(check, ext) ? ann.trueType : ann.falseType;
+          return this.resolveAnnotationInModule(
+            branch,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+        }
+        if (ann.kind === "MappedType") {
+          return {
+            kind: "object",
+            name: "Mapped",
+            fields: [],
+            indexType: null,
+          };
+        }
+        // IndexedAccessType
+        const obj = this.resolveAnnotationInModule(
+          ann.objectType,
+          localStructs,
+          localEnums,
+          localClasses,
+          localInterfaces,
+          namespaces,
+        );
+        const idx = this.resolveAnnotationInModule(
+          ann.indexType,
+          localStructs,
+          localEnums,
+          localClasses,
+          localInterfaces,
+          namespaces,
+        );
+        if (obj && isObjectType(obj) && idx && isLiteralType(idx) && idx.literalKind === "string") {
+          const field = obj.fields.find((f) => f.name === String(idx.value));
+          return (field?.type as ValueType) ?? null;
+        }
+        return null;
+      }
+      case "NamedType": {
+        if (ann.typeArgs.length > 0) {
+          const generic = this.genericTypeAliases.get(ann.name);
+          if (generic && generic.typeParams.length === ann.typeArgs.length) {
+            const subst = new Map(
+              generic.typeParams.map((tp, i) => [tp.name.name, ann.typeArgs[i]!]),
+            );
+            return this.resolveAnnotationInModule(
+              substituteAnnotation(generic.type, subst),
+              localStructs,
+              localEnums,
+              localClasses,
+              localInterfaces,
+              namespaces,
+            );
+          }
+          throw new Error(
+            `Codegen: unexpected type arguments on '${ann.name}' (monomorphize should have removed them)`,
+          );
+        }
+        if (ann.namespace) {
+          const ns = namespaces.get(ann.namespace);
+          if (!ns) {
+            return null;
+          }
+          const enumInfo = ns.enums.get(ann.name);
+          if (enumInfo) {
+            return { kind: "enum", name: enumInfo.name };
+          }
+          const structInfo = ns.structs.get(ann.name);
+          if (structInfo) {
+            return { kind: "struct", name: structInfo.name };
+          }
+          const classInfo = ns.classes.get(ann.name);
+          if (classInfo) {
+            return { kind: "class", name: classInfo.name };
+          }
+          const ifaceInfo = ns.interfaces.get(ann.name);
+          if (ifaceInfo) {
+            return this.interfaceToValueType(
+              ifaceInfo,
+              localStructs,
+              localEnums,
+              localClasses,
+              localInterfaces,
+              namespaces,
+            );
+          }
+          return null;
+        }
+        const enumInfo = localEnums.get(ann.name);
         if (enumInfo) {
           return { kind: "enum", name: enumInfo.name };
         }
-        const structInfo = ns.structs.get(ann.name);
+        const structInfo = localStructs.get(ann.name);
         if (structInfo) {
           return { kind: "struct", name: structInfo.name };
         }
-        const classInfo = ns.classes.get(ann.name);
+        const classInfo = localClasses.get(ann.name);
         if (classInfo) {
           return { kind: "class", name: classInfo.name };
         }
-        const ifaceInfo = ns.interfaces.get(ann.name);
+        const ifaceInfo = localInterfaces.get(ann.name);
         if (ifaceInfo) {
-          return { kind: "interface", name: ifaceInfo.name };
+          return this.interfaceToValueType(
+            ifaceInfo,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+        }
+        // Type alias
+        const alias = this.typeAliases.get(ann.name);
+        if (alias) {
+          return this.resolveAnnotationInModule(
+            alias,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
         }
         return null;
       }
-      const enumInfo = localEnums.get(ann.name);
-      if (enumInfo) {
-        return { kind: "enum", name: enumInfo.name };
-      }
-      const structInfo = localStructs.get(ann.name);
-      if (structInfo) {
-        return { kind: "struct", name: structInfo.name };
-      }
-      const classInfo = localClasses.get(ann.name);
-      if (classInfo) {
-        return { kind: "class", name: classInfo.name };
-      }
-      const ifaceInfo = localInterfaces.get(ann.name);
-      if (ifaceInfo) {
-        return { kind: "interface", name: ifaceInfo.name };
-      }
-      return null;
     }
-    const element = this.resolveAnnotationInModule(
-      ann.element,
-      localStructs,
-      localEnums,
-      localClasses,
-      localInterfaces,
-      namespaces,
-    );
-    if (element === null) {
-      return null;
-    }
-    return { kind: "array", element };
   }
 
   private emitStructTypeDefs(): string[] {
@@ -1240,7 +1549,215 @@ export class LlvmCodegen {
       return { llvm: fat, type: expected };
     }
 
+    // Box into union — but homogeneous literal unions lower as string/i32, not %__Union
+    if (isUnionType(expected) && !isUnionType(value.type)) {
+      if (expected.arms.every((a) => isLiteralType(a) && a.literalKind === "string")) {
+        if (
+          value.type === "string" ||
+          (isLiteralType(value.type) && value.type.literalKind === "string")
+        ) {
+          return { llvm: value.llvm, type: expected };
+        }
+      }
+      if (expected.arms.every((a) => isLiteralType(a) && a.literalKind === "number")) {
+        if (
+          value.type === "i32" ||
+          value.type === "i64" ||
+          (isLiteralType(value.type) && value.type.literalKind === "number")
+        ) {
+          return { llvm: value.llvm, type: expected };
+        }
+      }
+      return this.boxUnion(value, expected, lines);
+    }
+
+    // Unbox from union when expected is a concrete arm
+    if (isUnionType(value.type) && !isUnionType(expected)) {
+      return this.unboxUnion(value, expected, lines);
+    }
+
+    // Literal → base
+    if (isLiteralType(value.type)) {
+      if (value.type.literalKind === "string" && expected === "string") {
+        return { llvm: value.llvm, type: "string" };
+      }
+      if (value.type.literalKind === "number" && (expected === "i32" || expected === "i64")) {
+        return { llvm: value.llvm, type: expected };
+      }
+    }
+
     return value;
+  }
+
+  private unionTagForType(type: ValueType): number {
+    const tag = typeofTagForType(type);
+    if (tag === "string") {
+      return 0;
+    }
+    if (tag === "number") {
+      return 1;
+    }
+    if (tag === "boolean") {
+      return 2;
+    }
+    return 3;
+  }
+
+  private boxUnion(value: EmittedValue, expected: ValueType, lines: string[]): EmittedValue {
+    this.needsUnionRuntime = true;
+    const tag = this.unionTagForType(value.type);
+    // Store payload on heap
+    const payloadSize = 8;
+    const raw = this.nextTemp();
+    lines.push(`  ${raw} = call ptr @malloc(i64 ${payloadSize})`);
+    if (value.type === "string" || (typeof value.type === "object" && (value.type.kind === "array" || value.type.kind === "class" || value.type.kind === "map"))) {
+      lines.push(`  store ptr ${value.llvm}, ptr ${raw}`);
+    } else if (value.type === "i32" || value.type === "bool" || value.type === "char" || (isLiteralType(value.type) && value.type.literalKind === "number")) {
+      const asI32 =
+        value.type === "bool"
+          ? (() => {
+              const t = this.nextTemp();
+              lines.push(`  ${t} = zext i1 ${value.llvm} to i32`);
+              return t;
+            })()
+          : value.llvm;
+      lines.push(`  store i32 ${asI32}, ptr ${raw}`);
+    } else if (value.type === "i64") {
+      lines.push(`  store i64 ${value.llvm}, ptr ${raw}`);
+    } else if (value.type === "f64") {
+      lines.push(`  store double ${value.llvm}, ptr ${raw}`);
+    } else if (value.type === "f32") {
+      lines.push(`  store float ${value.llvm}, ptr ${raw}`);
+    } else {
+      // Fallback: store as ptr-sized bitcast via alloca
+      lines.push(`  store ptr ${value.llvm}, ptr ${raw}`);
+    }
+    const undef = this.nextTemp();
+    lines.push(`  ${undef} = insertvalue %__Union undef, i32 ${tag}, 0`);
+    const boxed = this.nextTemp();
+    lines.push(`  ${boxed} = insertvalue %__Union ${undef}, ptr ${raw}, 1`);
+    return { llvm: boxed, type: expected };
+  }
+
+  private unboxUnion(value: EmittedValue, expected: ValueType, lines: string[]): EmittedValue {
+    this.needsUnionRuntime = true;
+    const payload = this.nextTemp();
+    lines.push(`  ${payload} = extractvalue %__Union ${value.llvm}, 1`);
+    if (expected === "string" || (typeof expected === "object" && (expected.kind === "array" || expected.kind === "class" || expected.kind === "map"))) {
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load ptr, ptr ${payload}`);
+      return { llvm: loaded, type: expected };
+    }
+    if (expected === "i32" || expected === "char" || (isLiteralType(expected) && expected.literalKind === "number")) {
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load i32, ptr ${payload}`);
+      return { llvm: loaded, type: expected === "char" ? "char" : "i32" };
+    }
+    if (expected === "bool") {
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load i32, ptr ${payload}`);
+      const asBool = this.nextTemp();
+      lines.push(`  ${asBool} = icmp ne i32 ${loaded}, 0`);
+      return { llvm: asBool, type: "bool" };
+    }
+    if (expected === "i64") {
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load i64, ptr ${payload}`);
+      return { llvm: loaded, type: "i64" };
+    }
+    if (expected === "f64") {
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load double, ptr ${payload}`);
+      return { llvm: loaded, type: "f64" };
+    }
+    if (expected === "f32") {
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load float, ptr ${payload}`);
+      return { llvm: loaded, type: "f32" };
+    }
+    const loaded = this.nextTemp();
+    lines.push(`  ${loaded} = load ptr, ptr ${payload}`);
+    return { llvm: loaded, type: expected };
+  }
+
+  private emitUnionRuntimeFns(): string[] {
+    // No separate helpers needed — boxing is inline
+    return [];
+  }
+
+  private emitMapRuntimeDecls(): string[] {
+    return [];
+  }
+
+  /** Simple open-addressing string→ptr map runtime (inline IR functions). */
+  private emitMapRuntimeFns(): string[] {
+    // Map header: { i64 len, i64 cap, ptr keys, ptr vals } — keys/vals are ptr arrays
+    return [
+      "define ptr @__tsn_map_new() {",
+      "entry:",
+      "  %m = call ptr @malloc(i64 32)",
+      "  %lp = getelementptr inbounds i64, ptr %m, i64 0",
+      "  store i64 0, ptr %lp",
+      "  %cp = getelementptr inbounds i64, ptr %m, i64 1",
+      "  store i64 8, ptr %cp",
+      "  %keys = call ptr @malloc(i64 64)",
+      "  %vals = call ptr @malloc(i64 64)",
+      "  %kp = getelementptr inbounds ptr, ptr %m, i64 2",
+      "  store ptr %keys, ptr %kp",
+      "  %vp = getelementptr inbounds ptr, ptr %m, i64 3",
+      "  store ptr %vals, ptr %vp",
+      "  ret ptr %m",
+      "}",
+      "",
+      "define void @__tsn_map_set(ptr %m, ptr %key, ptr %val) {",
+      "entry:",
+      "  %lp = getelementptr inbounds i64, ptr %m, i64 0",
+      "  %len = load i64, ptr %lp",
+      "  %kp = getelementptr inbounds ptr, ptr %m, i64 2",
+      "  %keys = load ptr, ptr %kp",
+      "  %vp = getelementptr inbounds ptr, ptr %m, i64 3",
+      "  %vals = load ptr, ptr %vp",
+      "  %slotk = getelementptr inbounds ptr, ptr %keys, i64 %len",
+      "  store ptr %key, ptr %slotk",
+      "  %slotv = getelementptr inbounds ptr, ptr %vals, i64 %len",
+      "  store ptr %val, ptr %slotv",
+      "  %nlen = add i64 %len, 1",
+      "  store i64 %nlen, ptr %lp",
+      "  ret void",
+      "}",
+      "",
+      "define ptr @__tsn_map_get(ptr %m, ptr %key) {",
+      "entry:",
+      "  %lp = getelementptr inbounds i64, ptr %m, i64 0",
+      "  %len = load i64, ptr %lp",
+      "  %kp = getelementptr inbounds ptr, ptr %m, i64 2",
+      "  %keys = load ptr, ptr %kp",
+      "  %vp = getelementptr inbounds ptr, ptr %m, i64 3",
+      "  %vals = load ptr, ptr %vp",
+      "  br label %loop",
+      "loop:",
+      "  %i = phi i64 [ 0, %entry ], [ %inext, %cont ]",
+      "  %cmp = icmp ult i64 %i, %len",
+      "  br i1 %cmp, label %body, label %miss",
+      "body:",
+      "  %sk = getelementptr inbounds ptr, ptr %keys, i64 %i",
+      "  %k = load ptr, ptr %sk",
+      "  %eq = call i32 @strcmp(ptr %k, ptr %key)",
+      "  %ok = icmp eq i32 %eq, 0",
+      "  br i1 %ok, label %hit, label %cont",
+      "hit:",
+      "  %sv = getelementptr inbounds ptr, ptr %vals, i64 %i",
+      "  %v = load ptr, ptr %sv",
+      "  ret ptr %v",
+      "cont:",
+      "  %inext = add i64 %i, 1",
+      "  br label %loop",
+      "miss:",
+      "  ret ptr null",
+      "}",
+      "",
+      "declare i32 @strcmp(ptr, ptr) nounwind",
+    ];
   }
 
   private emitStructMethod(struct: StructInfo, method: StructMethodInfo): void {
@@ -1804,6 +2321,21 @@ export class LlvmCodegen {
 
     // Index assignment
     const object = this.emitExpression(stmt.target.object, lines);
+    if (isMapType(object.type) || (isObjectType(object.type) && object.type.indexType)) {
+      this.needsMapRuntime = true;
+      if (stmt.operator !== "=") {
+        throw new Error("Codegen: compound assign on map element");
+      }
+      const index = this.emitExpression(stmt.target.index, lines, "string");
+      const valueType = (
+        isMapType(object.type) ? object.type.valueType : object.type.indexType
+      ) as ValueType;
+      const value = this.emitExpression(stmt.value, lines, valueType);
+      lines.push(
+        `  call void @__tsn_map_set(ptr ${object.llvm}, ptr ${index.llvm}, ptr ${value.llvm})`,
+      );
+      return;
+    }
     if (!isArrayType(object.type)) {
       throw new Error("Codegen: index assign on non-array");
     }
@@ -1887,6 +2419,10 @@ export class LlvmCodegen {
       this.emitPrintCall(call, lines);
       return;
     }
+    if (call.callee.name === "createMap") {
+      this.emitCreateMap(lines);
+      return;
+    }
     this.emitUserCall(call, lines, true);
   }
 
@@ -1965,15 +2501,22 @@ export class LlvmCodegen {
       }
       case "SuperExpression":
         throw new Error("Codegen: super used as value");
+      case "TypeofExpression":
+        return "string";
       case "IndexExpression": {
         const objectType = this.inferExpressionType(expr.object);
+        if (isMapType(objectType)) {
+          return objectType.valueType as ValueType;
+        }
+        if (isObjectType(objectType) && objectType.indexType) {
+          return objectType.indexType as ValueType;
+        }
         if (!isArrayType(objectType)) {
           throw new Error("Codegen: index into non-array");
         }
         return objectType.element;
       }
       case "MemberExpression": {
-        // ns.Enum.Variant
         if (
           expr.object.kind === "MemberExpression" &&
           expr.object.object.kind === "Identifier" &&
@@ -2003,6 +2546,13 @@ export class LlvmCodegen {
           }
         }
         const objectType = this.inferExpressionType(expr.object);
+        if (isObjectType(objectType)) {
+          const field = objectType.fields.find((f) => f.name === expr.property.name);
+          if (!field) {
+            throw new Error(`Codegen: unknown field '${expr.property.name}'`);
+          }
+          return field.type as ValueType;
+        }
         if (isStructType(objectType)) {
           const def = this.structs.get(objectType.name);
           if (!def) {
@@ -2120,6 +2670,9 @@ export class LlvmCodegen {
         }
         const sig = this.localFunctions.get(expr.callee.name);
         if (!sig || sig.returnType === "void") {
+          if (expr.callee.name === "createMap") {
+            return { kind: "map", valueType: "string" };
+          }
           throw new Error(`Codegen: unexpected call in type inference '${expr.callee.name}'`);
         }
         return sig.returnType;
@@ -2178,8 +2731,70 @@ export class LlvmCodegen {
       }
       case "SuperExpression":
         throw new Error("Codegen: super used as value");
+      case "TypeofExpression": {
+        const operand = this.emitExpression(expr.operand, lines);
+        this.needsStringRuntime = true;
+        let tagNum = 3;
+        if (isUnionType(operand.type)) {
+          this.needsUnionRuntime = true;
+          const tag = this.nextTemp();
+          lines.push(`  ${tag} = extractvalue %__Union ${operand.llvm}, 0`);
+          // Map tag to string via comparisons
+          const isStr = this.nextTemp();
+          lines.push(`  ${isStr} = icmp eq i32 ${tag}, 0`);
+          const isNum = this.nextTemp();
+          lines.push(`  ${isNum} = icmp eq i32 ${tag}, 1`);
+          const isBool = this.nextTemp();
+          lines.push(`  ${isBool} = icmp eq i32 ${tag}, 2`);
+          const strG = this.internString("string");
+          const numG = this.internString("number");
+          const boolG = this.internString("boolean");
+          const objG = this.internString("object");
+          const strPtr = this.nextTemp();
+          lines.push(
+            `  ${strPtr} = getelementptr inbounds [${strG.length} x i8], ptr @${strG.name}, i64 0, i64 0`,
+          );
+          const numPtr = this.nextTemp();
+          lines.push(
+            `  ${numPtr} = getelementptr inbounds [${numG.length} x i8], ptr @${numG.name}, i64 0, i64 0`,
+          );
+          const boolPtr = this.nextTemp();
+          lines.push(
+            `  ${boolPtr} = getelementptr inbounds [${boolG.length} x i8], ptr @${boolG.name}, i64 0, i64 0`,
+          );
+          const objPtr = this.nextTemp();
+          lines.push(
+            `  ${objPtr} = getelementptr inbounds [${objG.length} x i8], ptr @${objG.name}, i64 0, i64 0`,
+          );
+          const sel1 = this.nextTemp();
+          lines.push(`  ${sel1} = select i1 ${isBool}, ptr ${boolPtr}, ptr ${objPtr}`);
+          const sel2 = this.nextTemp();
+          lines.push(`  ${sel2} = select i1 ${isNum}, ptr ${numPtr}, ptr ${sel1}`);
+          const sel3 = this.nextTemp();
+          lines.push(`  ${sel3} = select i1 ${isStr}, ptr ${strPtr}, ptr ${sel2}`);
+          return { llvm: sel3, type: "string" };
+        }
+        const tagName = typeofTagForType(operand.type) ?? "object";
+        const global = this.internString(tagName);
+        const tmp = this.nextTemp();
+        lines.push(
+          `  ${tmp} = getelementptr inbounds [${global.length} x i8], ptr @${global.name}, i64 0, i64 0`,
+        );
+        void tagNum;
+        return { llvm: tmp, type: "string" };
+      }
       case "IndexExpression": {
         const object = this.emitExpression(expr.object, lines);
+        if (isMapType(object.type) || (isObjectType(object.type) && object.type.indexType)) {
+          this.needsMapRuntime = true;
+          const index = this.emitExpression(expr.index, lines, "string");
+          const result = this.nextTemp();
+          lines.push(`  ${result} = call ptr @__tsn_map_get(ptr ${object.llvm}, ptr ${index.llvm})`);
+          const valueType = isMapType(object.type)
+            ? (object.type.valueType as ValueType)
+            : (object.type.indexType as ValueType);
+          return { llvm: result, type: valueType };
+        }
         if (!isArrayType(object.type)) {
           throw new Error("Codegen: index into non-array");
         }
@@ -2241,7 +2856,19 @@ export class LlvmCodegen {
         if (expr.property.name !== "length") {
           throw new Error(`Codegen: unknown property '${expr.property.name}'`);
         }
+        // Prefer string length when object may be a union (post-narrowing)
         const object = this.emitExpression(expr.object, lines);
+        if (object.type === "string" || isUnionType(object.type)) {
+          this.needsStringRuntime = true;
+          const asString = isUnionType(object.type)
+            ? this.unboxUnion(object, "string", lines)
+            : object;
+          const len64 = this.nextTemp();
+          lines.push(`  ${len64} = call i64 @strlen(ptr ${asString.llvm})`);
+          const len32 = this.nextTemp();
+          lines.push(`  ${len32} = trunc i64 ${len64} to i32`);
+          return { llvm: len32, type: "i32" };
+        }
         if (!isArrayType(object.type)) {
           throw new Error("Codegen: .length on non-array");
         }
@@ -2272,8 +2899,36 @@ export class LlvmCodegen {
           }
           return this.emitMethodCall(expr, lines, false);
         }
+        if (expr.callee.name === "createMap") {
+          return this.emitCreateMap(lines, expected);
+        }
         return this.emitUserCall(expr, lines, false);
     }
+  }
+
+  private interfaceToValueType(
+    ifaceInfo: InterfaceInfo,
+    localStructs: Map<string, StructInfo>,
+    localEnums: Map<string, EnumInfo>,
+    localClasses: Map<string, ClassInfo>,
+    localInterfaces: Map<string, InterfaceInfo>,
+    namespaces: Map<string, NamespaceInfo>,
+  ): ValueType | null {
+    const indexSig = ifaceInfo.decl.indexSignature;
+    if (indexSig && ifaceInfo.methods.length === 0 && ifaceInfo.decl.methods.length === 0) {
+      const valueType = this.resolveAnnotationInModule(
+        indexSig.valueType,
+        localStructs,
+        localEnums,
+        localClasses,
+        localInterfaces,
+        namespaces,
+      );
+      if (valueType) {
+        return { kind: "map", valueType };
+      }
+    }
+    return { kind: "interface", name: ifaceInfo.name };
   }
 
   private lookupStruct(namespace: string | null, name: string): StructInfo | undefined {
@@ -2968,8 +3623,18 @@ export class LlvmCodegen {
       }
     }
 
-    const left = this.emitExpression(expr.left, lines);
-    const right = this.emitExpression(expr.right, lines, left.type);
+    let left = this.emitExpression(expr.left, lines);
+    let right = this.emitExpression(expr.right, lines);
+    if (isUnionType(left.type) && !isUnionType(right.type)) {
+      left = this.unboxUnion(left, right.type, lines);
+    } else if (!isUnionType(left.type) && isUnionType(right.type)) {
+      right = this.unboxUnion(right, left.type, lines);
+    } else if (isUnionType(left.type) && isUnionType(right.type)) {
+      left = this.unboxUnion(left, "i32", lines);
+      right = this.unboxUnion(right, "i32", lines);
+    } else {
+      right = this.coerceValue(right, left.type, lines);
+    }
     const llvmType = toLlvmType(left.type);
     const tmp = this.nextTemp();
 
@@ -3011,7 +3676,6 @@ export class LlvmCodegen {
       default:
         throw new Error(`Codegen: unexpected arithmetic operator '${expr.operator}'`);
     }
-
     lines.push(`  ${tmp} = ${opcode} ${llvmType} ${left.llvm}, ${right.llvm}`);
     return { llvm: tmp, type: left.type };
   }
@@ -3046,6 +3710,19 @@ export class LlvmCodegen {
     lines.push(`  call ptr @strcat(ptr noundef ${buf}, ptr noundef ${right.llvm})`);
 
     return { llvm: buf, type: "string" };
+  }
+
+  private emitCreateMap(lines: string[], expected?: ValueType): EmittedValue {
+    this.needsMapRuntime = true;
+    const tmp = this.nextTemp();
+    lines.push(`  ${tmp} = call ptr @__tsn_map_new()`);
+    if (expected && isMapType(expected)) {
+      return { llvm: tmp, type: expected };
+    }
+    if (expected && isObjectType(expected) && expected.indexType) {
+      return { llvm: tmp, type: { kind: "map", valueType: expected.indexType } };
+    }
+    return { llvm: tmp, type: { kind: "map", valueType: "string" } };
   }
 
   private emitUserCall(
@@ -3431,11 +4108,34 @@ function toLlvmType(type: ValueType | "void"): string {
     return "void";
   }
   if (typeof type === "object") {
-    if (type.kind === "struct" || type.kind === "interface") {
+    if (type.kind === "struct" || type.kind === "interface" || type.kind === "object") {
       return `%${type.name}`;
     }
     if (type.kind === "enum") {
       return "i32";
+    }
+    if (type.kind === "union") {
+      if (type.arms.every((a) => isLiteralType(a) && a.literalKind === "string")) {
+        return "ptr";
+      }
+      if (type.arms.every((a) => isLiteralType(a) && a.literalKind === "number")) {
+        return "i32";
+      }
+      return "%__Union";
+    }
+    if (type.kind === "literal") {
+      return type.literalKind === "string" ? "ptr" : "i32";
+    }
+    if (type.kind === "map") {
+      return "ptr";
+    }
+    if (type.kind === "intersection") {
+      for (const arm of type.arms) {
+        if (typeof arm === "object" && (arm.kind === "object" || arm.kind === "struct")) {
+          return toLlvmType(arm as ValueType);
+        }
+      }
+      return "ptr";
     }
     // class and array are pointers
     return "ptr";
@@ -3463,8 +4163,11 @@ function zeroInitializer(type: ValueType): string {
     if (type.kind === "enum") {
       return "0";
     }
-    if (type.kind === "struct" || type.kind === "interface") {
+    if (type.kind === "struct" || type.kind === "interface" || type.kind === "object" || type.kind === "union") {
       return "zeroinitializer";
+    }
+    if (type.kind === "literal") {
+      return type.literalKind === "string" ? "null" : "0";
     }
     return "null";
   }
@@ -3474,6 +4177,7 @@ function zeroInitializer(type: ValueType): string {
     case "char":
       return "0";
     case "f32":
+      return "0.0";
     case "f64":
       return "0.0";
     case "bool":
@@ -3602,6 +4306,17 @@ function printfSpecifier(type: ValueType): string {
     if (type.kind === "enum") {
       return "%d";
     }
+    if (type.kind === "literal") {
+      return type.literalKind === "string" ? "%s" : "%d";
+    }
+    if (type.kind === "union") {
+      if (type.arms.every((a) => isLiteralType(a) && a.literalKind === "string")) {
+        return "%s";
+      }
+      if (type.arms.every((a) => isLiteralType(a) && a.literalKind === "number")) {
+        return "%d";
+      }
+    }
     throw new Error(`Codegen: cannot print ${type.kind}`);
   }
   switch (type) {
@@ -3625,6 +4340,17 @@ function printfArgType(type: ValueType): string {
   if (typeof type === "object") {
     if (type.kind === "enum") {
       return "i32";
+    }
+    if (type.kind === "literal") {
+      return type.literalKind === "string" ? "ptr" : "i32";
+    }
+    if (type.kind === "union") {
+      if (type.arms.every((a) => isLiteralType(a) && a.literalKind === "string")) {
+        return "ptr";
+      }
+      if (type.arms.every((a) => isLiteralType(a) && a.literalKind === "number")) {
+        return "i32";
+      }
     }
     throw new Error(`Codegen: cannot print ${type.kind}`);
   }

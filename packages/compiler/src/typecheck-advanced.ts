@@ -8,6 +8,7 @@ import type { DiagnosticCollector, SourceSpan } from "./diagnostics/diagnostic.j
 export type BaseValueType =
   | string
   | { readonly kind: "array"; readonly element: ExtendedValueType }
+  | { readonly kind: "tuple"; readonly elements: readonly ExtendedValueType[] }
   | { readonly kind: "struct" | "class" | "interface" | "enum"; readonly name: string }
   | {
       readonly kind: "typeParam";
@@ -83,6 +84,12 @@ export function isLiteralType(type: ExtendedValueType): type is LiteralValueType
 
 export function isMapType(type: ExtendedValueType): type is MapValueType {
   return typeof type === "object" && type.kind === "map";
+}
+
+export function isTupleType(
+  type: ExtendedValueType,
+): type is { readonly kind: "tuple"; readonly elements: readonly ExtendedValueType[] } {
+  return typeof type === "object" && type.kind === "tuple";
 }
 
 export function flattenUnion(type: ExtendedValueType): ExtendedValueType[] {
@@ -167,6 +174,8 @@ export function advancedTypeToString(type: ExtendedValueType): string {
   switch (type.kind) {
     case "array":
       return `${advancedTypeToString(type.element)}[]`;
+    case "tuple":
+      return `[${type.elements.map(advancedTypeToString).join(", ")}]`;
     case "union":
       return type.arms.map(advancedTypeToString).join(" | ");
     case "intersection":
@@ -206,6 +215,12 @@ export function advancedTypesEqual(a: ExtendedValueType, b: ExtendedValueType): 
   switch (a.kind) {
     case "array":
       return b.kind === "array" && advancedTypesEqual(a.element, b.element);
+    case "tuple":
+      return (
+        b.kind === "tuple" &&
+        a.elements.length === b.elements.length &&
+        a.elements.every((el, i) => advancedTypesEqual(el, b.elements[i]!))
+      );
     case "union":
       return (
         b.kind === "union" &&
@@ -278,6 +293,7 @@ export function typeofTagForType(type: ExtendedValueType): string | null {
       type.kind === "interface" ||
       type.kind === "enum" ||
       type.kind === "array" ||
+      type.kind === "tuple" ||
       type.kind === "object" ||
       type.kind === "map"
     ) {
@@ -434,6 +450,13 @@ export function advancedIsAssignable(
 
   if (isMapType(to) && isObjectType(from) && from.indexType) {
     return advancedIsAssignable(from.indexType, to.valueType, baseAssign);
+  }
+
+  if (isTupleType(from) && isTupleType(to)) {
+    return (
+      from.elements.length === to.elements.length &&
+      from.elements.every((el, i) => advancedIsAssignable(el, to.elements[i]!, baseAssign))
+    );
   }
 
   return baseAssign(from, to);

@@ -21,6 +21,7 @@ import type {
   StructDeclaration,
   StructField,
   StructMethod,
+  TupleType,
   TypeAnnotation,
   TypeParameter,
   TypeofType,
@@ -40,6 +41,14 @@ export function substituteAnnotation(ann: TypeAnnotation, subst: TypeSubst): Typ
       const result: ArrayType = {
         kind: "ArrayType",
         element,
+        span: ann.span,
+      };
+      return result;
+    }
+    case "TupleType": {
+      const result: TupleType = {
+        kind: "TupleType",
+        elements: ann.elements.map((e) => substituteAnnotation(e, subst)),
         span: ann.span,
       };
       return result;

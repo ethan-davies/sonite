@@ -74,7 +74,7 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 **Currently supported:**
 
 - A single top-level `function main(): void` with no parameters (return type required)
-- Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`, `null`, arrays `T[]`, `struct`, `enum`, `class`, and `interface` types
+- Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`, `null`, arrays `T[]`, tuples `[T, U]`, `struct`, `enum`, `class`, and `interface` types
 - Generics: type parameters on structs, classes, interfaces, functions, and methods; constraints (`T extends I`); nested type arguments; call-site inference; compile-time monomorphization (no runtime generics)
 - Type aliases (`type Name = ...`), including generic aliases, unions (`|`), intersections (`&`), literal types, `keyof` / `typeof` type operators, conditional and mapped types
 - Control-flow narrowing via `typeof` checks, `== null` / `!= null`, and `is` type checks on union / nullable values; early `return` / `break` / `continue` refine types in subsequent code
@@ -82,9 +82,10 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 - Struct declarations, literals (`Person { name: "...", age: 16 }`), field access, field assignment, and instance methods
 - Classes: `new`, constructors, instance/static fields and methods, `public`/`private`, `readonly`, inheritance (`extends`), and `abstract` classes (heap reference types)
 - Interfaces: method contracts with `implements` / `extends`, optional index signatures, compile-time compliance checks, and fat-pointer dynamic dispatch when typed as an interface
-- `let` / `const` variables with optional annotations and inference (`5` → `i32`, `3.14` → `f64`); annotated `let` may omit an initializer (`let x: T | null;`)
+- `let` / `const` variables with optional annotations and inference (`5` → `i32`, `3.14` → `f64`); annotated `let` may omit an initializer (`let x: T | null;`); tuple destructuring (`let [a, b] = pair`)
 - Reassignment for `let` only (`=`, `+=`, `-=`, `++`, `--` on numeric lets)
 - Arrays: literals `[1, 2, 3]`, indexing, element assignment, `.length`, `.push` / `.pop` / `.includes` / `.indexOf`
+- Tuples: fixed-length heterogeneous products `[string, i32]`, const/dynamic indexing (dynamic → union), `.length`, element assignment with constant indexes, destructuring with holes
 - Literals: integers, floats, booleans, strings, chars, `null`
 - `print(...)` of printable values; multiple args are joined with spaces
 - String concatenation with `+`
@@ -107,6 +108,7 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 | [`examples/control-flow.tsn`](./examples/control-flow.tsn) | `if` / `elseif` / `else`, comparisons |
 | [`examples/loops.tsn`](./examples/loops.tsn) | `for` / `while`, updates, `break` / `continue` |
 | [`examples/arrays.tsn`](./examples/arrays.tsn) | Array literals, indexing, methods, `for-in` |
+| [`examples/tuples.tsn`](./examples/tuples.tsn) | Tuple types, indexing, destructuring, generics |
 | [`examples/structs.tsn`](./examples/structs.tsn) | Struct decls, literals, fields, params |
 | [`examples/struct-methods.tsn`](./examples/struct-methods.tsn) | Struct instance methods with `this` |
 | [`examples/classes.tsn`](./examples/classes.tsn) | Classes, `new`, constructors, static/readonly/private |

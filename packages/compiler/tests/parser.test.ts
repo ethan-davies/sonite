@@ -905,4 +905,45 @@ describe("Parser", () => {
       expect(body[2].condition.kind).toBe("IsExpression");
     }
   });
+
+  it("parses tuple types and destructuring bindings", () => {
+    const { ast, diagnostics } = parse(`
+      type Person = [string, i32];
+      function main(): void {
+        let pair: [string, i32] = ["hello", 123];
+        let [name, age] = pair;
+        let [first, , third]: [string, string, string] = ["a", "b", "c"];
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(ast.body[0]).toMatchObject({
+      kind: "TypeAliasDeclaration",
+      type: { kind: "TupleType" },
+    });
+    if (ast.body[0]?.kind === "TypeAliasDeclaration" && ast.body[0].type.kind === "TupleType") {
+      expect(ast.body[0].type.elements).toHaveLength(2);
+    }
+    const body = functionAt(ast, 1).body;
+    expect(body[0]?.kind).toBe("VariableDeclaration");
+    if (body[0]?.kind === "VariableDeclaration") {
+      expect(body[0].binding.kind).toBe("Identifier");
+      expect(body[0].typeAnnotation?.kind).toBe("TupleType");
+    }
+    expect(body[1]?.kind).toBe("VariableDeclaration");
+    if (body[1]?.kind === "VariableDeclaration") {
+      expect(body[1].binding.kind).toBe("ArrayBindingPattern");
+      if (body[1].binding.kind === "ArrayBindingPattern") {
+        expect(body[1].binding.elements).toHaveLength(2);
+        expect(body[1].binding.elements[0]?.name?.name).toBe("name");
+        expect(body[1].binding.elements[1]?.name?.name).toBe("age");
+      }
+    }
+    expect(body[2]?.kind).toBe("VariableDeclaration");
+    if (body[2]?.kind === "VariableDeclaration" && body[2].binding.kind === "ArrayBindingPattern") {
+      expect(body[2].binding.elements).toHaveLength(3);
+      expect(body[2].binding.elements[0]?.name?.name).toBe("first");
+      expect(body[2].binding.elements[1]?.name).toBeNull();
+      expect(body[2].binding.elements[2]?.name?.name).toBe("third");
+    }
+  });
 });

@@ -28,6 +28,8 @@ import type {
   VariableDeclaration,
   WhileStatement,
 } from "../ast/nodes.js";
+import { mangleTypeAnnotation } from "../generics/mangle.js";
+import { valueTypeToAnnotation } from "../generics/value-type.js";
 import { mangleSymbol } from "../modules/mangle.js";
 import type { ResolvedModule } from "../modules/resolve.js";
 import {
@@ -37,9 +39,11 @@ import {
   isEnumType,
   isInterfaceType,
   isStructType,
+  isTupleType,
   typesEqual,
   type EnumValueType,
   type StructValueType,
+  type TupleValueType,
   type ValueType,
 } from "../typecheck.js";
 import {
@@ -48,9 +52,13 @@ import {
   isMapType,
   isObjectType,
   isUnionType,
+  makeUnion,
   typeofTagForType,
 } from "../typecheck-advanced.js";
 import { substituteAnnotation } from "../generics/substitute.js";
+
+/** Filled during emit so free `toLlvmType` can register synthetic tuple aggregates. */
+let activeTupleRegistry: Map<string, readonly ValueType[]> | null = null;
 
 /** Types lowered as a single LLVM `ptr`. */
 function isSinglePtrType(type: ValueType): boolean {
@@ -234,6 +242,8 @@ export class LlvmCodegen {
   private needsSprintf = false;
   private needsUnionRuntime = false;
   private needsMapRuntime = false;
+  /** Synthetic tuple LLVM type name → element types. */
+  private readonly registeredTuples = new Map<string, readonly ValueType[]>();
   /** Local type alias expansions (local name → annotation). */
   private typeAliases = new Map<string, TypeAnnotation>();
   /** Generic type aliases (local name → declaration) for expanding `Alias<T>` in annotations. */
@@ -285,6 +295,7 @@ export class LlvmCodegen {
     this.needsSprintf = false;
     this.needsUnionRuntime = false;
     this.needsMapRuntime = false;
+    this.registeredTuples.clear();
     this.typeAliases = new Map();
     this.genericTypeAliases = new Map();
     this.functionBodies.length = 0;
@@ -292,6 +303,8 @@ export class LlvmCodegen {
     this.loopStack.length = 0;
     this.thisPtr = null;
     this.thisType = null;
+
+    activeTupleRegistry = this.registeredTuples;
 
     const moduleSymbols = new Map<
       string,
@@ -615,11 +628,13 @@ export class LlvmCodegen {
     this.emitClassGlobals();
 
     const structTypeLines = this.emitStructTypeDefs();
+    const tupleTypeLines = this.emitTupleTypeDefs();
     const interfaceTypeLines = this.emitInterfaceTypeDefs();
     const classTypeLines = this.emitClassTypeDefs();
     const unionTypeLines = this.needsUnionRuntime ? ["%__Union = type { i32, ptr }"] : [];
     const typeLines = [
       ...structTypeLines,
+      ...tupleTypeLines,
       ...interfaceTypeLines,
       ...classTypeLines,
       ...unionTypeLines,
@@ -661,7 +676,7 @@ export class LlvmCodegen {
       ...(this.needsMapRuntime ? this.emitMapRuntimeFns() : []),
     ];
 
-    return [
+    const ir = [
       "; ModuleID = 'typescript-native'",
       'source_filename = "typescript-native"',
       "",
@@ -678,6 +693,8 @@ export class LlvmCodegen {
     ]
       .filter((line): line is string => line !== null)
       .join("\n");
+    activeTupleRegistry = null;
+    return ir;
   }
 
   private registerEnum(decl: EnumDeclaration, moduleId: string): EnumInfo {
@@ -1110,6 +1127,24 @@ export class LlvmCodegen {
         }
         return { kind: "array", element };
       }
+      case "TupleType": {
+        const elements: ValueType[] = [];
+        for (const el of ann.elements) {
+          const vt = this.resolveAnnotationInModule(
+            el,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          if (vt === null) {
+            return null;
+          }
+          elements.push(vt);
+        }
+        return { kind: "tuple", elements };
+      }
       case "UnionType": {
         const arms: ValueType[] = [];
         for (const t of ann.types) {
@@ -1419,6 +1454,15 @@ export class LlvmCodegen {
     for (const info of this.structs.values()) {
       const fieldTypes = info.fields.map((f) => toLlvmType(f.type)).join(", ");
       lines.push(`%${info.name} = type { ${fieldTypes} }`);
+    }
+    return lines;
+  }
+
+  private emitTupleTypeDefs(): string[] {
+    const lines: string[] = [];
+    for (const [name, elements] of this.registeredTuples) {
+      const fieldTypes = elements.map((el) => toLlvmType(el)).join(", ");
+      lines.push(`%${name} = type { ${fieldTypes} }`);
     }
     return lines;
   }
@@ -2327,11 +2371,17 @@ export class LlvmCodegen {
   }
 
   private emitVariableDeclaration(stmt: VariableDeclaration, lines: string[]): void {
+    if (stmt.binding.kind === "ArrayBindingPattern") {
+      this.emitDestructuringDeclaration(stmt, lines);
+      return;
+    }
+
+    const name = stmt.binding.name;
     const type = this.resolveDeclType(stmt);
     const llvmType = toLlvmType(type);
-    const ptr = `%v.${stmt.name.name}`;
+    const ptr = `%v.${name}`;
     lines.push(`  ${ptr} = alloca ${llvmType}`);
-    this.locals.set(stmt.name.name, { ptr, type });
+    this.locals.set(name, { ptr, type });
 
     if (stmt.initializer === null) {
       lines.push(`  store ${llvmType} ${zeroInitializer(type)}, ptr ${ptr}`);
@@ -2340,6 +2390,41 @@ export class LlvmCodegen {
 
     const init = this.emitExpression(stmt.initializer, lines, type);
     lines.push(`  store ${llvmType} ${init.llvm}, ptr ${ptr}`);
+  }
+
+  private emitDestructuringDeclaration(stmt: VariableDeclaration, lines: string[]): void {
+    const pattern = stmt.binding;
+    if (pattern.kind !== "ArrayBindingPattern" || !stmt.initializer) {
+      throw new Error("Codegen: invalid destructuring declaration");
+    }
+    const annotated = stmt.typeAnnotation ? this.resolveAnnotation(stmt.typeAnnotation) : null;
+    const tuple = this.emitExpression(stmt.initializer, lines, annotated ?? undefined);
+    if (!isTupleType(tuple.type)) {
+      throw new Error("Codegen: destructuring requires a tuple");
+    }
+    if (pattern.elements.length !== tuple.type.elements.length) {
+      throw new Error("Codegen: destructuring arity mismatch");
+    }
+    const llvmType = toLlvmType(tuple.type);
+    const tmp = this.nextTemp();
+    lines.push(`  ${tmp} = alloca ${llvmType}`);
+    lines.push(`  store ${llvmType} ${tuple.llvm}, ptr ${tmp}`);
+
+    for (let i = 0; i < pattern.elements.length; i += 1) {
+      const el = pattern.elements[i]!;
+      if (!el.name) {
+        continue;
+      }
+      const elemType = tuple.type.elements[i]!;
+      const elemLlvm = toLlvmType(elemType);
+      const fieldPtr = this.emitStructFieldPtr(tmp, tupleTypeName(tuple.type.elements), i, lines);
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load ${elemLlvm}, ptr ${fieldPtr}`);
+      const ptr = `%v.${el.name.name}`;
+      lines.push(`  ${ptr} = alloca ${elemLlvm}`);
+      lines.push(`  store ${elemLlvm} ${loaded}, ptr ${ptr}`);
+      this.locals.set(el.name.name, { ptr, type: elemType });
+    }
   }
 
   private emitAssignment(stmt: AssignmentStatement, lines: string[]): void {
@@ -2418,6 +2503,55 @@ export class LlvmCodegen {
       lines.push(
         `  call void @__tsn_map_set(ptr ${object.llvm}, ptr ${index.llvm}, ptr ${value.llvm})`,
       );
+      return;
+    }
+    if (isTupleType(object.type)) {
+      const constIndex = this.constantIndexValue(stmt.target.index);
+      if (constIndex === null) {
+        throw new Error("Codegen: tuple element assignment requires a constant index");
+      }
+      if (constIndex < 0 || constIndex >= object.type.elements.length) {
+        throw new Error(`Codegen: tuple index ${constIndex} out of bounds`);
+      }
+      const elemType = object.type.elements[constIndex]!;
+      const elemLlvm = toLlvmType(elemType);
+      const tupleName = tupleTypeName(object.type.elements);
+      const tmp = this.nextTemp();
+      const llvmType = toLlvmType(object.type);
+      lines.push(`  ${tmp} = alloca ${llvmType}`);
+      lines.push(`  store ${llvmType} ${object.llvm}, ptr ${tmp}`);
+      const fieldPtr = this.emitStructFieldPtr(tmp, tupleName, constIndex, lines);
+
+      if (stmt.operator === "=") {
+        const value = this.emitExpression(stmt.value, lines, elemType);
+        lines.push(`  store ${elemLlvm} ${value.llvm}, ptr ${fieldPtr}`);
+      } else {
+        const loaded = this.nextTemp();
+        lines.push(`  ${loaded} = load ${elemLlvm}, ptr ${fieldPtr}`);
+        const rhs = this.emitExpression(stmt.value, lines, elemType);
+        const result = this.nextTemp();
+        const isFloat = elemType === "f32" || elemType === "f64";
+        const opcode =
+          stmt.operator === "+="
+            ? isFloat
+              ? "fadd"
+              : "add"
+            : isFloat
+              ? "fsub"
+              : "sub";
+        lines.push(`  ${result} = ${opcode} ${elemLlvm} ${loaded}, ${rhs.llvm}`);
+        lines.push(`  store ${elemLlvm} ${result}, ptr ${fieldPtr}`);
+      }
+
+      // Write updated aggregate back if the object is a local identifier
+      if (stmt.target.object.kind === "Identifier") {
+        const local = this.locals.get(stmt.target.object.name);
+        if (local) {
+          const updated = this.nextTemp();
+          lines.push(`  ${updated} = load ${llvmType}, ptr ${tmp}`);
+          lines.push(`  store ${llvmType} ${updated}, ptr ${local.ptr}`);
+        }
+      }
       return;
     }
     if (!isArrayType(object.type)) {
@@ -2546,7 +2680,7 @@ export class LlvmCodegen {
     return this.inferExpressionType(stmt.initializer);
   }
 
-  private inferExpressionType(expr: Expression): ValueType {
+  private inferExpressionType(expr: Expression, expected?: ValueType): ValueType {
     switch (expr.kind) {
       case "IntegerLiteral":
         return "i32";
@@ -2563,10 +2697,21 @@ export class LlvmCodegen {
       case "IsExpression":
         return "bool";
       case "ArrayLiteral": {
+        if (expected && isTupleType(expected)) {
+          return expected;
+        }
         if (expr.elements.length === 0) {
+          if (expected && isArrayType(expected)) {
+            return expected;
+          }
           throw new Error("Codegen: empty array without annotation");
         }
-        return { kind: "array", element: this.inferExpressionType(expr.elements[0]!) };
+        const elementTypes = expr.elements.map((el) => this.inferExpressionType(el));
+        const first = elementTypes[0]!;
+        if (elementTypes.every((t) => typesEqual(t, first))) {
+          return { kind: "array", element: first };
+        }
+        return { kind: "tuple", elements: elementTypes };
       }
       case "StructLiteral": {
         const def = this.lookupStruct(expr.namespace?.name ?? null, expr.name.name);
@@ -2601,6 +2746,23 @@ export class LlvmCodegen {
         }
         if (isObjectType(objectType) && objectType.indexType) {
           return objectType.indexType as ValueType;
+        }
+        if (isTupleType(objectType)) {
+          if (expr.index.kind === "IntegerLiteral") {
+            const i = expr.index.value;
+            if (i < 0 || i >= objectType.elements.length) {
+              throw new Error(`Codegen: tuple index ${i} out of bounds`);
+            }
+            return objectType.elements[i]!;
+          }
+          if (
+            expr.index.kind === "UnaryExpression" &&
+            expr.index.operator === "-" &&
+            expr.index.operand.kind === "IntegerLiteral"
+          ) {
+            throw new Error("Codegen: negative tuple index");
+          }
+          return makeUnion(objectType.elements) as ValueType;
         }
         if (!isArrayType(objectType)) {
           throw new Error("Codegen: index into non-array");
@@ -2806,7 +2968,7 @@ export class LlvmCodegen {
         return { llvm: tmp, type: "string" };
       }
       case "ArrayLiteral":
-        return this.emitArrayLiteral(expr.elements, lines, expected);
+        return this.emitArrayOrTupleLiteral(expr.elements, lines, expected);
       case "StructLiteral":
         return this.emitStructLiteral(expr, lines);
       case "NewExpression":
@@ -2871,6 +3033,9 @@ export class LlvmCodegen {
             ? (object.type.valueType as ValueType)
             : (object.type.indexType as ValueType);
           return { llvm: result, type: valueType };
+        }
+        if (isTupleType(object.type)) {
+          return this.emitTupleIndexLoad(object, expr.index, lines);
         }
         if (!isArrayType(object.type)) {
           throw new Error("Codegen: index into non-array");
@@ -2977,6 +3142,9 @@ export class LlvmCodegen {
           const len32 = this.nextTemp();
           lines.push(`  ${len32} = trunc i64 ${len64} to i32`);
           return { llvm: len32, type: "i32" };
+        }
+        if (isTupleType(object.type)) {
+          return { llvm: String(object.type.elements.length), type: "i32" };
         }
         if (!isArrayType(object.type)) {
           throw new Error("Codegen: .length on non-array");
@@ -3286,6 +3454,151 @@ export class LlvmCodegen {
     }
 
     return { llvm: header, type: { kind: "array", element: elementType } };
+  }
+
+  private emitArrayOrTupleLiteral(
+    elements: Expression[],
+    lines: string[],
+    expected?: ValueType,
+  ): EmittedValue {
+    if (expected && isTupleType(expected)) {
+      return this.emitTupleLiteral(elements, expected, lines);
+    }
+    if (elements.length > 0) {
+      const elementTypes = elements.map((el) => this.inferExpressionType(el));
+      const first = elementTypes[0]!;
+      if (!elementTypes.every((t) => typesEqual(t, first))) {
+        const tupleType: TupleValueType = { kind: "tuple", elements: elementTypes };
+        return this.emitTupleLiteral(elements, tupleType, lines);
+      }
+    }
+    return this.emitArrayLiteral(elements, lines, expected);
+  }
+
+  private emitTupleLiteral(
+    elements: Expression[],
+    tupleType: TupleValueType,
+    lines: string[],
+  ): EmittedValue {
+    if (elements.length !== tupleType.elements.length) {
+      throw new Error("Codegen: tuple literal arity mismatch");
+    }
+    const llvmType = toLlvmType(tupleType);
+    const name = tupleTypeName(tupleType.elements);
+    const tmp = this.nextTemp();
+    lines.push(`  ${tmp} = alloca ${llvmType}`);
+    for (let i = 0; i < elements.length; i += 1) {
+      const elemType = tupleType.elements[i]!;
+      const value = this.emitExpression(elements[i]!, lines, elemType);
+      const fieldPtr = this.emitStructFieldPtr(tmp, name, i, lines);
+      lines.push(`  store ${toLlvmType(elemType)} ${value.llvm}, ptr ${fieldPtr}`);
+    }
+    const loaded = this.nextTemp();
+    lines.push(`  ${loaded} = load ${llvmType}, ptr ${tmp}`);
+    return { llvm: loaded, type: tupleType };
+  }
+
+  private constantIndexValue(expr: Expression): number | null {
+    if (expr.kind === "IntegerLiteral") {
+      return expr.value;
+    }
+    if (
+      expr.kind === "UnaryExpression" &&
+      expr.operator === "-" &&
+      expr.operand.kind === "IntegerLiteral"
+    ) {
+      return -expr.operand.value;
+    }
+    return null;
+  }
+
+  private emitTupleIndexLoad(
+    object: EmittedValue,
+    indexExpr: Expression,
+    lines: string[],
+  ): EmittedValue {
+    if (!isTupleType(object.type)) {
+      throw new Error("Codegen: tuple index on non-tuple");
+    }
+    const tupleType = object.type;
+    const constIndex = this.constantIndexValue(indexExpr);
+    const llvmType = toLlvmType(tupleType);
+    const name = tupleTypeName(tupleType.elements);
+    const tmp = this.nextTemp();
+    lines.push(`  ${tmp} = alloca ${llvmType}`);
+    lines.push(`  store ${llvmType} ${object.llvm}, ptr ${tmp}`);
+
+    if (constIndex !== null) {
+      if (constIndex < 0 || constIndex >= tupleType.elements.length) {
+        throw new Error(`Codegen: tuple index ${constIndex} out of bounds`);
+      }
+      const elemType = tupleType.elements[constIndex]!;
+      const fieldPtr = this.emitStructFieldPtr(tmp, name, constIndex, lines);
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load ${toLlvmType(elemType)}, ptr ${fieldPtr}`);
+      return { llvm: loaded, type: elemType };
+    }
+
+    // Dynamic index: bounds check + switch, box into union of element types
+    const resultType = makeUnion(tupleType.elements) as ValueType;
+    this.needsAbort = true;
+    if (isUnionType(resultType)) {
+      this.needsUnionRuntime = true;
+    }
+
+    const index = this.emitExpression(indexExpr, lines);
+    const indexI32 = this.asI32Index(index, lines);
+    const n = tupleType.elements.length;
+    const okGe = this.nextTemp();
+    lines.push(`  ${okGe} = icmp sge i32 ${indexI32}, 0`);
+    const okLt = this.nextTemp();
+    lines.push(`  ${okLt} = icmp slt i32 ${indexI32}, ${n}`);
+    const ok = this.nextTemp();
+    lines.push(`  ${ok} = and i1 ${okGe}, ${okLt}`);
+    const okLabel = this.nextLabel("tuple_idx_ok");
+    const badLabel = this.nextLabel("tuple_idx_oob");
+    const contLabel = this.nextLabel("tuple_idx_cont");
+    lines.push(`  br i1 ${ok}, label %${okLabel}, label %${badLabel}`);
+
+    lines.push(`${badLabel}:`);
+    lines.push(`  call void @abort()`);
+    lines.push(`  unreachable`);
+
+    lines.push(`${okLabel}:`);
+    const resultPtr = this.nextTemp();
+    const resultLlvm = toLlvmType(resultType);
+    lines.push(`  ${resultPtr} = alloca ${resultLlvm}`);
+
+    const defaultLabel = this.nextLabel("tuple_idx_default");
+    const caseLabels = tupleType.elements.map((_, i) => this.nextLabel(`tuple_idx_${i}`));
+    const switchCases = caseLabels.map((lab, i) => `i32 ${i}, label %${lab}`).join(" ");
+    lines.push(`  switch i32 ${indexI32}, label %${defaultLabel} [ ${switchCases} ]`);
+
+    for (let i = 0; i < tupleType.elements.length; i += 1) {
+      lines.push(`${caseLabels[i]!}:`);
+      const elemType = tupleType.elements[i]!;
+      const fieldPtr = this.emitStructFieldPtr(tmp, name, i, lines);
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load ${toLlvmType(elemType)}, ptr ${fieldPtr}`);
+      const boxed = this.coerceValue({ llvm: loaded, type: elemType }, resultType, lines);
+      lines.push(`  store ${resultLlvm} ${boxed.llvm}, ptr ${resultPtr}`);
+      lines.push(`  br label %${contLabel}`);
+    }
+
+    lines.push(`${defaultLabel}:`);
+    lines.push(`  call void @abort()`);
+    lines.push(`  unreachable`);
+
+    lines.push(`${contLabel}:`);
+    const result = this.nextTemp();
+    lines.push(`  ${result} = load ${resultLlvm}, ptr ${resultPtr}`);
+    return { llvm: result, type: resultType };
+  }
+
+  private nextLabel(prefix: string): string {
+    const id = this.labelCounter;
+    this.labelCounter += 1;
+    return `${prefix}.${id}`;
   }
 
   private emitArrayLength(header: string, lines: string[]): string {
@@ -4428,6 +4741,9 @@ function toLlvmType(type: ValueType | "void"): string {
     if (type.kind === "struct" || type.kind === "interface" || type.kind === "object") {
       return `%${type.name}`;
     }
+    if (type.kind === "tuple") {
+      return `%${tupleTypeName(type.elements)}`;
+    }
     if (type.kind === "enum") {
       return "i32";
     }
@@ -4480,6 +4796,15 @@ function toLlvmType(type: ValueType | "void"): string {
   }
 }
 
+function tupleTypeName(elements: readonly ValueType[]): string {
+  const mangled = elements
+    .map((el) => mangleTypeAnnotation(valueTypeToAnnotation(el as never)))
+    .join("__");
+  const name = `__tuple_${mangled || "empty"}`;
+  activeTupleRegistry?.set(name, elements);
+  return name;
+}
+
 function zeroInitializer(type: ValueType): string {
   if (typeof type === "object") {
     if (type.kind === "enum") {
@@ -4492,6 +4817,9 @@ function zeroInitializer(type: ValueType): string {
       return "zeroinitializer";
     }
     if (type.kind === "struct" || type.kind === "interface" || type.kind === "object") {
+      return "zeroinitializer";
+    }
+    if (type.kind === "tuple") {
       return "zeroinitializer";
     }
     if (type.kind === "literal") {
@@ -4534,6 +4862,17 @@ function elementByteSize(type: ValueType, structs?: Map<string, StructInfo>): nu
     if (type.kind === "struct") {
       return structByteSize(type.name, structs);
     }
+    if (type.kind === "tuple") {
+      let size = 0;
+      let maxAlign = 1;
+      for (const el of type.elements) {
+        const align = fieldAlign(el);
+        size = alignUp(size, align);
+        size += elementByteSize(el, structs);
+        maxAlign = Math.max(maxAlign, align);
+      }
+      return alignUp(size, maxAlign);
+    }
     if (type.kind === "interface") {
       return 16; // { ptr, ptr }
     }
@@ -4569,6 +4908,9 @@ function fieldAlign(type: ValueType): number {
       return 8;
     }
     if (type.kind === "struct") {
+      return 8;
+    }
+    if (type.kind === "tuple") {
       return 8;
     }
     if (type.kind === "enum") {

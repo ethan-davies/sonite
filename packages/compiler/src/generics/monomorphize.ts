@@ -66,6 +66,12 @@ function rewriteType(
         element: rewriteType(ann.element, typeRewrites),
         span: ann.span,
       };
+    case "TupleType":
+      return {
+        kind: "TupleType",
+        elements: ann.elements.map((e) => rewriteType(e, typeRewrites)),
+        span: ann.span,
+      };
     case "NamedType": {
       const rewritten = typeRewrites.get(ann.span.start.offset);
       if (rewritten) {

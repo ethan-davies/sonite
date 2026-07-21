@@ -10,6 +10,8 @@ export function mangleTypeAnnotation(ann: TypeAnnotation): string {
       return ann.name;
     case "ArrayType":
       return `arr__${mangleTypeAnnotation(ann.element)}`;
+    case "TupleType":
+      return `tup__${ann.elements.map(mangleTypeAnnotation).join("__")}`;
     case "NamedType": {
       const base = ann.namespace ? `${ann.namespace}_${ann.name}` : ann.name;
       if (ann.typeArgs.length === 0) {

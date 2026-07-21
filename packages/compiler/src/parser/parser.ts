@@ -1,9 +1,12 @@
 import type {
+  ArrayBindingElement,
+  ArrayBindingPattern,
   ArrayLiteral,
   Assignable,
   AssignmentStatement,
   BinaryExpression,
   BinaryOperator,
+  BindingPattern,
   BooleanLiteral,
   BreakStatement,
   CallExpression,
@@ -58,6 +61,7 @@ import type {
   SuperExpression,
   ThisExpression,
   TopLevelDeclaration,
+  TupleType,
   TypeAliasDeclaration,
   TypeAnnotation,
   TypeofExpression,
@@ -102,7 +106,9 @@ const UPDATE_OPS = new Set<TokenKind>([TokenKind.PlusPlus, TokenKind.MinusMinus]
  *   intersection = conditionalType ("&" conditionalType)*
  *   conditional  = postfixType ("extends" type "?" type ":" type)?
  *   postfix      = primaryType ("[]" | "[" type "]")*
- *   primary      = primitive | named | object | literal | keyof | typeof | "(" type ")"
+ *   primary      = primitive | named | object | literal | keyof | typeof | tupleType | "(" type ")"
+ *   tupleType    = "[" (type ("," type)*)? "]"
+ *   binding      = Identifier | "[" (Identifier | ",")* "]"
  */
 export class Parser {
   private readonly tokens: Token[];
@@ -1665,16 +1671,23 @@ export class Parser {
     const mutabilityToken = this.advance();
     const mutability = mutabilityToken.kind === TokenKind.Const ? "const" : "let";
 
-    const nameToken = this.expect(TokenKind.Identifier, "Expected variable name");
-    if (!nameToken) {
-      return null;
+    let binding: BindingPattern | null = null;
+    if (this.check(TokenKind.LBracket)) {
+      binding = this.parseArrayBindingPattern();
+      if (!binding) {
+        return null;
+      }
+    } else {
+      const nameToken = this.expect(TokenKind.Identifier, "Expected variable name");
+      if (!nameToken) {
+        return null;
+      }
+      binding = {
+        kind: "Identifier",
+        name: nameToken.lexeme,
+        span: nameToken.span,
+      };
     }
-
-    const name: Identifier = {
-      kind: "Identifier",
-      name: nameToken.lexeme,
-      span: nameToken.span,
-    };
 
     let typeAnnotation: TypeAnnotation | null = null;
     if (this.check(TokenKind.Colon)) {
@@ -1692,10 +1705,17 @@ export class Parser {
       if (!initializer) {
         return null;
       }
+    } else if (binding.kind === "ArrayBindingPattern") {
+      this.diagnostics.error(
+        "Destructuring declarations must have an initializer",
+        binding.span,
+        "E0102",
+      );
+      return null;
     } else if (mutability === "const") {
       this.diagnostics.error(
         "const declarations must have an initializer",
-        name.span,
+        binding.span,
         "E0102",
       );
       return null;
@@ -1713,15 +1733,73 @@ export class Parser {
       semicolon?.span.end ??
       initializer?.span.end ??
       typeAnnotation?.span.end ??
-      name.span.end;
+      binding.span.end;
 
     return {
       kind: "VariableDeclaration",
       mutability,
-      name,
+      binding,
       typeAnnotation,
       initializer,
       span: { start, end },
+    };
+  }
+
+  private parseArrayBindingPattern(): ArrayBindingPattern | null {
+    const start = this.peek().span.start;
+    this.advance(); // [
+
+    const elements: ArrayBindingElement[] = [];
+    if (!this.check(TokenKind.RBracket)) {
+      for (;;) {
+        if (this.check(TokenKind.Comma)) {
+          const comma = this.advance();
+          elements.push({
+            kind: "ArrayBindingElement",
+            name: null,
+            span: comma.span,
+          });
+          if (this.check(TokenKind.RBracket)) {
+            break;
+          }
+          continue;
+        }
+
+        const nameToken = this.expect(TokenKind.Identifier, "Expected binding name");
+        if (!nameToken) {
+          return null;
+        }
+        const name: Identifier = {
+          kind: "Identifier",
+          name: nameToken.lexeme,
+          span: nameToken.span,
+        };
+        elements.push({
+          kind: "ArrayBindingElement",
+          name,
+          span: name.span,
+        });
+
+        if (this.check(TokenKind.Comma)) {
+          this.advance();
+          if (this.check(TokenKind.RBracket)) {
+            break; // trailing comma
+          }
+          continue;
+        }
+        break;
+      }
+    }
+
+    const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after binding pattern");
+    if (!rbracket) {
+      return null;
+    }
+
+    return {
+      kind: "ArrayBindingPattern",
+      elements,
+      span: { start, end: rbracket.span.end },
     };
   }
 
@@ -2784,6 +2862,43 @@ export class Parser {
     return type;
   }
 
+  private parseTupleType(): TupleType | null {
+    const start = this.peek().span.start;
+    this.advance(); // [
+
+    const elements: TypeAnnotation[] = [];
+    if (!this.check(TokenKind.RBracket)) {
+      const first = this.parseType();
+      if (!first) {
+        return null;
+      }
+      elements.push(first);
+
+      while (this.check(TokenKind.Comma)) {
+        this.advance();
+        if (this.check(TokenKind.RBracket)) {
+          break; // trailing comma
+        }
+        const elem = this.parseType();
+        if (!elem) {
+          return null;
+        }
+        elements.push(elem);
+      }
+    }
+
+    const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after tuple type");
+    if (!rbracket) {
+      return null;
+    }
+
+    return {
+      kind: "TupleType",
+      elements,
+      span: { start, end: rbracket.span.end },
+    };
+  }
+
   private parsePrimaryType(): TypeAnnotation | null {
     if (this.check(TokenKind.LParen)) {
       this.advance();
@@ -2795,6 +2910,10 @@ export class Parser {
         return null;
       }
       return inner;
+    }
+
+    if (this.check(TokenKind.LBracket)) {
+      return this.parseTupleType();
     }
 
     if (this.check(TokenKind.Keyof)) {

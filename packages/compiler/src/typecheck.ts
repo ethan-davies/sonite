@@ -73,6 +73,11 @@ export interface ArrayValueType {
   readonly element: ValueType;
 }
 
+export interface TupleValueType {
+  readonly kind: "tuple";
+  readonly elements: readonly ValueType[];
+}
+
 export interface StructValueType {
   readonly kind: "struct";
   readonly name: string;
@@ -110,6 +115,7 @@ export interface TypeParamValueType {
 export type ValueType =
   | PrimitiveValueType
   | ArrayValueType
+  | TupleValueType
   | StructValueType
   | ClassValueType
   | InterfaceValueType
@@ -1854,6 +1860,10 @@ export function isArrayType(type: ValueType): type is ArrayValueType {
   return typeof type === "object" && type.kind === "array";
 }
 
+export function isTupleType(type: ValueType): type is TupleValueType {
+  return typeof type === "object" && type.kind === "tuple";
+}
+
 export function isStructType(type: ValueType): type is StructValueType {
   return typeof type === "object" && type.kind === "struct";
 }
@@ -1917,6 +1927,17 @@ export function annotationToValueType(
         return null;
       }
       return { kind: "array", element };
+    }
+    case "TupleType": {
+      const elements: ValueType[] = [];
+      for (const el of ann.elements) {
+        const vt = annotationToValueType(el, namedKinds);
+        if (vt === null) {
+          return null;
+        }
+        elements.push(vt);
+      }
+      return { kind: "tuple", elements };
     }
     case "UnionType": {
       const arms: ValueType[] = [];
@@ -1990,6 +2011,17 @@ function resolveAnnotation(
         return null;
       }
       return { kind: "array", element };
+    }
+    case "TupleType": {
+      const elements: ValueType[] = [];
+      for (const el of ann.elements) {
+        const vt = resolveAnnotation(el, structs, enums, diagnostics);
+        if (vt === null) {
+          return null;
+        }
+        elements.push(vt);
+      }
+      return { kind: "tuple", elements };
     }
     case "UnionType": {
       const arms: ValueType[] = [];
@@ -2978,6 +3010,12 @@ function valueTypeToLocalAnnotation(type: ValueType): TypeAnnotation {
         element: valueTypeToLocalAnnotation(type.element),
         span,
       };
+    case "tuple":
+      return {
+        kind: "TupleType",
+        elements: type.elements.map((e) => valueTypeToLocalAnnotation(e)),
+        span,
+      };
     case "typeParam":
       return valueTypeToAnnotation(type);
     case "union":
@@ -3558,6 +3596,125 @@ function makeNarrowingResolver(
   return (ann) => resolveAnnotation(ann, structs, enums, diagnostics);
 }
 
+/** Constant integer index from `n` or `-n` literals; null if not a compile-time constant. */
+function constantIndexValue(expr: Expression): number | null {
+  if (expr.kind === "IntegerLiteral") {
+    return expr.value;
+  }
+  if (
+    expr.kind === "UnaryExpression" &&
+    expr.operator === "-" &&
+    expr.operand.kind === "IntegerLiteral"
+  ) {
+    return -expr.operand.value;
+  }
+  return null;
+}
+
+function checkDestructuringDeclaration(
+  stmt: Extract<Statement, { kind: "VariableDeclaration" }>,
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+): boolean {
+  const pattern = stmt.binding;
+  if (pattern.kind !== "ArrayBindingPattern") {
+    return false;
+  }
+  if (!stmt.initializer) {
+    diagnostics.error(
+      "Destructuring declarations must have an initializer",
+      pattern.span,
+      "E0102",
+    );
+    return false;
+  }
+
+  let annotated: ValueType | null = null;
+  if (stmt.typeAnnotation) {
+    annotated = resolveAnnotation(stmt.typeAnnotation, structs, enums, diagnostics);
+    if (annotated === null) {
+      return false;
+    }
+  }
+
+  const inferred = checkExpression(
+    stmt.initializer,
+    scope,
+    functions,
+    structs,
+    enums,
+    diagnostics,
+    false,
+    annotated,
+  );
+  if (!inferred) {
+    return false;
+  }
+
+  let tupleType: TupleValueType | null = null;
+  if (annotated) {
+    if (!isTupleType(annotated)) {
+      diagnostics.error(
+        `Destructuring requires a tuple type, got '${typeToString(annotated)}'`,
+        stmt.typeAnnotation?.span ?? pattern.span,
+        "E0303",
+      );
+      return false;
+    }
+    if (!initializerMatchesAnnotation(stmt.initializer, inferred, annotated)) {
+      diagnostics.error(
+        typeMismatchMessage(annotated, inferred),
+        stmt.initializer.span,
+        "E0303",
+      );
+      return false;
+    }
+    tupleType = annotated;
+  } else if (isTupleType(inferred)) {
+    tupleType = inferred;
+  } else {
+    diagnostics.error(
+      `Destructuring requires a tuple, got '${typeToString(inferred)}'`,
+      stmt.initializer.span,
+      "E0303",
+    );
+    return false;
+  }
+
+  if (pattern.elements.length !== tupleType.elements.length) {
+    diagnostics.error(
+      `Destructuring pattern has ${pattern.elements.length} element(s), but tuple has ${tupleType.elements.length}`,
+      pattern.span,
+      "E0330",
+    );
+    return false;
+  }
+
+  const mutable = stmt.mutability === "let";
+  for (let i = 0; i < pattern.elements.length; i += 1) {
+    const el = pattern.elements[i]!;
+    if (!el.name) {
+      continue;
+    }
+    if (scope.has(el.name.name)) {
+      diagnostics.error(
+        `Variable '${el.name.name}' is already declared`,
+        el.name.span,
+        "E0301",
+      );
+      return false;
+    }
+    scope.set(el.name.name, {
+      type: tupleType.elements[i]!,
+      mutable,
+    });
+  }
+  return false;
+}
+
 /** Returns true when every path through the statement list exits (return/break/continue). */
 function checkStatements(
   stmts: Statement[],
@@ -3597,10 +3754,22 @@ function checkStatement(
 ): boolean {
   switch (stmt.kind) {
     case "VariableDeclaration": {
-      if (scope.has(stmt.name.name)) {
+      if (stmt.binding.kind === "ArrayBindingPattern") {
+        return checkDestructuringDeclaration(
+          stmt,
+          scope,
+          functions,
+          structs,
+          enums,
+          diagnostics,
+        );
+      }
+
+      const name = stmt.binding;
+      if (scope.has(name.name)) {
         diagnostics.error(
-          `Variable '${stmt.name.name}' is already declared`,
-          stmt.name.span,
+          `Variable '${name.name}' is already declared`,
+          name.span,
           "E0301",
         );
         return false;
@@ -3617,13 +3786,13 @@ function checkStatement(
       if (stmt.initializer === null) {
         if (!annotated) {
           diagnostics.error(
-            `Variable '${stmt.name.name}' requires a type annotation when not initialized`,
-            stmt.name.span,
+            `Variable '${name.name}' requires a type annotation when not initialized`,
+            name.span,
             "E0303",
           );
           return false;
         }
-        scope.set(stmt.name.name, {
+        scope.set(name.name, {
           type: annotated,
           mutable: stmt.mutability === "let",
         });
@@ -3657,7 +3826,7 @@ function checkStatement(
         bindingType = annotated;
       }
 
-      scope.set(stmt.name.name, {
+      scope.set(name.name, {
         type: bindingType,
         mutable: stmt.mutability === "let",
       });
@@ -4019,7 +4188,7 @@ function checkAssignment(
     }
     return;
   }
-  if (!isArrayType(objectType)) {
+  if (!isArrayType(objectType) && !isTupleType(objectType)) {
     diagnostics.error(
       `Cannot index into type '${typeToString(objectType)}'`,
       stmt.target.object.span,
@@ -4029,14 +4198,37 @@ function checkAssignment(
   }
   if (!isIntegerType(indexType)) {
     diagnostics.error(
-      `Array index must be an integer, got '${typeToString(indexType)}'`,
+      `${isTupleType(objectType) ? "Tuple" : "Array"} index must be an integer, got '${typeToString(indexType)}'`,
       stmt.target.index.span,
       "E0320",
     );
     return;
   }
 
-  const elementType = objectType.element;
+  let elementType: ValueType;
+  if (isTupleType(objectType)) {
+    const constIndex = constantIndexValue(stmt.target.index);
+    if (constIndex === null) {
+      diagnostics.error(
+        "Tuple element assignment requires a constant index",
+        stmt.target.index.span,
+        "E0333",
+      );
+      return;
+    }
+    if (constIndex < 0 || constIndex >= objectType.elements.length) {
+      diagnostics.error(
+        `Tuple index ${constIndex} is out of bounds.\nTuple contains ${objectType.elements.length} elements.`,
+        stmt.target.index.span,
+        "E0332",
+      );
+      return;
+    }
+    elementType = objectType.elements[constIndex]!;
+  } else {
+    elementType = objectType.element;
+  }
+
   if (stmt.operator === "+=" || stmt.operator === "-=") {
     if (!isNumericType(elementType)) {
       diagnostics.error(
@@ -4480,8 +4672,47 @@ function checkExpression(
       return { kind: "struct", name: def.name };
     }
     case "ArrayLiteral": {
+      if (expectedType && isTupleType(expectedType)) {
+        if (expr.elements.length !== expectedType.elements.length) {
+          diagnostics.error(
+            `Tuple literal has ${expr.elements.length} element(s), but type '${typeToString(expectedType)}' expects ${expectedType.elements.length}`,
+            expr.span,
+            "E0331",
+          );
+          return null;
+        }
+        for (let i = 0; i < expr.elements.length; i += 1) {
+          const expectedEl = expectedType.elements[i]!;
+          const t = checkExpression(
+            expr.elements[i]!,
+            scope,
+            functions,
+            structs,
+            enums,
+            diagnostics,
+            false,
+            expectedEl,
+          );
+          if (!t) {
+            return null;
+          }
+          if (!valueMatchesBinding(expr.elements[i]!, t, expectedEl)) {
+            diagnostics.error(
+              typeMismatchMessage(expectedEl, t),
+              expr.elements[i]!.span,
+              "E0303",
+            );
+            return null;
+          }
+        }
+        return expectedType;
+      }
+
       if (expr.elements.length === 0) {
         if (expectedType && isArrayType(expectedType)) {
+          return expectedType;
+        }
+        if (expectedType && isTupleType(expectedType) && expectedType.elements.length === 0) {
           return expectedType;
         }
         diagnostics.error(
@@ -4492,51 +4723,46 @@ function checkExpression(
         return null;
       }
 
-      let elementType: ValueType | null = null;
-      const expectedElement =
-        expectedType && isArrayType(expectedType) ? expectedType.element : null;
-
+      const elementTypes: ValueType[] = [];
       for (const element of expr.elements) {
-        const t = checkExpression(element, scope, functions, structs, enums, diagnostics, false, expectedElement);
+        const expectedElement =
+          expectedType && isArrayType(expectedType) ? expectedType.element : null;
+        const t = checkExpression(
+          element,
+          scope,
+          functions,
+          structs,
+          enums,
+          diagnostics,
+          false,
+          expectedElement,
+        );
         if (!t) {
           return null;
         }
-        if (elementType === null) {
-          elementType = expectedElement ?? t;
-          if (expectedElement && !valueMatchesBinding(element, t, expectedElement)) {
-            diagnostics.error(
-              typeMismatchMessage(expectedElement, t),
-              element.span,
-              "E0303",
-            );
-            return null;
-          }
-          continue;
+        const bound =
+          expectedElement && valueMatchesBinding(element, t, expectedElement)
+            ? expectedElement
+            : t;
+        if (expectedElement && !valueMatchesBinding(element, t, expectedElement)) {
+          diagnostics.error(
+            typeMismatchMessage(expectedElement, t),
+            element.span,
+            "E0303",
+          );
+          return null;
         }
-        if (!valueMatchesBinding(element, t, elementType) && !typesEqual(t, elementType)) {
-          if (
-            !(
-              element.kind === "IntegerLiteral" &&
-              isIntegerType(elementType) &&
-              isIntegerType(t)
-            ) &&
-            !(
-              element.kind === "FloatLiteral" &&
-              (elementType === "f32" || elementType === "f64") &&
-              (t === "f32" || t === "f64")
-            )
-          ) {
-            diagnostics.error(
-              `Array elements must have the same type; expected '${typeToString(elementType)}', got '${typeToString(t)}'`,
-              element.span,
-              "E0322",
-            );
-            return null;
-          }
-        }
+        elementTypes.push(bound);
       }
 
-      return { kind: "array", element: elementType! };
+      const first = elementTypes[0]!;
+      const homogeneous = elementTypes.every((t) => typesEqual(t, first));
+      if (!homogeneous) {
+        return { kind: "tuple", elements: elementTypes };
+      }
+
+      // Homogeneous → array (unless somehow expected was already handled as tuple above)
+      return { kind: "array", element: first };
     }
     case "IndexExpression": {
       const objectType = checkExpression(expr.object, scope, functions, structs, enums, diagnostics);
@@ -4554,6 +4780,29 @@ function checkExpression(
           return null;
         }
         return (isMapType(objectType) ? objectType.valueType : objectType.indexType) as ValueType;
+      }
+      if (isTupleType(objectType)) {
+        if (!isIntegerType(indexType)) {
+          diagnostics.error(
+            `Tuple index must be an integer, got '${typeToString(indexType)}'`,
+            expr.index.span,
+            "E0320",
+          );
+          return null;
+        }
+        const constIndex = constantIndexValue(expr.index);
+        if (constIndex !== null) {
+          if (constIndex < 0 || constIndex >= objectType.elements.length) {
+            diagnostics.error(
+              `Tuple index ${constIndex} is out of bounds.\nTuple contains ${objectType.elements.length} elements.`,
+              expr.index.span,
+              "E0332",
+            );
+            return null;
+          }
+          return objectType.elements[constIndex]!;
+        }
+        return makeUnion(objectType.elements) as ValueType;
       }
       if (!isArrayType(objectType)) {
         diagnostics.error(
@@ -4745,15 +4994,15 @@ function checkExpression(
         if (objectType === "string") {
           return "i32";
         }
-        if (!isArrayType(objectType)) {
-          diagnostics.error(
-            `Property 'length' is only available on arrays and strings, got '${typeToString(objectType)}'`,
-            expr.span,
-            "E0323",
-          );
-          return null;
+        if (isArrayType(objectType) || isTupleType(objectType)) {
+          return "i32";
         }
-        return "i32";
+        diagnostics.error(
+          `Property 'length' is only available on arrays, tuples, and strings, got '${typeToString(objectType)}'`,
+          expr.span,
+          "E0323",
+        );
+        return null;
       }
       diagnostics.error(
         `Unknown property '${expr.property.name}'`,
@@ -5874,6 +6123,15 @@ function valueMatchesBinding(
         return typesEqual(inferred.element, expected.element);
       }
       return valueMatchesBinding(el, elInferred, expected.element);
+    });
+  }
+  if (value.kind === "ArrayLiteral" && isTupleType(inferred) && isTupleType(expected)) {
+    if (value.elements.length !== expected.elements.length) {
+      return false;
+    }
+    return value.elements.every((el, i) => {
+      const elType = inferred.elements[i]!;
+      return valueMatchesBinding(el, elType, expected.elements[i]!);
     });
   }
   return false;

@@ -4,6 +4,7 @@ import type { TypeAnnotation } from "../ast/nodes.js";
 export type MonoValueType =
   | string
   | { readonly kind: "array"; readonly element: MonoValueType }
+  | { readonly kind: "tuple"; readonly elements: readonly MonoValueType[] }
   | { readonly kind: "struct" | "class" | "interface" | "enum"; readonly name: string }
   | { readonly kind: "typeParam"; readonly name: string };
 
@@ -21,6 +22,13 @@ export function valueTypeToAnnotation(type: MonoValueType): TypeAnnotation {
     return {
       kind: "ArrayType",
       element: valueTypeToAnnotation(type.element),
+      span: EMPTY_SPAN,
+    };
+  }
+  if (type.kind === "tuple") {
+    return {
+      kind: "TupleType",
+      elements: type.elements.map(valueTypeToAnnotation),
       span: EMPTY_SPAN,
     };
   }

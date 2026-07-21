@@ -1,0 +1,59 @@
+type Pair<A, B> = [A, B];
+type Person = [string, i32];
+
+function makePair<A, B>(first: A, second: B): [A, B] {
+  return [first, second];
+}
+
+function getPerson(): Person {
+  return ["Ethan", 16];
+}
+
+function printPerson(person: [string, i32]): void {
+  print(person[0]);
+  print(person[1]);
+}
+
+function getIndex(): i32 {
+  return 0;
+}
+
+function main(): void {
+  let pair: [string, i32] = ["hello", 123];
+  print(pair[0]);
+  print(pair[1]);
+  print(pair.length);
+
+  pair[0] = "world";
+  pair[1] = 456;
+  print(pair[0]);
+  print(pair[1]);
+
+  let inferred = ["John", 18];
+  print(inferred[0]);
+  print(inferred[1]);
+
+  let typed: Pair<string, i32> = ["Ethan", 16];
+  print(typed[0]);
+
+  let made = makePair("Ada", 36);
+  print(made[0]);
+  print(made[1]);
+
+  let [name, age] = getPerson();
+  print(name);
+  print(age);
+
+  let [first, , third]: [string, string, string] = ["a", "skip", "c"];
+  print(first);
+  print(third);
+
+  printPerson(["Grace", 42]);
+
+  let index: i32 = getIndex();
+  let value = pair[index];
+  if (value is string) {
+    // narrowed to string for the call
+    printPerson([value, 0]);
+  }
+}

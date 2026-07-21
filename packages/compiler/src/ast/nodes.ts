@@ -48,6 +48,8 @@ export type AstNode =
   | TypeParameter
   | Parameter
   | VariableDeclaration
+  | ArrayBindingPattern
+  | ArrayBindingElement
   | AssignmentStatement
   | UpdateStatement
   | ExpressionStatement
@@ -258,10 +260,23 @@ export interface TypeAliasDeclaration extends AstNodeBase {
   readonly type: TypeAnnotation;
 }
 
+export interface ArrayBindingElement extends AstNodeBase {
+  readonly kind: "ArrayBindingElement";
+  /** null when the element is a hole (`let [a, , b] = …`). */
+  readonly name: Identifier | null;
+}
+
+export interface ArrayBindingPattern extends AstNodeBase {
+  readonly kind: "ArrayBindingPattern";
+  readonly elements: ArrayBindingElement[];
+}
+
+export type BindingPattern = Identifier | ArrayBindingPattern;
+
 export interface VariableDeclaration extends AstNodeBase {
   readonly kind: "VariableDeclaration";
   readonly mutability: "let" | "const";
-  readonly name: Identifier;
+  readonly binding: BindingPattern;
   readonly typeAnnotation: TypeAnnotation | null;
   /** null when declared as `let x: T;` without an initializer. */
   readonly initializer: Expression | null;
@@ -478,6 +493,7 @@ export interface CharLiteral extends AstNodeBase {
 export type TypeAnnotation =
   | PrimitiveType
   | ArrayType
+  | TupleType
   | NamedType
   | UnionType
   | IntersectionType
@@ -497,6 +513,11 @@ export interface PrimitiveType extends AstNodeBase {
 export interface ArrayType extends AstNodeBase {
   readonly kind: "ArrayType";
   readonly element: TypeAnnotation;
+}
+
+export interface TupleType extends AstNodeBase {
+  readonly kind: "TupleType";
+  readonly elements: TypeAnnotation[];
 }
 
 export interface NamedType extends AstNodeBase {

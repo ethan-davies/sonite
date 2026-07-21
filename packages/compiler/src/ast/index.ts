@@ -1,4 +1,6 @@
 export type {
+  ArrayBindingElement,
+  ArrayBindingPattern,
   ArrayLiteral,
   ArrayType,
   Assignable,
@@ -6,6 +8,7 @@ export type {
   AssignmentStatement,
   BinaryExpression,
   BinaryOperator,
+  BindingPattern,
   BooleanLiteral,
   BreakStatement,
   CallCallee,
@@ -62,6 +65,7 @@ export type {
   SuperExpression,
   ThisExpression,
   TopLevelDeclaration,
+  TupleType,
   TypeAliasDeclaration,
   TypeAnnotation,
   TypeofExpression,

@@ -1118,14 +1118,151 @@ describe("compile pipeline", () => {
       expect(result.ir).toContain(encodeLlvmString("]"));
     });
 
-    it("fails on heterogeneous array literals", () => {
+    it("infers heterogeneous literals as tuples", () => {
       const result = compile(`
         function main(): void {
-          let xs = [1, true];
+          let pair = [1, true];
+          print(pair[0]);
+          print(pair[1]);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("__tuple_");
+    });
+
+    it("rejects tuple arity mismatches", () => {
+      const result = compile(`
+        function main(): void {
+          let pair: [string, i32] = ["hello"];
         }
       `);
       expect(result.success).toBe(false);
-      expect(result.diagnostics.some((d) => d.code === "E0322")).toBe(true);
+      expect(result.diagnostics.some((d) => d.code === "E0331")).toBe(true);
+    });
+
+    it("rejects tuple element type mismatches", () => {
+      const result = compile(`
+        function main(): void {
+          let pair: [string, i32] = [123, "hello"];
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0303")).toBe(true);
+    });
+
+    it("rejects out-of-bounds constant tuple indexes", () => {
+      const result = compile(`
+        function main(): void {
+          let pair: [string, i32] = ["hello", 123];
+          let value = pair[2];
+          print(value);
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0332")).toBe(true);
+    });
+
+    it("rejects negative constant tuple indexes", () => {
+      const result = compile(`
+        function main(): void {
+          let pair: [string, i32] = ["hello", 123];
+          let value = pair[-1];
+          print(value);
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0332")).toBe(true);
+    });
+
+    it("types dynamic tuple indexes as unions", () => {
+      const result = compile(`
+        function getIndex(): i32 {
+          return 0;
+        }
+        function takeString(s: string): void {
+          print(s);
+        }
+        function main(): void {
+          let pair: [string, i32] = ["hello", 123];
+          let index: i32 = getIndex();
+          let value = pair[index];
+          if (value is string) {
+            takeString(value);
+          }
+        }
+      `);
+      expect(result.success).toBe(true);
+    });
+
+    it("supports tuple length, mutation, destructuring, and generics", () => {
+      const result = compile(`
+        type Pair<A, B> = [A, B];
+
+        function makePair<A, B>(first: A, second: B): [A, B] {
+          return [first, second];
+        }
+
+        function getPerson(): [string, i32] {
+          return ["Ethan", 16];
+        }
+
+        function printPerson(person: [string, i32]): void {
+          print(person[0]);
+          print(person[1]);
+        }
+
+        function main(): void {
+          let pair: [string, i32] = ["hello", 123];
+          print(pair.length);
+          pair[0] = "world";
+          pair[1] = 456;
+          print(pair[0]);
+          print(pair[1]);
+
+          let typed: Pair<string, i32> = ["Ethan", 16];
+          print(typed[0]);
+
+          let inferred = makePair("Ethan", 16);
+          print(inferred[1]);
+
+          let [name, age] = getPerson();
+          print(name);
+          print(age);
+
+          let [first, , third]: [string, string, string] = ["a", "b", "c"];
+          print(first);
+          print(third);
+
+          printPerson(["Ethan", 16]);
+        }
+      `);
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects wrong-type tuple element assignment", () => {
+      const result = compile(`
+        function main(): void {
+          let pair: [string, i32] = ["hello", 123];
+          pair[0] = 123;
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0303")).toBe(true);
+    });
+
+    it("rejects dynamic tuple element assignment", () => {
+      const result = compile(`
+        function getIndex(): i32 {
+          return 0;
+        }
+        function main(): void {
+          let pair: [string, i32] = ["hello", 123];
+          let index: i32 = getIndex();
+          pair[index] = "x";
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0333")).toBe(true);
     });
 
     it("fails when rebinding a const array", () => {

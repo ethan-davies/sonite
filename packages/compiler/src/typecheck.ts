@@ -37,9 +37,12 @@ import {
   advancedIsAssignable,
   advancedTypeToString,
   advancedTypesEqual,
-  cloneScopeWithNarrowing,
+  applyNarrowingFacts,
   expandMappedType,
-  extractTypeofNarrowing,
+  extractFalseNarrowingFacts,
+  extractNarrowingFacts,
+  flattenUnion,
+  includesNull,
   indexedAccess,
   isIntersectionType,
   isLiteralType,
@@ -50,6 +53,7 @@ import {
   literalBaseType,
   makeIntersection,
   makeUnion,
+  mutateScopeWithFacts,
   objectShapeName,
   typeofTagForType,
   type ExtendedValueType,
@@ -58,6 +62,7 @@ import {
   type MapValueType,
   type ObjectValueType,
   type TypeAliasDef,
+  type TypeAnnResolver,
   type UnionValueType,
 } from "./typecheck-advanced.js";
 
@@ -278,7 +283,16 @@ interface MemberContext {
 }
 
 const NUMERIC_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f64"]);
-const EQUALITY_PRIMITIVES = new Set<PrimitiveValueType>(["i32", "i64", "f32", "f64", "bool", "char", "string"]);
+const EQUALITY_PRIMITIVES = new Set<PrimitiveValueType>([
+  "i32",
+  "i64",
+  "f32",
+  "f64",
+  "bool",
+  "char",
+  "string",
+  "null",
+]);
 
 /** Active import namespaces while type-checking a module. */
 let activeNamespaces: Map<string, ModuleNamespace> = new Map();
@@ -3536,6 +3550,41 @@ function findClassByLocal(
   return activeClasses.get(name) ?? specializedClasses.get(name);
 }
 
+function makeNarrowingResolver(
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+): TypeAnnResolver {
+  return (ann) => resolveAnnotation(ann, structs, enums, diagnostics);
+}
+
+/** Returns true when every path through the statement list exits (return/break/continue). */
+function checkStatements(
+  stmts: Statement[],
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  returnType: ReturnType,
+  diagnostics: DiagnosticCollector,
+  loopDepth: number,
+): boolean {
+  let exits = false;
+  for (const s of stmts) {
+    if (exits) {
+      // Still typecheck unreachable code for errors, but don't apply further CFA
+      checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+      continue;
+    }
+    exits = checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+  }
+  return exits;
+}
+
+/**
+ * Typecheck a statement. Returns true if this statement unconditionally exits
+ * the current block (return / break / continue, or if both branches exit).
+ */
 function checkStatement(
   stmt: Statement,
   scope: Map<string, Binding>,
@@ -3545,7 +3594,7 @@ function checkStatement(
   returnType: ReturnType,
   diagnostics: DiagnosticCollector,
   loopDepth: number,
-): void {
+): boolean {
   switch (stmt.kind) {
     case "VariableDeclaration": {
       if (scope.has(stmt.name.name)) {
@@ -3554,15 +3603,31 @@ function checkStatement(
           stmt.name.span,
           "E0301",
         );
-        return;
+        return false;
       }
 
       let annotated: ValueType | null = null;
       if (stmt.typeAnnotation) {
         annotated = resolveAnnotation(stmt.typeAnnotation, structs, enums, diagnostics);
         if (annotated === null) {
-          return;
+          return false;
         }
+      }
+
+      if (stmt.initializer === null) {
+        if (!annotated) {
+          diagnostics.error(
+            `Variable '${stmt.name.name}' requires a type annotation when not initialized`,
+            stmt.name.span,
+            "E0303",
+          );
+          return false;
+        }
+        scope.set(stmt.name.name, {
+          type: annotated,
+          mutable: stmt.mutability === "let",
+        });
+        return false;
       }
 
       const inferred = checkExpression(
@@ -3576,7 +3641,7 @@ function checkStatement(
         annotated,
       );
       if (!inferred) {
-        return;
+        return false;
       }
 
       let bindingType: ValueType = inferred;
@@ -3587,7 +3652,7 @@ function checkStatement(
             stmt.initializer.span,
             "E0303",
           );
-          return;
+          return false;
         }
         bindingType = annotated;
       }
@@ -3596,17 +3661,17 @@ function checkStatement(
         type: bindingType,
         mutable: stmt.mutability === "let",
       });
-      return;
+      return false;
     }
     case "AssignmentStatement": {
       checkAssignment(stmt, scope, functions, structs, enums, diagnostics);
-      return;
+      return false;
     }
     case "UpdateStatement": {
       const binding = scope.get(stmt.name.name);
       if (!binding) {
         diagnostics.error(`Undefined variable '${stmt.name.name}'`, stmt.name.span, "E0304");
-        return;
+        return false;
       }
       if (!binding.mutable) {
         diagnostics.error(
@@ -3614,7 +3679,7 @@ function checkStatement(
           stmt.name.span,
           "E0305",
         );
-        return;
+        return false;
       }
       if (!isNumericType(binding.type)) {
         diagnostics.error(
@@ -3623,11 +3688,11 @@ function checkStatement(
           "E0306",
         );
       }
-      return;
+      return false;
     }
     case "ExpressionStatement": {
       checkExpression(stmt.expression, scope, functions, structs, enums, diagnostics, true);
-      return;
+      return false;
     }
     case "ReturnStatement": {
       if (returnType === "void") {
@@ -3638,7 +3703,7 @@ function checkStatement(
             "E0313",
           );
         }
-        return;
+        return true;
       }
 
       if (stmt.value === null) {
@@ -3647,12 +3712,12 @@ function checkStatement(
           stmt.span,
           "E0314",
         );
-        return;
+        return true;
       }
 
       const valueType = checkExpression(stmt.value, scope, functions, structs, enums, diagnostics);
       if (!valueType) {
-        return;
+        return true;
       }
       if (!valueMatchesBinding(stmt.value, valueType, returnType)) {
         diagnostics.error(
@@ -3661,9 +3726,10 @@ function checkStatement(
           "E0303",
         );
       }
-      return;
+      return true;
     }
     case "IfStatement": {
+      const resolveAnn = makeNarrowingResolver(structs, enums, diagnostics);
       const condType = checkExpression(stmt.condition, scope, functions, structs, enums, diagnostics);
       if (condType && condType !== "bool") {
         diagnostics.error(
@@ -3672,29 +3738,60 @@ function checkStatement(
           "E0316",
         );
       }
-      const narrowing = extractTypeofNarrowing(stmt.condition);
-      const thenScope = cloneScopeWithNarrowing(scope, narrowing) as Map<string, Binding>;
-      const elseNarrowing = narrowing
-        ? { ...narrowing, positive: !narrowing.positive }
-        : null;
-      const elseScope = cloneScopeWithNarrowing(scope, elseNarrowing) as Map<string, Binding>;
+      const thenFacts = extractNarrowingFacts(stmt.condition, resolveAnn);
+      const elseFacts = extractFalseNarrowingFacts(stmt.condition, resolveAnn);
+      const thenScope = applyNarrowingFacts(scope, thenFacts) as Map<string, Binding>;
+      const elseScope = applyNarrowingFacts(scope, elseFacts) as Map<string, Binding>;
 
-      for (const s of stmt.consequent) {
-        checkStatement(s, thenScope, functions, structs, enums, returnType, diagnostics, loopDepth);
-      }
+      const thenExits = checkStatements(
+        stmt.consequent,
+        thenScope,
+        functions,
+        structs,
+        enums,
+        returnType,
+        diagnostics,
+        loopDepth,
+      );
+
+      let elseExits = false;
       if (stmt.alternate === null) {
-        return;
-      }
-      if (Array.isArray(stmt.alternate)) {
-        for (const s of stmt.alternate) {
-          checkStatement(s, elseScope, functions, structs, enums, returnType, diagnostics, loopDepth);
-        }
+        elseExits = false;
+      } else if (Array.isArray(stmt.alternate)) {
+        elseExits = checkStatements(
+          stmt.alternate,
+          elseScope,
+          functions,
+          structs,
+          enums,
+          returnType,
+          diagnostics,
+          loopDepth,
+        );
       } else {
-        checkStatement(stmt.alternate, elseScope, functions, structs, enums, returnType, diagnostics, loopDepth);
+        elseExits = checkStatement(
+          stmt.alternate,
+          elseScope,
+          functions,
+          structs,
+          enums,
+          returnType,
+          diagnostics,
+          loopDepth,
+        );
       }
-      return;
+
+      // Post-if CFA: if one branch exits, apply the other branch's facts to the continuing scope
+      if (thenExits && !elseExits) {
+        mutateScopeWithFacts(scope, elseFacts);
+      } else if (elseExits && !thenExits) {
+        mutateScopeWithFacts(scope, thenFacts);
+      }
+
+      return thenExits && elseExits;
     }
     case "WhileStatement": {
+      const resolveAnn = makeNarrowingResolver(structs, enums, diagnostics);
       const condType = checkExpression(stmt.condition, scope, functions, structs, enums, diagnostics);
       if (condType && condType !== "bool") {
         diagnostics.error(
@@ -3703,10 +3800,19 @@ function checkStatement(
           "E0316",
         );
       }
-      for (const s of stmt.body) {
-        checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth + 1);
-      }
-      return;
+      const bodyFacts = extractNarrowingFacts(stmt.condition, resolveAnn);
+      const bodyScope = applyNarrowingFacts(scope, bodyFacts) as Map<string, Binding>;
+      checkStatements(
+        stmt.body,
+        bodyScope,
+        functions,
+        structs,
+        enums,
+        returnType,
+        diagnostics,
+        loopDepth + 1,
+      );
+      return false;
     }
     case "ForStatement": {
       if (stmt.initializer) {
@@ -3725,15 +3831,22 @@ function checkStatement(
       if (stmt.update) {
         checkStatement(stmt.update, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
       }
-      for (const s of stmt.body) {
-        checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth + 1);
-      }
-      return;
+      checkStatements(
+        stmt.body,
+        scope,
+        functions,
+        structs,
+        enums,
+        returnType,
+        diagnostics,
+        loopDepth + 1,
+      );
+      return false;
     }
     case "ForInStatement": {
       const iterableType = checkExpression(stmt.iterable, scope, functions, structs, enums, diagnostics);
       if (!iterableType) {
-        return;
+        return false;
       }
       if (!isArrayType(iterableType)) {
         diagnostics.error(
@@ -3741,7 +3854,7 @@ function checkStatement(
           stmt.iterable.span,
           "E0318",
         );
-        return;
+        return false;
       }
 
       if (scope.has(stmt.name.name)) {
@@ -3750,34 +3863,40 @@ function checkStatement(
           stmt.name.span,
           "E0301",
         );
-        return;
+        return false;
       }
 
-      // Bare / const → immutable loop var; let → mutable
       const mutable = stmt.mutability === "let";
       scope.set(stmt.name.name, {
         type: iterableType.element,
         mutable,
       });
 
-      for (const s of stmt.body) {
-        checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth + 1);
-      }
+      checkStatements(
+        stmt.body,
+        scope,
+        functions,
+        structs,
+        enums,
+        returnType,
+        diagnostics,
+        loopDepth + 1,
+      );
 
       scope.delete(stmt.name.name);
-      return;
+      return false;
     }
     case "BreakStatement": {
       if (loopDepth === 0) {
         diagnostics.error("'break' used outside of a loop", stmt.span, "E0317");
       }
-      return;
+      return true;
     }
     case "ContinueStatement": {
       if (loopDepth === 0) {
         diagnostics.error("'continue' used outside of a loop", stmt.span, "E0317");
       }
-      return;
+      return true;
     }
   }
 }
@@ -4209,6 +4328,8 @@ function checkExpression(
       return "string";
     case "CharLiteral":
       return "char";
+    case "NullLiteral":
+      return "null";
     case "StructLiteral": {
       let def: StructDef | undefined;
       let template = activeGenericStructs.get(expr.name.name);
@@ -4547,6 +4668,18 @@ function checkExpression(
       if (!objectType) {
         return null;
       }
+      if (isUnionType(objectType) || objectType === "null") {
+        const typeStr = typeToString(objectType);
+        const mayBeNull = includesNull(objectType) || objectType === "null";
+        let message = `Cannot access property '${expr.property.name}' on type '${typeStr}'.`;
+        if (mayBeNull && expr.object.kind === "Identifier") {
+          message += `\n'${expr.object.name}' may be null.`;
+        } else if (mayBeNull) {
+          message += `\nValue may be null.`;
+        }
+        diagnostics.error(message, expr.span, "E0397");
+        return null;
+      }
       if (isObjectType(objectType)) {
         const field = objectType.fields.find((f) => f.name === expr.property.name);
         if (!field) {
@@ -4853,15 +4986,45 @@ function checkExpression(
       }
       return "string";
     }
-    case "BinaryExpression": {
-      const left = checkExpression(expr.left, scope, functions, structs, enums, diagnostics);
-      const right = checkExpression(expr.right, scope, functions, structs, enums, diagnostics);
-      if (!left || !right) {
+    case "IsExpression": {
+      const valueType = checkExpression(expr.value, scope, functions, structs, enums, diagnostics);
+      if (!valueType) {
         return null;
       }
-
+      const targetType = resolveAnnotation(expr.typeAnnotation, structs, enums, diagnostics);
+      if (targetType === null) {
+        return null;
+      }
+      return "bool";
+    }
+    case "BinaryExpression": {
       if (expr.operator === "&&" || expr.operator === "||") {
-        if (left !== "bool" || right !== "bool") {
+        const left = checkExpression(expr.left, scope, functions, structs, enums, diagnostics);
+        if (!left) {
+          return null;
+        }
+        if (left !== "bool") {
+          diagnostics.error(
+            `Operator '${expr.operator}' requires two bool operands, got '${typeToString(left)}' and '...'`,
+            expr.span,
+            "E0306",
+          );
+          return null;
+        }
+        // Right side of && sees true-facts from left
+        const resolveAnn = makeNarrowingResolver(structs, enums, diagnostics);
+        const rightScope =
+          expr.operator === "&&"
+            ? (applyNarrowingFacts(scope, extractNarrowingFacts(expr.left, resolveAnn)) as Map<
+                string,
+                Binding
+              >)
+            : scope;
+        const right = checkExpression(expr.right, rightScope, functions, structs, enums, diagnostics);
+        if (!right) {
+          return null;
+        }
+        if (right !== "bool") {
           diagnostics.error(
             `Operator '${expr.operator}' requires two bool operands, got '${typeToString(left)}' and '${typeToString(right)}'`,
             expr.span,
@@ -4870,6 +5033,12 @@ function checkExpression(
           return null;
         }
         return "bool";
+      }
+
+      const left = checkExpression(expr.left, scope, functions, structs, enums, diagnostics);
+      const right = checkExpression(expr.right, scope, functions, structs, enums, diagnostics);
+      if (!left || !right) {
+        return null;
       }
 
       if (
@@ -5554,7 +5723,16 @@ function supportsEquality(type: ValueType): boolean {
   if (typeof type === "string") {
     return EQUALITY_PRIMITIVES.has(type);
   }
-  return type.kind === "enum";
+  // Reference types and unions support == / != (especially vs null)
+  return (
+    type.kind === "enum" ||
+    type.kind === "class" ||
+    type.kind === "interface" ||
+    type.kind === "array" ||
+    type.kind === "map" ||
+    type.kind === "union" ||
+    type.kind === "object"
+  );
 }
 
 function typeMismatchMessage(expected: ValueType | PrimitiveTypeName, got: ValueType | PrimitiveTypeName): string {
@@ -5577,7 +5755,45 @@ function checkComparison(
   span: SourceSpan,
   diagnostics: DiagnosticCollector,
 ): ValueType | null {
+  const isEquality = operator === "==" || operator === "!=";
+
+  // null comparisons: null == null, or T|null == null, or class/string == null, etc.
+  if (isEquality && (left === "null" || right === "null")) {
+    const other = left === "null" ? right : left;
+    if (
+      other === "null" ||
+      other === "string" ||
+      includesNull(other) ||
+      isUnionType(other) ||
+      (typeof other === "object" &&
+        (other.kind === "class" ||
+          other.kind === "interface" ||
+          other.kind === "array" ||
+          other.kind === "map" ||
+          other.kind === "object"))
+    ) {
+      return "bool";
+    }
+    if (supportsEquality(other)) {
+      return "bool";
+    }
+    diagnostics.error(
+      `Operator '${operator}' cannot compare type '${typeToString(other)}' with null`,
+      span,
+      "E0306",
+    );
+    return null;
+  }
+
   if (!typesEqual(left, right)) {
+    // Allow comparing a union to one of its arms for equality (rare); otherwise error
+    if (
+      isEquality &&
+      ((isUnionType(left) && isAssignable(right, left)) ||
+        (isUnionType(right) && isAssignable(left, right)))
+    ) {
+      return "bool";
+    }
     diagnostics.error(
       `Operator '${operator}' requires matching operand types, got '${typeToString(left)}' and '${typeToString(right)}'`,
       span,
@@ -5586,7 +5802,6 @@ function checkComparison(
     return null;
   }
 
-  const isEquality = operator === "==" || operator === "!=";
   if (isEquality) {
     if (supportsEquality(left)) {
       return "bool";

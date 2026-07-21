@@ -8,7 +8,8 @@ export type PrimitiveTypeName =
   | "bool"
   | "string"
   | "char"
-  | "void";
+  | "void"
+  | "null";
 
 export type BinaryOperator =
   | "+"
@@ -61,6 +62,7 @@ export type AstNode =
   | BinaryExpression
   | UnaryExpression
   | TypeofExpression
+  | IsExpression
   | IndexExpression
   | MemberExpression
   | ArrayLiteral
@@ -75,6 +77,7 @@ export type AstNode =
   | FloatLiteral
   | BooleanLiteral
   | CharLiteral
+  | NullLiteral
   | TypeAnnotation;
 
 interface AstNodeBase {
@@ -260,7 +263,8 @@ export interface VariableDeclaration extends AstNodeBase {
   readonly mutability: "let" | "const";
   readonly name: Identifier;
   readonly typeAnnotation: TypeAnnotation | null;
-  readonly initializer: Expression;
+  /** null when declared as `let x: T;` without an initializer. */
+  readonly initializer: Expression | null;
 }
 
 export type Assignable = Identifier | IndexExpression | MemberExpression;
@@ -332,6 +336,7 @@ export type Expression =
   | BinaryExpression
   | UnaryExpression
   | TypeofExpression
+  | IsExpression
   | IndexExpression
   | MemberExpression
   | ArrayLiteral
@@ -344,7 +349,8 @@ export type Expression =
   | IntegerLiteral
   | FloatLiteral
   | BooleanLiteral
-  | CharLiteral;
+  | CharLiteral
+  | NullLiteral;
 
 export type CallCallee = Identifier | MemberExpression | SuperExpression;
 
@@ -372,6 +378,12 @@ export interface UnaryExpression extends AstNodeBase {
 export interface TypeofExpression extends AstNodeBase {
   readonly kind: "TypeofExpression";
   readonly operand: Expression;
+}
+
+export interface IsExpression extends AstNodeBase {
+  readonly kind: "IsExpression";
+  readonly value: Expression;
+  readonly typeAnnotation: TypeAnnotation;
 }
 
 export interface IndexExpression extends AstNodeBase {
@@ -451,6 +463,10 @@ export interface FloatLiteral extends AstNodeBase {
 export interface BooleanLiteral extends AstNodeBase {
   readonly kind: "BooleanLiteral";
   readonly value: boolean;
+}
+
+export interface NullLiteral extends AstNodeBase {
+  readonly kind: "NullLiteral";
 }
 
 export interface CharLiteral extends AstNodeBase {

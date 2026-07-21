@@ -1,0 +1,54 @@
+class User {
+  name: string;
+
+  constructor(name: string) {
+    this.name = name;
+  }
+}
+
+function findUser(id: i32): User | null {
+  if (id == 10) {
+    return new User("Ada");
+  }
+  return null;
+}
+
+function process(value: string | null): void {
+  if (value == null) {
+    return;
+  }
+  print(value.length);
+}
+
+function main(): void {
+  let user: User | null = null;
+  user = new User("Grace");
+  user = null;
+
+  let found = findUser(10);
+  if (found != null) {
+    print(found.name);
+  } else {
+    print("No user");
+  }
+
+  process("hello");
+  process(null);
+
+  let value: string | i32 | bool = "hi";
+  if (typeof value == "string") {
+    print(value.length);
+  } elseif (typeof value == "i32") {
+    print(value + 1);
+  } else {
+    print(value == true);
+  }
+
+  let mixed: string | null = "ok";
+  if (mixed is string) {
+    print(mixed.length);
+  }
+  if (mixed is null) {
+    print("was null");
+  }
+}

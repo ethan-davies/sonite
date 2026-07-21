@@ -76,7 +76,7 @@ describe("Parser", () => {
 
     if (body[0]?.kind === "VariableDeclaration") {
       expect(body[0].mutability).toBe("let");
-      expect(body[0].initializer.kind).toBe("IntegerLiteral");
+      expect(body[0].initializer?.kind).toBe("IntegerLiteral");
     }
     if (body[1]?.kind === "VariableDeclaration") {
       expect(body[1].mutability).toBe("const");
@@ -183,8 +183,8 @@ describe("Parser", () => {
     const body = ast.body[1].body;
     expect(body[0]?.kind).toBe("VariableDeclaration");
     if (body[0]?.kind === "VariableDeclaration") {
-      expect(body[0].initializer.kind).toBe("StructLiteral");
-      if (body[0].initializer.kind === "StructLiteral") {
+      expect(body[0].initializer?.kind).toBe("StructLiteral");
+      if (body[0].initializer?.kind === "StructLiteral") {
         expect(body[0].initializer.name.name).toBe("Person");
         expect(body[0].initializer.fields).toHaveLength(2);
       }
@@ -234,8 +234,8 @@ describe("Parser", () => {
         namespace: null,
         name: "Direction",
       });
-      expect(decl.initializer.kind).toBe("MemberExpression");
-      if (decl.initializer.kind === "MemberExpression") {
+      expect(decl.initializer?.kind).toBe("MemberExpression");
+      if (decl.initializer?.kind === "MemberExpression") {
         expect(decl.initializer.object).toMatchObject({
           kind: "Identifier",
           name: "Direction",
@@ -489,8 +489,8 @@ describe("Parser", () => {
           name: "i32",
         });
       }
-      expect(body[0].initializer.kind).toBe("ArrayLiteral");
-      if (body[0].initializer.kind === "ArrayLiteral") {
+      expect(body[0].initializer?.kind).toBe("ArrayLiteral");
+      if (body[0].initializer?.kind === "ArrayLiteral") {
         expect(body[0].initializer.elements).toHaveLength(3);
       }
     }
@@ -879,5 +879,30 @@ describe("Parser", () => {
       kind: "TypeAliasDeclaration",
       type: { kind: "IndexedAccessType" },
     });
+  });
+
+  it("parses null literals, nullable types, is-checks, and uninitialized let", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        let user: User | null;
+        user = null;
+        if (user is User) {}
+        if (user is null) {}
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const body = functionAt(ast, 0).body;
+    expect(body[0]?.kind).toBe("VariableDeclaration");
+    if (body[0]?.kind === "VariableDeclaration") {
+      expect(body[0].initializer).toBeNull();
+      expect(body[0].typeAnnotation?.kind).toBe("UnionType");
+    }
+    expect(body[1]?.kind).toBe("AssignmentStatement");
+    if (body[1]?.kind === "AssignmentStatement") {
+      expect(body[1].value.kind).toBe("NullLiteral");
+    }
+    if (body[2]?.kind === "IfStatement") {
+      expect(body[2].condition.kind).toBe("IsExpression");
+    }
   });
 });

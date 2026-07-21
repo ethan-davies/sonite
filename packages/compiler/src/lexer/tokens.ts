@@ -42,6 +42,8 @@ export enum TokenKind {
   In = "in",
   Keyof = "keyof",
   Typeof = "typeof",
+  Null = "null",
+  Is = "is",
 
   LParen = "(",
   RParen = ")",
@@ -124,4 +126,6 @@ export const KEYWORDS: ReadonlyMap<string, TokenKind> = new Map([
   ["in", TokenKind.In],
   ["keyof", TokenKind.Keyof],
   ["typeof", TokenKind.Typeof],
+  ["null", TokenKind.Null],
+  ["is", TokenKind.Is],
 ]);

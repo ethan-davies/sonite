@@ -200,6 +200,12 @@ function substExpression(expr: Expression, subst: TypeSubst): Expression {
       return { ...expr, operand: substExpression(expr.operand, subst) };
     case "TypeofExpression":
       return { ...expr, operand: substExpression(expr.operand, subst) };
+    case "IsExpression":
+      return {
+        ...expr,
+        value: substExpression(expr.value, subst),
+        typeAnnotation: substituteAnnotation(expr.typeAnnotation, subst),
+      };
     case "IndexExpression":
       return {
         ...expr,
@@ -226,7 +232,7 @@ function substStatement(stmt: Statement, subst: TypeSubst): Statement {
         typeAnnotation: stmt.typeAnnotation
           ? substituteAnnotation(stmt.typeAnnotation, subst)
           : null,
-        initializer: substExpression(stmt.initializer, subst),
+        initializer: stmt.initializer ? substExpression(stmt.initializer, subst) : null,
       };
     case "AssignmentStatement":
       return {

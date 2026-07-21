@@ -252,17 +252,37 @@ export function literalBaseType(lit: LiteralValueType): string {
 }
 
 export function typeofTagForType(type: ExtendedValueType): string | null {
+  if (type === "null") {
+    return "null";
+  }
   if (type === "string") {
     return "string";
   }
   if (type === "bool") {
-    return "boolean";
+    return "bool";
+  }
+  if (type === "char") {
+    return "char";
   }
   if (typeof type === "string" && (type === "i32" || type === "i64" || type === "f32" || type === "f64")) {
-    return "number";
+    return type;
   }
   if (isLiteralType(type)) {
-    return type.literalKind === "string" ? "string" : "number";
+    return type.literalKind === "string" ? "string" : "i32";
+  }
+  if (typeof type === "object") {
+    // class, struct, array, interface, enum, object, map, union → object at runtime typeof
+    if (
+      type.kind === "class" ||
+      type.kind === "struct" ||
+      type.kind === "interface" ||
+      type.kind === "enum" ||
+      type.kind === "array" ||
+      type.kind === "object" ||
+      type.kind === "map"
+    ) {
+      return "object";
+    }
   }
   return null;
 }
@@ -283,6 +303,58 @@ export function narrowByTypeofTag(
   return makeUnion(matched);
 }
 
+export function stripNull(type: ExtendedValueType): ExtendedValueType {
+  const arms = flattenUnion(type).filter((a) => a !== "null");
+  if (arms.length === 0) {
+    return "null";
+  }
+  return makeUnion(arms);
+}
+
+export function includesNull(type: ExtendedValueType): boolean {
+  return flattenUnion(type).some((a) => a === "null");
+}
+
+export function narrowByNullCheck(
+  type: ExtendedValueType,
+  positive: boolean,
+): ExtendedValueType {
+  // positive = value is not null (from `!= null` or successful non-null branch)
+  if (positive) {
+    return stripNull(type);
+  }
+  return "null";
+}
+
+function armMatchesIsTarget(
+  arm: ExtendedValueType,
+  target: ExtendedValueType,
+): boolean {
+  if (target === "null") {
+    return arm === "null";
+  }
+  return advancedTypesEqual(arm, target);
+}
+
+export function narrowByIsType(
+  type: ExtendedValueType,
+  target: ExtendedValueType,
+  positive: boolean,
+): ExtendedValueType {
+  if (target === "null") {
+    // `is null` positive → null; negative → strip null
+    return narrowByNullCheck(type, !positive);
+  }
+  const arms = flattenUnion(type);
+  const kept = positive
+    ? arms.filter((arm) => armMatchesIsTarget(arm, target))
+    : arms.filter((arm) => !armMatchesIsTarget(arm, target));
+  if (kept.length === 0) {
+    return type;
+  }
+  return makeUnion(kept);
+}
+
 export type AssignabilityFn = (from: ExtendedValueType, to: ExtendedValueType) => boolean;
 
 export function advancedIsAssignable(
@@ -292,6 +364,16 @@ export function advancedIsAssignable(
 ): boolean {
   if (advancedTypesEqual(from, to)) {
     return true;
+  }
+
+  if (from === "null") {
+    if (to === "null") {
+      return true;
+    }
+    if (isUnionType(to)) {
+      return to.arms.some((arm) => advancedIsAssignable(from, arm, baseAssign));
+    }
+    return false;
   }
 
   if (isLiteralType(from)) {
@@ -410,6 +492,153 @@ function mangleValueRough(type: ExtendedValueType): string {
   return "x";
 }
 
+export type NarrowingFact =
+  | { readonly kind: "typeof"; readonly name: string; readonly tag: string; readonly positive: boolean }
+  | { readonly kind: "nullCheck"; readonly name: string; readonly isNotNull: boolean }
+  | { readonly kind: "is"; readonly name: string; readonly type: ExtendedValueType; readonly positive: boolean };
+
+export type TypeAnnResolver = (ann: import("./ast/nodes.js").TypeAnnotation) => ExtendedValueType | null;
+
+function invertFact(fact: NarrowingFact): NarrowingFact {
+  switch (fact.kind) {
+    case "typeof":
+      return { ...fact, positive: !fact.positive };
+    case "nullCheck":
+      return { ...fact, isNotNull: !fact.isNotNull };
+    case "is":
+      return { ...fact, positive: !fact.positive };
+  }
+}
+
+export function invertFacts(facts: readonly NarrowingFact[]): NarrowingFact[] {
+  return facts.map(invertFact);
+}
+
+export function narrowTypeByFact(type: ExtendedValueType, fact: NarrowingFact): ExtendedValueType {
+  switch (fact.kind) {
+    case "typeof":
+      return narrowByTypeofTag(type, fact.tag, fact.positive);
+    case "nullCheck":
+      return narrowByNullCheck(type, fact.isNotNull);
+    case "is":
+      return narrowByIsType(type, fact.type, fact.positive);
+  }
+}
+
+/** Extract true-branch narrowing facts from a condition expression. */
+export function extractNarrowingFacts(
+  expr: Expression,
+  resolveAnn?: TypeAnnResolver,
+): NarrowingFact[] {
+  if (expr.kind === "UnaryExpression" && expr.operator === "!") {
+    return invertFacts(extractNarrowingFacts(expr.operand, resolveAnn));
+  }
+
+  if (expr.kind === "BinaryExpression") {
+    const { operator, left, right } = expr;
+
+    if (operator === "&&") {
+      // True branch: both sides true
+      return [
+        ...extractNarrowingFacts(left, resolveAnn),
+        ...extractNarrowingFacts(right, resolveAnn),
+      ];
+    }
+    if (operator === "||") {
+      // True branch of || is hard; keep empty for true, use invert of both for false via invertFacts
+      // For true-facts of `a || b` we cannot simply union. Leave empty.
+      return [];
+    }
+
+    if (operator === "==" || operator === "!=") {
+      const eq = operator === "==";
+
+      // typeof x ==/!= "tag"
+      if (
+        left.kind === "TypeofExpression" &&
+        left.operand.kind === "Identifier" &&
+        right.kind === "StringLiteral"
+      ) {
+        return [{ kind: "typeof", name: left.operand.name, tag: right.value, positive: eq }];
+      }
+      if (
+        right.kind === "TypeofExpression" &&
+        right.operand.kind === "Identifier" &&
+        left.kind === "StringLiteral"
+      ) {
+        return [{ kind: "typeof", name: right.operand.name, tag: left.value, positive: eq }];
+      }
+
+      // x == null / x != null
+      if (left.kind === "Identifier" && right.kind === "NullLiteral") {
+        return [{ kind: "nullCheck", name: left.name, isNotNull: !eq }];
+      }
+      if (right.kind === "Identifier" && left.kind === "NullLiteral") {
+        return [{ kind: "nullCheck", name: right.name, isNotNull: !eq }];
+      }
+    }
+  }
+
+  if (expr.kind === "IsExpression" && expr.value.kind === "Identifier" && resolveAnn) {
+    const target = resolveAnn(expr.typeAnnotation);
+    if (target !== null) {
+      return [{ kind: "is", name: expr.value.name, type: target, positive: true }];
+    }
+  }
+
+  return [];
+}
+
+/** False-branch facts: invert true facts, with special handling for || / &&. */
+export function extractFalseNarrowingFacts(
+  expr: Expression,
+  resolveAnn?: TypeAnnResolver,
+): NarrowingFact[] {
+  if (expr.kind === "BinaryExpression" && expr.operator === "||") {
+    // False when both sides false
+    return [
+      ...extractFalseNarrowingFacts(expr.left, resolveAnn),
+      ...extractFalseNarrowingFacts(expr.right, resolveAnn),
+    ];
+  }
+  if (expr.kind === "BinaryExpression" && expr.operator === "&&") {
+    // False branch of && is hard; invert combined true facts as approximation
+    return invertFacts(extractNarrowingFacts(expr, resolveAnn));
+  }
+  return invertFacts(extractNarrowingFacts(expr, resolveAnn));
+}
+
+export function applyNarrowingFacts<T extends { type: ExtendedValueType; mutable: boolean }>(
+  scope: Map<string, T>,
+  facts: readonly NarrowingFact[],
+): Map<string, T> {
+  const next = new Map(scope);
+  for (const fact of facts) {
+    const binding = next.get(fact.name);
+    if (!binding) {
+      continue;
+    }
+    const narrowed = narrowTypeByFact(binding.type, fact);
+    next.set(fact.name, { ...binding, type: narrowed });
+  }
+  return next;
+}
+
+/** Mutate scope bindings in place with narrowing facts (for post-if CFA). */
+export function mutateScopeWithFacts<T extends { type: ExtendedValueType; mutable: boolean }>(
+  scope: Map<string, T>,
+  facts: readonly NarrowingFact[],
+): void {
+  for (const fact of facts) {
+    const binding = scope.get(fact.name);
+    if (!binding) {
+      continue;
+    }
+    scope.set(fact.name, { ...binding, type: narrowTypeByFact(binding.type, fact) });
+  }
+}
+
+/** @deprecated Use extractNarrowingFacts */
 export interface TypeofNarrowing {
   readonly name: string;
   readonly tag: string;
@@ -417,51 +646,21 @@ export interface TypeofNarrowing {
 }
 
 export function extractTypeofNarrowing(expr: Expression): TypeofNarrowing | null {
-  if (expr.kind === "BinaryExpression") {
-    const { operator, left, right } = expr;
-    if (operator !== "==" && operator !== "!=") {
-      return null;
-    }
-    const positive = operator === "==";
-    if (
-      left.kind === "TypeofExpression" &&
-      left.operand.kind === "Identifier" &&
-      right.kind === "StringLiteral"
-    ) {
-      return { name: left.operand.name, tag: right.value, positive };
-    }
-    if (
-      right.kind === "TypeofExpression" &&
-      right.operand.kind === "Identifier" &&
-      left.kind === "StringLiteral"
-    ) {
-      return { name: right.operand.name, tag: left.value, positive };
-    }
-  }
-  if (expr.kind === "UnaryExpression" && expr.operator === "!") {
-    const inner = extractTypeofNarrowing(expr.operand);
-    if (inner) {
-      return { ...inner, positive: !inner.positive };
-    }
-  }
-  return null;
+  const facts = extractNarrowingFacts(expr);
+  const f = facts.find((x): x is Extract<NarrowingFact, { kind: "typeof" }> => x.kind === "typeof");
+  return f ? { name: f.name, tag: f.tag, positive: f.positive } : null;
 }
 
 export function cloneScopeWithNarrowing<T extends { type: ExtendedValueType; mutable: boolean }>(
   scope: Map<string, T>,
   narrowing: TypeofNarrowing | null,
 ): Map<string, T> {
-  const next = new Map(scope);
   if (!narrowing) {
-    return next;
+    return new Map(scope);
   }
-  const binding = next.get(narrowing.name);
-  if (!binding) {
-    return next;
-  }
-  const narrowed = narrowByTypeofTag(binding.type, narrowing.tag, narrowing.positive);
-  next.set(narrowing.name, { ...binding, type: narrowed });
-  return next;
+  return applyNarrowingFacts(scope, [
+    { kind: "typeof", name: narrowing.name, tag: narrowing.tag, positive: narrowing.positive },
+  ]);
 }
 
 export function reportTypeError(

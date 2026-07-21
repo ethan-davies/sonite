@@ -33,12 +33,14 @@ import type {
   InterfaceIndexSignature,
   InterfaceMethodSignature,
   IntersectionType,
+  IsExpression,
   KeyofType,
   LiteralType,
   MappedType,
   MemberExpression,
   NamedType,
   NewExpression,
+  NullLiteral,
   ObjectIndexSignature,
   ObjectType,
   ObjectTypeField,
@@ -80,6 +82,7 @@ const PRIMITIVE_TYPES = new Set<string>([
   "string",
   "char",
   "void",
+  "null",
 ]);
 
 const ASSIGNMENT_OPS = new Set<TokenKind>([
@@ -1682,17 +1685,35 @@ export class Parser {
       }
     }
 
-    if (!this.expect(TokenKind.Equal, "Expected '=' after variable name")) {
+    let initializer: Expression | null = null;
+    if (this.check(TokenKind.Equal)) {
+      this.advance();
+      initializer = this.parseExpression();
+      if (!initializer) {
+        return null;
+      }
+    } else if (mutability === "const") {
+      this.diagnostics.error(
+        "const declarations must have an initializer",
+        name.span,
+        "E0102",
+      );
       return null;
-    }
-
-    const initializer = this.parseExpression();
-    if (!initializer) {
+    } else if (!typeAnnotation) {
+      this.diagnostics.error(
+        "Expected '=' after variable name",
+        this.peek().span,
+        "E0102",
+      );
       return null;
     }
 
     const semicolon = this.expect(TokenKind.Semicolon, "Expected ';' after variable declaration");
-    const end = semicolon?.span.end ?? initializer.span.end;
+    const end =
+      semicolon?.span.end ??
+      initializer?.span.end ??
+      typeAnnotation?.span.end ??
+      name.span.end;
 
     return {
       kind: "VariableDeclaration",
@@ -2060,6 +2081,22 @@ export class Parser {
       left = binary;
     }
 
+    // `value is Type` — same precedence band as relational comparisons
+    while (this.check(TokenKind.Is)) {
+      this.advance();
+      const typeAnnotation = this.parseType();
+      if (!typeAnnotation) {
+        return null;
+      }
+      const isExpr: IsExpression = {
+        kind: "IsExpression",
+        value: left,
+        typeAnnotation,
+        span: { start: left.span.start, end: typeAnnotation.span.end },
+      };
+      left = isExpr;
+    }
+
     return left;
   }
 
@@ -2242,6 +2279,13 @@ export class Parser {
       const literal: BooleanLiteral = {
         kind: "BooleanLiteral",
         value: token.kind === TokenKind.True,
+        span: token.span,
+      };
+      expr = literal;
+    } else if (this.check(TokenKind.Null)) {
+      const token = this.advance();
+      const literal: NullLiteral = {
+        kind: "NullLiteral",
         span: token.span,
       };
       expr = literal;
@@ -2805,6 +2849,15 @@ export class Parser {
         span: token.span,
       };
       return lit;
+    }
+
+    if (this.check(TokenKind.Null)) {
+      const token = this.advance();
+      return {
+        kind: "PrimitiveType",
+        name: "null",
+        span: token.span,
+      };
     }
 
     const token = this.expect(TokenKind.Identifier, "Expected a type name");

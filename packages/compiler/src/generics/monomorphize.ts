@@ -210,6 +210,12 @@ function rewriteExpression(expr: Expression, inst: TypecheckInstantiations): Exp
       return { ...expr, operand: rewriteExpression(expr.operand, inst) };
     case "TypeofExpression":
       return { ...expr, operand: rewriteExpression(expr.operand, inst) };
+    case "IsExpression":
+      return {
+        ...expr,
+        value: rewriteExpression(expr.value, inst),
+        typeAnnotation: rewriteType(expr.typeAnnotation, inst.typeRewrites),
+      };
     case "IndexExpression":
       return {
         ...expr,
@@ -236,7 +242,7 @@ function rewriteStatement(stmt: Statement, inst: TypecheckInstantiations): State
         typeAnnotation: stmt.typeAnnotation
           ? rewriteType(stmt.typeAnnotation, inst.typeRewrites)
           : null,
-        initializer: rewriteExpression(stmt.initializer, inst),
+        initializer: stmt.initializer ? rewriteExpression(stmt.initializer, inst) : null,
       };
     case "AssignmentStatement":
       return {

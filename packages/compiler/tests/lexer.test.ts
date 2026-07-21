@@ -180,8 +180,8 @@ describe("Lexer", () => {
     ]);
   });
 
-  it("tokenizes type, keyof, and typeof keywords", () => {
-    const { tokens, diagnostics } = lex(`type Keys = keyof T; typeof x`);
+  it("tokenizes type, keyof, typeof, null, and is keywords", () => {
+    const { tokens, diagnostics } = lex(`type Keys = keyof T; typeof x; null; x is string`);
     expect(diagnostics.hasErrors).toBe(false);
     expect(tokens.map((t) => t.kind)).toEqual([
       TokenKind.Type,
@@ -191,6 +191,12 @@ describe("Lexer", () => {
       TokenKind.Identifier,
       TokenKind.Semicolon,
       TokenKind.Typeof,
+      TokenKind.Identifier,
+      TokenKind.Semicolon,
+      TokenKind.Null,
+      TokenKind.Semicolon,
+      TokenKind.Identifier,
+      TokenKind.Is,
       TokenKind.Identifier,
       TokenKind.Eof,
     ]);

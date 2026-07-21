@@ -74,22 +74,23 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 **Currently supported:**
 
 - A single top-level `function main(): void` with no parameters (return type required)
-- Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`, arrays `T[]`, `struct`, `enum`, `class`, and `interface` types
+- Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`, `null`, arrays `T[]`, `struct`, `enum`, `class`, and `interface` types
 - Generics: type parameters on structs, classes, interfaces, functions, and methods; constraints (`T extends I`); nested type arguments; call-site inference; compile-time monomorphization (no runtime generics)
 - Type aliases (`type Name = ...`), including generic aliases, unions (`|`), intersections (`&`), literal types, `keyof` / `typeof` type operators, conditional and mapped types
-- Control-flow narrowing via `typeof` checks on union values
+- Control-flow narrowing via `typeof` checks, `== null` / `!= null`, and `is` type checks on union / nullable values; early `return` / `break` / `continue` refine types in subsequent code
 - Index signatures (`[key: string]: T`) as string-keyed maps
 - Struct declarations, literals (`Person { name: "...", age: 16 }`), field access, field assignment, and instance methods
 - Classes: `new`, constructors, instance/static fields and methods, `public`/`private`, `readonly`, inheritance (`extends`), and `abstract` classes (heap reference types)
 - Interfaces: method contracts with `implements` / `extends`, optional index signatures, compile-time compliance checks, and fat-pointer dynamic dispatch when typed as an interface
-- `let` / `const` variables with optional annotations and inference (`5` → `i32`, `3.14` → `f64`)
+- `let` / `const` variables with optional annotations and inference (`5` → `i32`, `3.14` → `f64`); annotated `let` may omit an initializer (`let x: T | null;`)
 - Reassignment for `let` only (`=`, `+=`, `-=`, `++`, `--` on numeric lets)
 - Arrays: literals `[1, 2, 3]`, indexing, element assignment, `.length`, `.push` / `.pop` / `.includes` / `.indexOf`
-- Literals: integers, floats, booleans, strings, chars
+- Literals: integers, floats, booleans, strings, chars, `null`
 - `print(...)` of printable values; multiple args are joined with spaces
 - String concatenation with `+`
 - Comparisons (`== != < <= > >=`) and logical ops (`&& || !`)
-- Value-position `typeof` expression (returns `"string" | "number" | "boolean" | "object"`)
+- Value-position `typeof` expression (returns type tags such as `"string"`, `"i32"`, `"bool"`, `"null"`, `"object"`)
+- `value is Type` type checks (including `is null` and class types) with narrowing
 - Control flow: `if` / `elseif` / `else`, `while`, C-style `for`, element `for (i in arr)`, `break`, `continue`
 - `//` line comments and `/* */` block comments
 
@@ -114,6 +115,7 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 | [`examples/generics.tsn`](./examples/generics.tsn) | Generic structs/classes/functions/methods, constraints, inference |
 | [`examples/type-aliases.tsn`](./examples/type-aliases.tsn) | Type aliases and literal unions |
 | [`examples/unions.tsn`](./examples/unions.tsn) | Union types and typeof narrowing |
+| [`examples/nullability.tsn`](./examples/nullability.tsn) | `null`, nullable types, `is` checks, CFA narrowing |
 | [`examples/multi-constraints.tsn`](./examples/multi-constraints.tsn) | Multi-constraints (`T extends A & B`) |
 | [`examples/dictionaries.tsn`](./examples/dictionaries.tsn) | Index signatures as string-keyed maps |
 | [`examples/type-operators.tsn`](./examples/type-operators.tsn) | `keyof` / `typeof` / conditionals / mapped types / `T[K]` |

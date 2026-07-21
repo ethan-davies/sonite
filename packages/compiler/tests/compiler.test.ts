@@ -330,6 +330,7 @@ describe("compile pipeline", () => {
         "generics.tsn",
         "type-aliases.tsn",
         "unions.tsn",
+        "nullability.tsn",
         "multi-constraints.tsn",
         "dictionaries.tsn",
         "type-operators.tsn",
@@ -1464,6 +1465,144 @@ describe("type aliases and advanced types", () => {
       function main(): void {
         let p: Person = createPerson();
         print(p.x);
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+});
+
+describe("nullability and control-flow narrowing", () => {
+  it("compiles nullable class types and null assignment", () => {
+    const result = compile(`
+      class User {
+        name: string;
+        constructor(name: string) { this.name = name; }
+      }
+      function main(): void {
+        let user: User | null = null;
+        user = new User("Ada");
+        user = null;
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects property access on nullable without narrowing", () => {
+    const result = compile(`
+      class User {
+        name: string;
+        constructor(name: string) { this.name = name; }
+      }
+      function main(): void {
+        let user: User | null = null;
+        print(user.name);
+      }
+    `);
+    expect(result.success).toBe(false);
+    expect(result.diagnostics.some((d) => d.message.includes("may be null"))).toBe(true);
+    expect(result.diagnostics.some((d) => d.code === "E0397")).toBe(true);
+  });
+
+  it("narrows with != null inside if", () => {
+    const result = compile(`
+      class User {
+        name: string;
+        constructor(name: string) { this.name = name; }
+      }
+      function main(): void {
+        let user: User | null = new User("Ada");
+        if (user != null) {
+          print(user.name);
+        } else {
+          print("No user");
+        }
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("narrows after early return on == null", () => {
+    const result = compile(`
+      function process(value: string | null): void {
+        if (value == null) {
+          return;
+        }
+        print(value.length);
+      }
+      function main(): void {
+        process("hi");
+        process(null);
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("narrows with is checks", () => {
+    const result = compile(`
+      function main(): void {
+        let value: string | i32 = "hi";
+        if (value is string) {
+          print(value.length);
+        }
+        let n: string | null = null;
+        if (n is null) {
+          print("null");
+        }
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("narrows multi-arm unions with typeof", () => {
+    const result = compile(`
+      function main(): void {
+        let value: string | i32 | bool = 1;
+        if (typeof value == "string") {
+          print(value.length);
+        } elseif (typeof value == "i32") {
+          print(value + 1);
+        } else {
+          print(value == true);
+        }
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("%__Union");
+  });
+
+  it("narrows after break on null check", () => {
+    const result = compile(`
+      function main(): void {
+        let value: string | null = "hi";
+        while (true) {
+          if (value == null) {
+            break;
+          }
+          print(value.length);
+          break;
+        }
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("infers nullable return types", () => {
+    const result = compile(`
+      class User {
+        name: string;
+        constructor(name: string) { this.name = name; }
+      }
+      function findUser(id: i32): User | null {
+        if (id == 10) {
+          return new User("Ada");
+        }
+        return null;
+      }
+      function main(): void {
+        let user = findUser(10);
+        if (user != null) {
+          print(user.name);
+        }
       }
     `);
     expect(result.success).toBe(true);

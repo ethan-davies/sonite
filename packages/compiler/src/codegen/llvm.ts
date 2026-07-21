@@ -43,6 +43,7 @@ import {
   type ValueType,
 } from "../typecheck.js";
 import {
+  flattenUnion,
   isLiteralType,
   isMapType,
   isObjectType,
@@ -50,6 +51,43 @@ import {
   typeofTagForType,
 } from "../typecheck-advanced.js";
 import { substituteAnnotation } from "../generics/substitute.js";
+
+/** Types lowered as a single LLVM `ptr`. */
+function isSinglePtrType(type: ValueType): boolean {
+  if (type === "string") {
+    return true;
+  }
+  if (typeof type === "object") {
+    return type.kind === "class" || type.kind === "array" || type.kind === "map";
+  }
+  return false;
+}
+
+/** `T | null` where every non-null arm is a single ptr — lower as bare `ptr`. */
+function isNullablePointerUnion(type: ValueType): boolean {
+  if (!isUnionType(type)) {
+    return false;
+  }
+  const arms = flattenUnion(type);
+  if (!arms.some((a) => a === "null")) {
+    return false;
+  }
+  const nonNull = arms.filter((a) => a !== "null");
+  return nonNull.length > 0 && nonNull.every((a) => isSinglePtrType(a as ValueType));
+}
+
+/** Union tag constants matching typeofTagForType. */
+const UNION_TAG = {
+  string: 0,
+  i32: 1,
+  bool: 2,
+  object: 3,
+  null: 4,
+  i64: 5,
+  f32: 6,
+  f64: 7,
+  char: 8,
+} as const;
 
 interface LocalBinding {
   readonly ptr: string;
@@ -1550,7 +1588,14 @@ export class LlvmCodegen {
     }
 
     // Box into union — but homogeneous literal unions lower as string/i32, not %__Union
+    // Nullable pointer unions lower as bare ptr
     if (isUnionType(expected) && !isUnionType(value.type)) {
+      if (isNullablePointerUnion(expected)) {
+        if (value.type === "null") {
+          return { llvm: "null", type: expected };
+        }
+        return { llvm: value.llvm, type: expected };
+      }
       if (expected.arms.every((a) => isLiteralType(a) && a.literalKind === "string")) {
         if (
           value.type === "string" ||
@@ -1568,11 +1613,18 @@ export class LlvmCodegen {
           return { llvm: value.llvm, type: expected };
         }
       }
+      if (value.type === "null") {
+        return this.boxNullUnion(expected, lines);
+      }
       return this.boxUnion(value, expected, lines);
     }
 
     // Unbox from union when expected is a concrete arm
     if (isUnionType(value.type) && !isUnionType(expected)) {
+      if (isNullablePointerUnion(value.type)) {
+        // Already a ptr; null check is the caller's job. Pass through for non-null expected.
+        return { llvm: value.llvm, type: expected };
+      }
       return this.unboxUnion(value, expected, lines);
     }
 
@@ -1590,17 +1642,44 @@ export class LlvmCodegen {
   }
 
   private unionTagForType(type: ValueType): number {
+    if (type === "null") {
+      return UNION_TAG.null;
+    }
     const tag = typeofTagForType(type);
     if (tag === "string") {
-      return 0;
+      return UNION_TAG.string;
     }
-    if (tag === "number") {
-      return 1;
+    if (tag === "i32") {
+      return UNION_TAG.i32;
     }
-    if (tag === "boolean") {
-      return 2;
+    if (tag === "bool") {
+      return UNION_TAG.bool;
     }
-    return 3;
+    if (tag === "i64") {
+      return UNION_TAG.i64;
+    }
+    if (tag === "f32") {
+      return UNION_TAG.f32;
+    }
+    if (tag === "f64") {
+      return UNION_TAG.f64;
+    }
+    if (tag === "char") {
+      return UNION_TAG.char;
+    }
+    if (tag === "null") {
+      return UNION_TAG.null;
+    }
+    return UNION_TAG.object;
+  }
+
+  private boxNullUnion(expected: ValueType, lines: string[]): EmittedValue {
+    this.needsUnionRuntime = true;
+    const undef = this.nextTemp();
+    lines.push(`  ${undef} = insertvalue %__Union undef, i32 ${UNION_TAG.null}, 0`);
+    const boxed = this.nextTemp();
+    lines.push(`  ${boxed} = insertvalue %__Union ${undef}, ptr null, 1`);
+    return { llvm: boxed, type: expected };
   }
 
   private boxUnion(value: EmittedValue, expected: ValueType, lines: string[]): EmittedValue {
@@ -2254,6 +2333,11 @@ export class LlvmCodegen {
     lines.push(`  ${ptr} = alloca ${llvmType}`);
     this.locals.set(stmt.name.name, { ptr, type });
 
+    if (stmt.initializer === null) {
+      lines.push(`  store ${llvmType} ${zeroInitializer(type)}, ptr ${ptr}`);
+      return;
+    }
+
     const init = this.emitExpression(stmt.initializer, lines, type);
     lines.push(`  store ${llvmType} ${init.llvm}, ptr ${ptr}`);
   }
@@ -2456,6 +2540,9 @@ export class LlvmCodegen {
         return annotated;
       }
     }
+    if (!stmt.initializer) {
+      throw new Error("Codegen: variable without initializer or annotation");
+    }
     return this.inferExpressionType(stmt.initializer);
   }
 
@@ -2471,6 +2558,10 @@ export class LlvmCodegen {
         return "string";
       case "CharLiteral":
         return "char";
+      case "NullLiteral":
+        return "null";
+      case "IsExpression":
+        return "bool";
       case "ArrayLiteral": {
         if (expr.elements.length === 0) {
           throw new Error("Codegen: empty array without annotation");
@@ -2700,6 +2791,8 @@ export class LlvmCodegen {
       }
       case "BooleanLiteral":
         return { llvm: expr.value ? "true" : "false", type: "bool" };
+      case "NullLiteral":
+        return { llvm: "null", type: "null" };
       case "CharLiteral": {
         const code = expr.value.codePointAt(0) ?? 0;
         return { llvm: String(code), type: "char" };
@@ -2734,45 +2827,28 @@ export class LlvmCodegen {
       case "TypeofExpression": {
         const operand = this.emitExpression(expr.operand, lines);
         this.needsStringRuntime = true;
-        let tagNum = 3;
         if (isUnionType(operand.type)) {
+          if (isNullablePointerUnion(operand.type)) {
+            const isNull = this.nextTemp();
+            lines.push(`  ${isNull} = icmp eq ptr ${operand.llvm}, null`);
+            const nullG = this.internString("null");
+            const objG = this.internString("object");
+            const nullPtr = this.nextTemp();
+            lines.push(
+              `  ${nullPtr} = getelementptr inbounds [${nullG.length} x i8], ptr @${nullG.name}, i64 0, i64 0`,
+            );
+            const objPtr = this.nextTemp();
+            lines.push(
+              `  ${objPtr} = getelementptr inbounds [${objG.length} x i8], ptr @${objG.name}, i64 0, i64 0`,
+            );
+            const sel = this.nextTemp();
+            lines.push(`  ${sel} = select i1 ${isNull}, ptr ${nullPtr}, ptr ${objPtr}`);
+            return { llvm: sel, type: "string" };
+          }
           this.needsUnionRuntime = true;
           const tag = this.nextTemp();
           lines.push(`  ${tag} = extractvalue %__Union ${operand.llvm}, 0`);
-          // Map tag to string via comparisons
-          const isStr = this.nextTemp();
-          lines.push(`  ${isStr} = icmp eq i32 ${tag}, 0`);
-          const isNum = this.nextTemp();
-          lines.push(`  ${isNum} = icmp eq i32 ${tag}, 1`);
-          const isBool = this.nextTemp();
-          lines.push(`  ${isBool} = icmp eq i32 ${tag}, 2`);
-          const strG = this.internString("string");
-          const numG = this.internString("number");
-          const boolG = this.internString("boolean");
-          const objG = this.internString("object");
-          const strPtr = this.nextTemp();
-          lines.push(
-            `  ${strPtr} = getelementptr inbounds [${strG.length} x i8], ptr @${strG.name}, i64 0, i64 0`,
-          );
-          const numPtr = this.nextTemp();
-          lines.push(
-            `  ${numPtr} = getelementptr inbounds [${numG.length} x i8], ptr @${numG.name}, i64 0, i64 0`,
-          );
-          const boolPtr = this.nextTemp();
-          lines.push(
-            `  ${boolPtr} = getelementptr inbounds [${boolG.length} x i8], ptr @${boolG.name}, i64 0, i64 0`,
-          );
-          const objPtr = this.nextTemp();
-          lines.push(
-            `  ${objPtr} = getelementptr inbounds [${objG.length} x i8], ptr @${objG.name}, i64 0, i64 0`,
-          );
-          const sel1 = this.nextTemp();
-          lines.push(`  ${sel1} = select i1 ${isBool}, ptr ${boolPtr}, ptr ${objPtr}`);
-          const sel2 = this.nextTemp();
-          lines.push(`  ${sel2} = select i1 ${isNum}, ptr ${numPtr}, ptr ${sel1}`);
-          const sel3 = this.nextTemp();
-          lines.push(`  ${sel3} = select i1 ${isStr}, ptr ${strPtr}, ptr ${sel2}`);
-          return { llvm: sel3, type: "string" };
+          return this.emitTypeofFromTag(tag, lines);
         }
         const tagName = typeofTagForType(operand.type) ?? "object";
         const global = this.internString(tagName);
@@ -2780,9 +2856,10 @@ export class LlvmCodegen {
         lines.push(
           `  ${tmp} = getelementptr inbounds [${global.length} x i8], ptr @${global.name}, i64 0, i64 0`,
         );
-        void tagNum;
         return { llvm: tmp, type: "string" };
       }
+      case "IsExpression":
+        return this.emitIsExpression(expr, lines);
       case "IndexExpression": {
         const object = this.emitExpression(expr.object, lines);
         if (isMapType(object.type) || (isObjectType(object.type) && object.type.indexType)) {
@@ -2853,6 +2930,32 @@ export class LlvmCodegen {
         if (isClassType(objectType)) {
           return this.emitClassFieldLoad(expr, lines);
         }
+        // After null-check narrowing, locals may still be typed as T | null (ptr)
+        if (isNullablePointerUnion(objectType)) {
+          const classArm = flattenUnion(objectType).find(
+            (a) => typeof a === "object" && a.kind === "class",
+          );
+          if (classArm && typeof classArm === "object" && classArm.kind === "class") {
+            const object = this.emitExpression(expr.object, lines);
+            const classInfo =
+              [...this.localClasses.values()].find((c) => c.name === classArm.name) ??
+              [...this.localClasses.values()].find((c) => c.localName === classArm.name);
+            if (!classInfo) {
+              throw new Error(`Codegen: unknown class '${classArm.name}'`);
+            }
+            const field = classInfo.fields.find((f) => f.name === expr.property.name);
+            if (!field) {
+              throw new Error(`Codegen: unknown field '${expr.property.name}'`);
+            }
+            const fieldPtr = this.nextTemp();
+            lines.push(
+              `  ${fieldPtr} = getelementptr inbounds %${classInfo.name}, ptr ${object.llvm}, i32 0, i32 ${field.fieldIndex}`,
+            );
+            const loaded = this.nextTemp();
+            lines.push(`  ${loaded} = load ${toLlvmType(field.type)}, ptr ${fieldPtr}`);
+            return { llvm: loaded, type: field.type };
+          }
+        }
         if (expr.property.name !== "length") {
           throw new Error(`Codegen: unknown property '${expr.property.name}'`);
         }
@@ -2860,9 +2963,15 @@ export class LlvmCodegen {
         const object = this.emitExpression(expr.object, lines);
         if (object.type === "string" || isUnionType(object.type)) {
           this.needsStringRuntime = true;
-          const asString = isUnionType(object.type)
-            ? this.unboxUnion(object, "string", lines)
-            : object;
+          let asString = object;
+          if (isUnionType(object.type)) {
+            if (isNullablePointerUnion(object.type)) {
+              // Bare ptr — already the string pointer after null check
+              asString = { llvm: object.llvm, type: "string" };
+            } else {
+              asString = this.unboxUnion(object, "string", lines);
+            }
+          }
           const len64 = this.nextTemp();
           lines.push(`  ${len64} = call i64 @strlen(ptr ${asString.llvm})`);
           const len32 = this.nextTemp();
@@ -3599,6 +3708,175 @@ export class LlvmCodegen {
     return { llvm: result, type: "i32" };
   }
 
+  private emitTypeofFromTag(tag: string, lines: string[]): EmittedValue {
+    const entries: Array<{ tag: number; name: string }> = [
+      { tag: UNION_TAG.string, name: "string" },
+      { tag: UNION_TAG.i32, name: "i32" },
+      { tag: UNION_TAG.bool, name: "bool" },
+      { tag: UNION_TAG.null, name: "null" },
+      { tag: UNION_TAG.i64, name: "i64" },
+      { tag: UNION_TAG.f32, name: "f32" },
+      { tag: UNION_TAG.f64, name: "f64" },
+      { tag: UNION_TAG.char, name: "char" },
+    ];
+    const objG = this.internString("object");
+    let result = this.nextTemp();
+    lines.push(
+      `  ${result} = getelementptr inbounds [${objG.length} x i8], ptr @${objG.name}, i64 0, i64 0`,
+    );
+    for (const entry of entries) {
+      const isMatch = this.nextTemp();
+      lines.push(`  ${isMatch} = icmp eq i32 ${tag}, ${entry.tag}`);
+      const g = this.internString(entry.name);
+      const ptr = this.nextTemp();
+      lines.push(
+        `  ${ptr} = getelementptr inbounds [${g.length} x i8], ptr @${g.name}, i64 0, i64 0`,
+      );
+      const sel = this.nextTemp();
+      lines.push(`  ${sel} = select i1 ${isMatch}, ptr ${ptr}, ptr ${result}`);
+      result = sel;
+    }
+    return { llvm: result, type: "string" };
+  }
+
+  private emitIsExpression(
+    expr: Extract<Expression, { kind: "IsExpression" }>,
+    lines: string[],
+  ): EmittedValue {
+    const value = this.emitExpression(expr.value, lines);
+    const targetType = this.resolveAnnotation(expr.typeAnnotation);
+    if (!targetType) {
+      throw new Error("Codegen: invalid is-type annotation");
+    }
+
+    const tmp = this.nextTemp();
+
+    if (targetType === "null") {
+      if (isNullablePointerUnion(value.type) || isSinglePtrType(value.type) || value.type === "null") {
+        lines.push(`  ${tmp} = icmp eq ptr ${value.llvm}, null`);
+        return { llvm: tmp, type: "bool" };
+      }
+      if (isUnionType(value.type)) {
+        this.needsUnionRuntime = true;
+        const tag = this.nextTemp();
+        lines.push(`  ${tag} = extractvalue %__Union ${value.llvm}, 0`);
+        lines.push(`  ${tmp} = icmp eq i32 ${tag}, ${UNION_TAG.null}`);
+        return { llvm: tmp, type: "bool" };
+      }
+      lines.push(`  ${tmp} = add i1 false, false`);
+      return { llvm: tmp, type: "bool" };
+    }
+
+    // Class exact match via vtable pointer
+    if (typeof targetType === "object" && targetType.kind === "class") {
+      const classInfo = this.localClasses.get(targetType.name) ?? [...this.localClasses.values()].find((c) => c.name === targetType.name);
+      // Also search all modules
+      let info = classInfo;
+      if (!info) {
+        for (const c of this.localClasses.values()) {
+          if (c.name === targetType.name || c.localName === targetType.name) {
+            info = c;
+            break;
+          }
+        }
+      }
+      // Search namespaces
+      if (!info) {
+        for (const ns of this.namespaces.values()) {
+          for (const c of ns.classes.values()) {
+            if (c.name === targetType.name || c.localName === targetType.name) {
+              info = c;
+              break;
+            }
+          }
+          if (info) {
+            break;
+          }
+        }
+      }
+      if (!info) {
+        throw new Error(`Codegen: unknown class for is-check '${targetType.name}'`);
+      }
+
+      let objPtr = value.llvm;
+      if (isUnionType(value.type) && !isNullablePointerUnion(value.type)) {
+        this.needsUnionRuntime = true;
+        const tag = this.nextTemp();
+        lines.push(`  ${tag} = extractvalue %__Union ${value.llvm}, 0`);
+        const isObj = this.nextTemp();
+        lines.push(`  ${isObj} = icmp eq i32 ${tag}, ${UNION_TAG.object}`);
+        const payload = this.nextTemp();
+        lines.push(`  ${payload} = extractvalue %__Union ${value.llvm}, 1`);
+        const loaded = this.nextTemp();
+        lines.push(`  ${loaded} = load ptr, ptr ${payload}`);
+        const vtPtr = this.nextTemp();
+        lines.push(`  ${vtPtr} = getelementptr inbounds ptr, ptr ${loaded}, i32 0`);
+        const vt = this.nextTemp();
+        lines.push(`  ${vt} = load ptr, ptr ${vtPtr}`);
+        const match = this.nextTemp();
+        lines.push(`  ${match} = icmp eq ptr ${vt}, @${info.vtableGlobalName}`);
+        lines.push(`  ${tmp} = and i1 ${isObj}, ${match}`);
+        return { llvm: tmp, type: "bool" };
+      }
+      if (isNullablePointerUnion(value.type) || isClassType(value.type)) {
+        if (isNullablePointerUnion(value.type)) {
+          const notNull = this.nextTemp();
+          lines.push(`  ${notNull} = icmp ne ptr ${objPtr}, null`);
+          const vtPtr = this.nextTemp();
+          lines.push(`  ${vtPtr} = getelementptr inbounds ptr, ptr ${objPtr}, i32 0`);
+          const vt = this.nextTemp();
+          lines.push(`  ${vt} = load ptr, ptr ${vtPtr}`);
+          const match = this.nextTemp();
+          lines.push(`  ${match} = icmp eq ptr ${vt}, @${info.vtableGlobalName}`);
+          lines.push(`  ${tmp} = and i1 ${notNull}, ${match}`);
+          return { llvm: tmp, type: "bool" };
+        }
+        const vtPtr = this.nextTemp();
+        lines.push(`  ${vtPtr} = getelementptr inbounds ptr, ptr ${objPtr}, i32 0`);
+        const vt = this.nextTemp();
+        lines.push(`  ${vt} = load ptr, ptr ${vtPtr}`);
+        lines.push(`  ${tmp} = icmp eq ptr ${vt}, @${info.vtableGlobalName}`);
+        return { llvm: tmp, type: "bool" };
+      }
+    }
+
+    // Primitive / typeof-tag style: compare union tag or static typeof
+    const wantTag = this.unionTagForType(targetType);
+    if (isUnionType(value.type) && !isNullablePointerUnion(value.type)) {
+      this.needsUnionRuntime = true;
+      const tag = this.nextTemp();
+      lines.push(`  ${tag} = extractvalue %__Union ${value.llvm}, 0`);
+      lines.push(`  ${tmp} = icmp eq i32 ${tag}, ${wantTag}`);
+      return { llvm: tmp, type: "bool" };
+    }
+
+    // Nullable pointer union: non-null means the non-null arm(s)
+    if (isNullablePointerUnion(value.type)) {
+      const nonNull = flattenUnion(value.type).filter((a) => a !== "null");
+      const matches = nonNull.some(
+        (arm) => this.unionTagForType(arm as ValueType) === wantTag ||
+          (typeof targetType === "object" &&
+            typeof arm === "object" &&
+            arm.kind === targetType.kind &&
+            "name" in arm &&
+            "name" in targetType &&
+            arm.name === targetType.name),
+      );
+      if (!matches) {
+        lines.push(`  ${tmp} = add i1 false, false`);
+        return { llvm: tmp, type: "bool" };
+      }
+      // True when pointer is non-null (and the non-null arm matches the target)
+      lines.push(`  ${tmp} = icmp ne ptr ${value.llvm}, null`);
+      return { llvm: tmp, type: "bool" };
+    }
+
+    // Static knowledge
+    const actualTag = this.unionTagForType(value.type);
+    lines.push(`  ${tmp} = add i1 ${actualTag === wantTag ? "true" : "false"}, false`);
+    return { llvm: tmp, type: "bool" };
+  }
+
   private emitUnary(expr: UnaryExpression, lines: string[]): EmittedValue {
     const operand = this.emitExpression(expr.operand, lines);
     const tmp = this.nextTemp();
@@ -3623,16 +3901,55 @@ export class LlvmCodegen {
       }
     }
 
+    // Null comparisons
+    if (
+      (expr.operator === "==" || expr.operator === "!=") &&
+      (expr.left.kind === "NullLiteral" || expr.right.kind === "NullLiteral")
+    ) {
+      const nonNullExpr = expr.left.kind === "NullLiteral" ? expr.right : expr.left;
+      const value = this.emitExpression(nonNullExpr, lines);
+      const tmp = this.nextTemp();
+      if (
+        isNullablePointerUnion(value.type) ||
+        isSinglePtrType(value.type) ||
+        value.type === "null" ||
+        value.type === "string" ||
+        (typeof value.type === "object" &&
+          (value.type.kind === "class" || value.type.kind === "array" || value.type.kind === "map"))
+      ) {
+        const pred = expr.operator === "==" ? "eq" : "ne";
+        lines.push(`  ${tmp} = icmp ${pred} ptr ${value.llvm}, null`);
+        return { llvm: tmp, type: "bool" };
+      }
+      if (isUnionType(value.type)) {
+        this.needsUnionRuntime = true;
+        const tag = this.nextTemp();
+        lines.push(`  ${tag} = extractvalue %__Union ${value.llvm}, 0`);
+        const pred = expr.operator === "==" ? "eq" : "ne";
+        lines.push(`  ${tmp} = icmp ${pred} i32 ${tag}, ${UNION_TAG.null}`);
+        return { llvm: tmp, type: "bool" };
+      }
+      // Fallback: never null
+      lines.push(`  ${tmp} = add i1 ${expr.operator === "==" ? "false" : "true"}, false`);
+      return { llvm: tmp, type: "bool" };
+    }
+
     let left = this.emitExpression(expr.left, lines);
     let right = this.emitExpression(expr.right, lines);
     if (isUnionType(left.type) && !isUnionType(right.type)) {
-      left = this.unboxUnion(left, right.type, lines);
+      if (!isNullablePointerUnion(left.type)) {
+        left = this.unboxUnion(left, right.type, lines);
+      }
     } else if (!isUnionType(left.type) && isUnionType(right.type)) {
-      right = this.unboxUnion(right, left.type, lines);
+      if (!isNullablePointerUnion(right.type)) {
+        right = this.unboxUnion(right, left.type, lines);
+      }
     } else if (isUnionType(left.type) && isUnionType(right.type)) {
-      left = this.unboxUnion(left, "i32", lines);
-      right = this.unboxUnion(right, "i32", lines);
-    } else {
+      if (!isNullablePointerUnion(left.type) && !isNullablePointerUnion(right.type)) {
+        left = this.unboxUnion(left, "i32", lines);
+        right = this.unboxUnion(right, "i32", lines);
+      }
+    } else if (left.type !== "null" && right.type !== "null") {
       right = this.coerceValue(right, left.type, lines);
     }
     const llvmType = toLlvmType(left.type);
@@ -4115,6 +4432,9 @@ function toLlvmType(type: ValueType | "void"): string {
       return "i32";
     }
     if (type.kind === "union") {
+      if (isNullablePointerUnion(type)) {
+        return "ptr";
+      }
       if (type.arms.every((a) => isLiteralType(a) && a.literalKind === "string")) {
         return "ptr";
       }
@@ -4155,6 +4475,8 @@ function toLlvmType(type: ValueType | "void"): string {
       return "i8";
     case "string":
       return "ptr";
+    case "null":
+      return "ptr";
   }
 }
 
@@ -4163,7 +4485,13 @@ function zeroInitializer(type: ValueType): string {
     if (type.kind === "enum") {
       return "0";
     }
-    if (type.kind === "struct" || type.kind === "interface" || type.kind === "object" || type.kind === "union") {
+    if (type.kind === "union") {
+      if (isNullablePointerUnion(type)) {
+        return "null";
+      }
+      return "zeroinitializer";
+    }
+    if (type.kind === "struct" || type.kind === "interface" || type.kind === "object") {
       return "zeroinitializer";
     }
     if (type.kind === "literal") {
@@ -4183,6 +4511,7 @@ function zeroInitializer(type: ValueType): string {
     case "bool":
       return "false";
     case "string":
+    case "null":
       return "null";
   }
 }
@@ -4229,6 +4558,8 @@ function elementByteSize(type: ValueType, structs?: Map<string, StructInfo>): nu
       return 1;
     case "string":
       return 8;
+    case "null":
+      return 8;
   }
 }
 
@@ -4252,6 +4583,7 @@ function fieldAlign(type: ValueType): number {
     case "i64":
     case "f64":
     case "string":
+    case "null":
       return 8;
     case "bool":
     case "char":
@@ -4333,6 +4665,8 @@ function printfSpecifier(type: ValueType): string {
       return "%c";
     case "string":
       return "%s";
+    case "null":
+      return "%s";
   }
 }
 
@@ -4367,6 +4701,7 @@ function printfArgType(type: ValueType): string {
     case "char":
       return "i8";
     case "string":
+    case "null":
       return "ptr";
   }
 }

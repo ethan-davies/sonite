@@ -86,6 +86,7 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 - Reassignment for `let` only (`=`, `+=`, `-=`, `++`, `--` on numeric lets)
 - Arrays: literals `[1, 2, 3]`, indexing, element assignment, `.length`, `.push` / `.pop` / `.includes` / `.indexOf`
 - Tuples: fixed-length heterogeneous products `[string, i32]`, const/dynamic indexing (dynamic → union), `.length`, element assignment with constant indexes, destructuring with holes
+- Arrow lambdas `(a: i32, b: i32) => a + b` and block bodies; function types `(i32, i32) => i32`; contextual typing for parameters; first-class named functions; closures with capture-by-reference for `let` (heap boxes) and by-value for `const` (no generic lambdas yet)
 - Literals: integers, floats, booleans, strings, chars, `null`
 - `print(...)` of printable values; multiple args are joined with spaces
 - String concatenation with `+`
@@ -121,6 +122,7 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 | [`examples/multi-constraints.tsn`](./examples/multi-constraints.tsn) | Multi-constraints (`T extends A & B`) |
 | [`examples/dictionaries.tsn`](./examples/dictionaries.tsn) | Index signatures as string-keyed maps |
 | [`examples/type-operators.tsn`](./examples/type-operators.tsn) | `keyof` / `typeof` / conditionals / mapped types / `T[K]` |
+| [`examples/lambdas.tsn`](./examples/lambdas.tsn) | Arrow lambdas, function types, contextual typing, closures |
 
 ## Development
 

@@ -1,0 +1,47 @@
+function add(a: i32, b: i32): i32 {
+  return a + b;
+}
+
+function execute(operation: (i32, i32) => i32): i32 {
+  return operation(10, 20);
+}
+
+function createAdder(x: i32): (i32) => i32 {
+  return (y: i32) => x + y;
+}
+
+function createCounter(): () => i32 {
+  let count: i32 = 0;
+  return (): i32 => {
+    count++;
+    return count;
+  };
+}
+
+function main(): void {
+  // Expression-bodied lambda with explicit parameter types
+  let sum = (a: i32, b: i32) => a + b;
+  print(sum(2, 3));
+
+  // Block-bodied lambda with explicit return type
+  let mul = (a: i32, b: i32): i32 => {
+    return a * b;
+  };
+  print(mul(4, 5));
+
+  // Contextual typing: parameter types come from the expected function type
+  print(execute((a, b) => a + b));
+
+  // Named function as a first-class value
+  let f = add;
+  print(f(1, 2));
+
+  // Closure capturing an outer parameter
+  let addTen = createAdder(10);
+  print(addTen(5));
+
+  // Mutable capture (shared heap box)
+  let counter = createCounter();
+  print(counter());
+  print(counter());
+}

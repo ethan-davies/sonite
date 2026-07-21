@@ -47,6 +47,7 @@ import {
   isIntersectionType,
   isLiteralType,
   isMapType,
+  isFunctionType,
   isObjectType,
   isUnionType,
   keyofType,
@@ -57,6 +58,7 @@ import {
   objectShapeName,
   typeofTagForType,
   type ExtendedValueType,
+  type FunctionValueType,
   type IntersectionValueType,
   type LiteralValueType,
   type MapValueType,
@@ -125,9 +127,11 @@ export type ValueType =
   | IntersectionValueType
   | ObjectValueType
   | LiteralValueType
-  | MapValueType;
+  | MapValueType
+  | FunctionValueType;
 
 export type {
+  FunctionValueType,
   IntersectionValueType,
   LiteralValueType,
   MapValueType,
@@ -323,6 +327,8 @@ let interfacesByMangled: Map<string, InterfaceDef> = new Map();
 let memberContext: MemberContext | null = null;
 /** Type parameters in scope while checking a generic template. */
 let activeTypeParams: Map<string, TypeParamValueType> = new Map();
+/** Nesting depth while typechecking lambda bodies (for `this` rejection). */
+let lambdaDepth = 0;
 /** Instantiation collector for the current typecheck run. */
 let instantiationCollector: InstantiationCollector = new InstantiationCollector();
 /** Module currently being checked (for instantiation records). */
@@ -1986,6 +1992,24 @@ export function annotationToValueType(
         indexType,
       };
     }
+    case "FunctionType": {
+      const params: ValueType[] = [];
+      for (const p of ann.params) {
+        const vt = annotationToValueType(p, namedKinds);
+        if (vt === null) {
+          return null;
+        }
+        params.push(vt);
+      }
+      if (ann.returnType.kind === "PrimitiveType" && ann.returnType.name === "void") {
+        return { kind: "function", params, returnType: "void" };
+      }
+      const returnType = annotationToValueType(ann.returnType, namedKinds);
+      if (returnType === null) {
+        return null;
+      }
+      return { kind: "function", params, returnType };
+    }
     default:
       return null;
   }
@@ -2153,6 +2177,24 @@ function resolveAnnotation(
         return null;
       }
       return result as ValueType;
+    }
+    case "FunctionType": {
+      const params: ValueType[] = [];
+      for (const p of ann.params) {
+        const vt = resolveAnnotation(p, structs, enums, diagnostics);
+        if (vt === null) {
+          return null;
+        }
+        params.push(vt);
+      }
+      if (ann.returnType.kind === "PrimitiveType" && ann.returnType.name === "void") {
+        return { kind: "function", params, returnType: "void" };
+      }
+      const returnType = resolveAnnotation(ann.returnType, structs, enums, diagnostics);
+      if (returnType === null) {
+        return null;
+      }
+      return { kind: "function", params, returnType };
     }
     case "NamedType":
       return resolveNamedType(ann, structs, enums, diagnostics);
@@ -3103,6 +3145,18 @@ function valueTypeToLocalAnnotation(type: ValueType): TypeAnnotation {
         typeArgs: [],
         span,
       };
+    case "function": {
+      const returnAnn =
+        type.returnType === "void"
+          ? ({ kind: "PrimitiveType", name: "void", span } as const)
+          : valueTypeToLocalAnnotation(type.returnType as ValueType);
+      return {
+        kind: "FunctionType",
+        params: type.params.map((p) => valueTypeToLocalAnnotation(p as ValueType)),
+        returnType: returnAnn,
+        span,
+      };
+    }
   }
 }
 
@@ -3884,7 +3938,16 @@ function checkStatement(
         return true;
       }
 
-      const valueType = checkExpression(stmt.value, scope, functions, structs, enums, diagnostics);
+      const valueType = checkExpression(
+        stmt.value,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+        false,
+        returnType,
+      );
       if (!valueType) {
         return true;
       }
@@ -5012,6 +5075,14 @@ function checkExpression(
       return null;
     }
     case "ThisExpression": {
+      if (lambdaDepth > 0) {
+        diagnostics.error(
+          "Lambdas cannot capture 'this'; use a local binding instead",
+          expr.span,
+          "E0397",
+        );
+        return null;
+      }
       if (!memberContext || memberContext.isStatic) {
         diagnostics.error(
           "'this' is only allowed in instance methods and constructors",
@@ -5183,11 +5254,20 @@ function checkExpression(
     }
     case "Identifier": {
       const binding = scope.get(expr.name);
-      if (!binding) {
-        diagnostics.error(`Undefined variable '${expr.name}'`, expr.span, "E0304");
-        return null;
+      if (binding) {
+        return binding.type;
       }
-      return binding.type;
+      const sig = functions.get(expr.name);
+      if (sig) {
+        return {
+          kind: "function",
+          params: sig.params,
+          returnType: sig.returnType,
+        };
+      }
+      // Namespace-imported functions are only available as ns.fn member access.
+      diagnostics.error(`Undefined variable '${expr.name}'`, expr.span, "E0304");
+      return null;
     }
     case "UnaryExpression": {
       const operand = checkExpression(expr.operand, scope, functions, structs, enums, diagnostics);
@@ -5326,6 +5406,16 @@ function checkExpression(
       }
       return left;
     }
+    case "LambdaExpression":
+      return checkLambdaExpression(
+        expr,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+        expectedType,
+      );
     case "CallExpression": {
       if (expr.callee.kind === "SuperExpression") {
         if (!memberContext?.isConstructor || !memberContext.enclosingClass?.superclass) {
@@ -5348,7 +5438,16 @@ function checkExpression(
         for (let i = 0; i < expr.args.length; i += 1) {
           const arg = expr.args[i]!;
           const expected = base.constructorParams[i]!;
-          const argType = checkExpression(arg, scope, functions, structs, enums, diagnostics);
+          const argType = checkExpression(
+            arg,
+            scope,
+            functions,
+            structs,
+            enums,
+            diagnostics,
+            false,
+            expected,
+          );
           if (!argType) {
             return null;
           }
@@ -5379,7 +5478,7 @@ function checkExpression(
         return checkMethodCall(expr, scope, functions, structs, enums, diagnostics, allowVoidCall);
       }
 
-      if (expr.callee.name === "print") {
+      if (expr.callee.kind === "Identifier" && expr.callee.name === "print") {
         if (!allowVoidCall) {
           diagnostics.error("'print' cannot be used as a value", expr.span, "E0309");
           return null;
@@ -5405,7 +5504,7 @@ function checkExpression(
         return null;
       }
 
-      if (expr.callee.name === "createMap") {
+      if (expr.callee.kind === "Identifier" && expr.callee.name === "createMap") {
         if (expr.args.length !== 0) {
           diagnostics.error("'createMap' expects no arguments", expr.span, "E0315");
           return null;
@@ -5429,70 +5528,503 @@ function checkExpression(
         return { kind: "map", valueType: "string" };
       }
 
-      const sig = functions.get(expr.callee.name);
-      if (!sig) {
-        const genericTpl = activeGenericFunctions.get(expr.callee.name);
-        if (genericTpl) {
-          return checkGenericFunctionCall(
+      if (expr.callee.kind === "Identifier") {
+        const sig = functions.get(expr.callee.name);
+        if (!sig) {
+          const genericTpl = activeGenericFunctions.get(expr.callee.name);
+          if (genericTpl) {
+            return checkGenericFunctionCall(
+              expr,
+              genericTpl,
+              scope,
+              functions,
+              structs,
+              enums,
+              diagnostics,
+              allowVoidCall,
+              expectedType,
+            );
+          }
+          // Fall through to value-call if the identifier is a function-typed variable.
+          const binding = scope.get(expr.callee.name);
+          if (!binding || !isFunctionType(binding.type)) {
+            diagnostics.error(
+              `Unknown function '${expr.callee.name}'`,
+              expr.callee.span,
+              "E0307",
+            );
+            return null;
+          }
+          return checkFunctionValueCall(
             expr,
-            genericTpl,
+            binding.type,
             scope,
             functions,
             structs,
             enums,
             diagnostics,
             allowVoidCall,
-            expectedType,
           );
         }
+
+        if (expr.args.length !== sig.params.length) {
+          diagnostics.error(
+            `Function '${sig.name}' expects ${sig.params.length} argument(s), got ${expr.args.length}`,
+            expr.span,
+            "E0315",
+          );
+          return null;
+        }
+
+        for (let i = 0; i < expr.args.length; i += 1) {
+          const arg = expr.args[i]!;
+          const expected = sig.params[i]!;
+          const argType = checkExpression(
+            arg,
+            scope,
+            functions,
+            structs,
+            enums,
+            diagnostics,
+            false,
+            expected,
+          );
+          if (!argType) {
+            return null;
+          }
+          if (!valueMatchesBinding(arg, argType, expected)) {
+            diagnostics.error(typeMismatchMessage(expected, argType), arg.span, "E0303");
+            return null;
+          }
+        }
+
+        if (sig.returnType === "void") {
+          if (!allowVoidCall) {
+            diagnostics.error(
+              `Void function '${sig.name}' cannot be used as a value`,
+              expr.span,
+              "E0309",
+            );
+          }
+          return null;
+        }
+
+        return sig.returnType;
+      }
+
+      // Indirect call through an arbitrary callable expression.
+      const calleeType = checkExpression(
+        expr.callee,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+      );
+      if (!calleeType) {
+        return null;
+      }
+      if (!isFunctionType(calleeType)) {
         diagnostics.error(
-          `Unknown function '${expr.callee.name}'`,
+          `Cannot call value of type '${typeToString(calleeType)}'`,
           expr.callee.span,
           "E0307",
         );
         return null;
       }
+      return checkFunctionValueCall(
+        expr,
+        calleeType,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+        allowVoidCall,
+      );
+    }
+  }
+}
 
-      if (expr.args.length !== sig.params.length) {
-        diagnostics.error(
-          `Function '${sig.name}' expects ${sig.params.length} argument(s), got ${expr.args.length}`,
-          expr.span,
-          "E0315",
-        );
+function checkFunctionValueCall(
+  expr: Extract<Expression, { kind: "CallExpression" }>,
+  fnType: FunctionValueType,
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+  allowVoidCall: boolean,
+): ValueType | null {
+  if (expr.args.length !== fnType.params.length) {
+    diagnostics.error(
+      `Function value expects ${fnType.params.length} argument(s), got ${expr.args.length}`,
+      expr.span,
+      "E0315",
+    );
+    return null;
+  }
+  for (let i = 0; i < expr.args.length; i += 1) {
+    const arg = expr.args[i]!;
+    const expected = fnType.params[i]! as ValueType;
+    const argType = checkExpression(
+      arg,
+      scope,
+      functions,
+      structs,
+      enums,
+      diagnostics,
+      false,
+      expected,
+    );
+    if (!argType) {
+      return null;
+    }
+    if (!valueMatchesBinding(arg, argType, expected)) {
+      diagnostics.error(typeMismatchMessage(expected, argType), arg.span, "E0303");
+      return null;
+    }
+  }
+  if (fnType.returnType === "void") {
+    if (!allowVoidCall) {
+      diagnostics.error("Void function cannot be used as a value", expr.span, "E0309");
+    }
+    return null;
+  }
+  return fnType.returnType as ValueType;
+}
+
+function checkLambdaExpression(
+  expr: Extract<Expression, { kind: "LambdaExpression" }>,
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+  expectedType: ValueType | null,
+): ValueType | null {
+  const expectedFn =
+    expectedType && isFunctionType(expectedType) ? expectedType : null;
+
+  if (expectedFn && expr.params.length !== expectedFn.params.length) {
+    diagnostics.error(
+      `Lambda expects ${expectedFn.params.length} parameter(s), got ${expr.params.length}`,
+      expr.span,
+      "E0315",
+    );
+    return null;
+  }
+
+  const paramTypes: ValueType[] = [];
+  const childScope = new Map(scope);
+  const selfBound = new Set<string>();
+
+  for (let i = 0; i < expr.params.length; i += 1) {
+    const param = expr.params[i]!;
+    selfBound.add(param.name.name);
+    let paramType: ValueType | null = null;
+    if (param.typeAnnotation) {
+      paramType = resolveAnnotation(param.typeAnnotation, structs, enums, diagnostics);
+      if (paramType === null) {
         return null;
       }
-
-      for (let i = 0; i < expr.args.length; i += 1) {
-        const arg = expr.args[i]!;
-        const expected = sig.params[i]!;
-        const argType = checkExpression(arg, scope, functions, structs, enums, diagnostics);
-        if (!argType) {
-          return null;
-        }
-        if (!valueMatchesBinding(arg, argType, expected)) {
+      if (expectedFn) {
+        const expectedParam = expectedFn.params[i]! as ValueType;
+        if (!typesEqual(paramType, expectedParam)) {
           diagnostics.error(
-            typeMismatchMessage(expected, argType),
-            arg.span,
+            typeMismatchMessage(expectedParam, paramType),
+            param.typeAnnotation.span,
             "E0303",
           );
           return null;
         }
       }
+    } else if (expectedFn) {
+      paramType = expectedFn.params[i]! as ValueType;
+    } else {
+      diagnostics.error(
+        `Parameter '${param.name.name}' requires a type annotation or a contextual function type`,
+        param.name.span,
+        "E0398",
+      );
+      return null;
+    }
+    paramTypes.push(paramType);
+    if (childScope.has(param.name.name)) {
+      // Shadow outer binding inside the lambda.
+    }
+    childScope.set(param.name.name, { type: paramType, mutable: false });
+  }
 
-      if (sig.returnType === "void") {
-        if (!allowVoidCall) {
-          diagnostics.error(
-            `Void function '${sig.name}' cannot be used as a value`,
-            expr.span,
-            "E0309",
-          );
-        }
+  let declaredReturn: ReturnType | null = null;
+  if (expr.returnType) {
+    const resolved = resolveReturnType(expr.returnType, structs, enums, diagnostics);
+    if (resolved === undefined) {
+      return null;
+    }
+    declaredReturn = resolved;
+    if (expectedFn) {
+      const er = expectedFn.returnType;
+      if ((er === "void") !== (declaredReturn === "void")) {
+        diagnostics.error(
+          `Expected return type '${typeToString(er as ValueType | "void")}', got '${typeToString(declaredReturn)}'`,
+          expr.returnType.span,
+          "E0303",
+        );
+      } else if (
+        er !== "void" &&
+        declaredReturn !== "void" &&
+        !typesEqual(declaredReturn, er as ValueType)
+      ) {
+        diagnostics.error(
+          typeMismatchMessage(er as ValueType, declaredReturn),
+          expr.returnType.span,
+          "E0303",
+        );
+      }
+    }
+  } else if (expectedFn) {
+    declaredReturn = expectedFn.returnType as ReturnType;
+  }
+
+  lambdaDepth += 1;
+  let bodyReturn: ReturnType | null = null;
+
+  if (expr.body.kind === "expression") {
+    const expectedBody =
+      declaredReturn && declaredReturn !== "void" ? declaredReturn : null;
+    const bodyType = checkExpression(
+      expr.body.expression,
+      childScope,
+      functions,
+      structs,
+      enums,
+      diagnostics,
+      false,
+      expectedBody,
+    );
+    if (!bodyType) {
+      lambdaDepth -= 1;
+      return null;
+    }
+    bodyReturn = bodyType;
+    if (declaredReturn === "void") {
+      diagnostics.error(
+        "Expression-bodied lambda cannot have return type 'void'",
+        expr.body.expression.span,
+        "E0313",
+      );
+      lambdaDepth -= 1;
+      return null;
+    }
+    if (declaredReturn) {
+      if (!valueMatchesBinding(expr.body.expression, bodyType, declaredReturn)) {
+        diagnostics.error(
+          typeMismatchMessage(declaredReturn, bodyType),
+          expr.body.expression.span,
+          "E0303",
+        );
+        lambdaDepth -= 1;
         return null;
       }
-
-      return sig.returnType;
+      bodyReturn = declaredReturn;
+    }
+  } else {
+    if (declaredReturn === null) {
+      diagnostics.error(
+        "Block-bodied lambda requires an explicit return type or a contextual function type",
+        expr.span,
+        "E0399",
+      );
+      lambdaDepth -= 1;
+      return null;
+    }
+    const blockScope = new Map(childScope);
+    const exits = checkStatements(
+      expr.body.statements,
+      blockScope,
+      functions,
+      structs,
+      enums,
+      declaredReturn,
+      diagnostics,
+      0,
+    );
+    for (const name of blockScope.keys()) {
+      if (!scope.has(name) && !expr.params.some((p) => p.name.name === name)) {
+        selfBound.add(name);
+      }
+    }
+    bodyReturn = declaredReturn;
+    if (declaredReturn !== "void" && !exits) {
+      diagnostics.error(
+        `Lambda must return a value of type '${typeToString(declaredReturn)}'`,
+        expr.span,
+        "E0312",
+      );
     }
   }
+
+  lambdaDepth -= 1;
+
+  if (bodyReturn === null) {
+    return null;
+  }
+
+  const captures = collectLambdaCaptures(expr, selfBound, scope);
+  instantiationCollector.lambdaCaptures.set(expr.span.start.offset, captures);
+
+  return {
+    kind: "function",
+    params: paramTypes,
+    returnType: bodyReturn,
+  };
+}
+
+function collectLambdaCaptures(
+  expr: Extract<Expression, { kind: "LambdaExpression" }>,
+  selfBound: Set<string>,
+  outerScope: Map<string, Binding>,
+): { name: string; mutable: boolean }[] {
+  const captures = new Map<string, { name: string; mutable: boolean }>();
+  const bound = new Set(selfBound);
+
+  const consider = (name: string): void => {
+    if (bound.has(name)) {
+      return;
+    }
+    const binding = outerScope.get(name);
+    if (binding) {
+      captures.set(name, { name, mutable: binding.mutable });
+    }
+  };
+
+  const walkExpr = (e: Expression): void => {
+    switch (e.kind) {
+      case "Identifier":
+        consider(e.name);
+        break;
+      case "LambdaExpression": {
+        const nestedBound = new Set(bound);
+        for (const p of e.params) {
+          nestedBound.add(p.name.name);
+        }
+        walkLambdaBody(e.body, nestedBound);
+        break;
+      }
+      case "CallExpression":
+        walkExpr(e.callee);
+        for (const a of e.args) walkExpr(a);
+        break;
+      case "BinaryExpression":
+        walkExpr(e.left);
+        walkExpr(e.right);
+        break;
+      case "UnaryExpression":
+      case "TypeofExpression":
+        walkExpr(e.operand);
+        break;
+      case "IsExpression":
+        walkExpr(e.value);
+        break;
+      case "IndexExpression":
+        walkExpr(e.object);
+        walkExpr(e.index);
+        break;
+      case "MemberExpression":
+        walkExpr(e.object);
+        break;
+      case "ArrayLiteral":
+        for (const el of e.elements) walkExpr(el);
+        break;
+      case "StructLiteral":
+        for (const f of e.fields) walkExpr(f.value);
+        break;
+      case "NewExpression":
+        for (const a of e.args) walkExpr(a);
+        break;
+      default:
+        break;
+    }
+  };
+
+  const walkStmt = (s: Statement, localBound: Set<string>): void => {
+    switch (s.kind) {
+      case "VariableDeclaration":
+        if (s.initializer) walkExpr(s.initializer);
+        if (s.binding.kind === "Identifier") {
+          localBound.add(s.binding.name);
+        } else {
+          for (const el of s.binding.elements) {
+            if (el.name) localBound.add(el.name.name);
+          }
+        }
+        break;
+      case "AssignmentStatement":
+        walkExpr(s.value);
+        break;
+      case "ExpressionStatement":
+        walkExpr(s.expression);
+        break;
+      case "ReturnStatement":
+        if (s.value) walkExpr(s.value);
+        break;
+      case "IfStatement":
+        walkExpr(s.condition);
+        for (const st of s.consequent) walkStmt(st, localBound);
+        if (Array.isArray(s.alternate)) {
+          for (const st of s.alternate) walkStmt(st, localBound);
+        } else if (s.alternate) {
+          walkStmt(s.alternate, localBound);
+        }
+        break;
+      case "WhileStatement":
+        walkExpr(s.condition);
+        for (const st of s.body) walkStmt(st, localBound);
+        break;
+      case "ForStatement":
+        if (s.initializer) walkStmt(s.initializer, localBound);
+        if (s.condition) walkExpr(s.condition);
+        if (s.update) {
+          if (s.update.kind === "AssignmentStatement") {
+            walkExpr(s.update.value);
+          }
+        }
+        for (const st of s.body) walkStmt(st, localBound);
+        break;
+      case "ForInStatement":
+        walkExpr(s.iterable);
+        localBound.add(s.name.name);
+        for (const st of s.body) walkStmt(st, localBound);
+        break;
+      default:
+        break;
+    }
+  };
+
+  const walkLambdaBody = (body: typeof expr.body, nestedBound: Set<string>): void => {
+    const saved = new Set(bound);
+    bound.clear();
+    for (const n of nestedBound) bound.add(n);
+    for (const n of selfBound) bound.add(n);
+    if (body.kind === "expression") {
+      walkExpr(body.expression);
+    } else {
+      const localBound = new Set(nestedBound);
+      for (const st of body.statements) walkStmt(st, localBound);
+    }
+    bound.clear();
+    for (const n of saved) bound.add(n);
+  };
+
+  if (expr.body.kind === "expression") {
+    walkExpr(expr.body.expression);
+  } else {
+    const localBound = new Set(bound);
+    for (const st of expr.body.statements) walkStmt(st, localBound);
+  }
+
+  return [...captures.values()];
 }
 
 function checkMethodCall(

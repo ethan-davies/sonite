@@ -7,6 +7,7 @@ import type {
   ConstructorDeclaration,
   Expression,
   FunctionDeclaration,
+  FunctionType,
   IndexedAccessType,
   InterfaceDeclaration,
   InterfaceMethodSignature,
@@ -151,6 +152,15 @@ export function substituteAnnotation(ann: TypeAnnotation, subst: TypeSubst): Typ
       };
       return result;
     }
+    case "FunctionType": {
+      const result: FunctionType = {
+        kind: "FunctionType",
+        params: ann.params.map((p) => substituteAnnotation(p, subst)),
+        returnType: substituteAnnotation(ann.returnType, subst),
+        span: ann.span,
+      };
+      return result;
+    }
   }
 }
 
@@ -179,10 +189,28 @@ function substExpression(expr: Expression, subst: TypeSubst): Expression {
         ...expr,
         typeArgs: expr.typeArgs.map((a) => substituteAnnotation(a, subst)),
         args: expr.args.map((a) => substExpression(a, subst)),
-        callee:
-          expr.callee.kind === "MemberExpression"
-            ? { ...expr.callee, object: substExpression(expr.callee.object, subst) }
-            : expr.callee,
+        callee: substExpression(expr.callee, subst),
+      };
+    case "LambdaExpression":
+      return {
+        ...expr,
+        params: expr.params.map((p) => ({
+          ...p,
+          typeAnnotation: p.typeAnnotation
+            ? substituteAnnotation(p.typeAnnotation, subst)
+            : null,
+        })),
+        returnType: expr.returnType ? substituteAnnotation(expr.returnType, subst) : null,
+        body:
+          expr.body.kind === "expression"
+            ? {
+                kind: "expression",
+                expression: substExpression(expr.body.expression, subst),
+              }
+            : {
+                kind: "block",
+                statements: expr.body.statements.map((s) => substStatement(s, subst)),
+              },
       };
     case "NewExpression":
       return {

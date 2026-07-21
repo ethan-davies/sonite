@@ -41,6 +41,11 @@ export interface InstantiationRecord {
 }
 
 /** Collected during typecheck; consumed by monomorphize. */
+export interface LambdaCaptureRecord {
+  readonly name: string;
+  readonly mutable: boolean;
+}
+
 export interface TypecheckInstantiations {
   readonly records: InstantiationRecord[];
   /** span.start.offset → specialized function local name */
@@ -50,6 +55,8 @@ export interface TypecheckInstantiations {
   readonly newRewrites: ReadonlyMap<number, string>;
   readonly structLiteralRewrites: ReadonlyMap<number, string>;
   readonly typeRewrites: ReadonlyMap<number, string>;
+  /** LambdaExpression span.start.offset → captured outer bindings */
+  readonly lambdaCaptures: ReadonlyMap<number, readonly LambdaCaptureRecord[]>;
 }
 
 function rewriteType(
@@ -155,6 +162,13 @@ function rewriteType(
         indexType: rewriteType(ann.indexType, typeRewrites),
         span: ann.span,
       };
+    case "FunctionType":
+      return {
+        kind: "FunctionType",
+        params: ann.params.map((p) => rewriteType(p, typeRewrites)),
+        returnType: rewriteType(ann.returnType, typeRewrites),
+        span: ann.span,
+      };
   }
 }
 
@@ -163,19 +177,13 @@ function rewriteExpression(expr: Expression, inst: TypecheckInstantiations): Exp
     case "CallExpression": {
       const fnRewrite = inst.callRewrites.get(expr.span.start.offset);
       const methodRewrite = inst.methodCallRewrites.get(expr.span.start.offset);
-      let callee = expr.callee;
+      let callee = rewriteExpression(expr.callee, inst);
       if (fnRewrite && callee.kind === "Identifier") {
         callee = { ...callee, name: fnRewrite };
       } else if (methodRewrite && callee.kind === "MemberExpression") {
         callee = {
           ...callee,
-          object: rewriteExpression(callee.object, inst),
           property: { ...callee.property, name: methodRewrite },
-        };
-      } else if (callee.kind === "MemberExpression") {
-        callee = {
-          ...callee,
-          object: rewriteExpression(callee.object, inst),
         };
       }
       return {
@@ -185,6 +193,29 @@ function rewriteExpression(expr: Expression, inst: TypecheckInstantiations): Exp
         args: expr.args.map((a) => rewriteExpression(a, inst)),
       };
     }
+    case "LambdaExpression":
+      return {
+        ...expr,
+        params: expr.params.map((p) => ({
+          ...p,
+          typeAnnotation: p.typeAnnotation
+            ? rewriteType(p.typeAnnotation, inst.typeRewrites)
+            : null,
+        })),
+        returnType: expr.returnType
+          ? rewriteType(expr.returnType, inst.typeRewrites)
+          : null,
+        body:
+          expr.body.kind === "expression"
+            ? {
+                kind: "expression",
+                expression: rewriteExpression(expr.body.expression, inst),
+              }
+            : {
+                kind: "block",
+                statements: expr.body.statements.map((s) => rewriteStatement(s, inst)),
+              },
+      };
     case "NewExpression": {
       const rewrite = inst.newRewrites.get(expr.span.start.offset);
       return {
@@ -681,5 +712,6 @@ export function emptyInstantiations(): TypecheckInstantiations {
     newRewrites: new Map(),
     structLiteralRewrites: new Map(),
     typeRewrites: new Map(),
+    lambdaCaptures: new Map(),
   };
 }

@@ -66,6 +66,7 @@ export enum TokenKind {
   Percent = "%",
   Equal = "=",
   EqualEqual = "==",
+  Arrow = "=>",
   Bang = "!",
   BangEqual = "!=",
   Less = "<",

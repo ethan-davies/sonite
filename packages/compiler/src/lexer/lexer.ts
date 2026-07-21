@@ -106,6 +106,10 @@ export class Lexer {
           this.advance();
           return this.makeToken(TokenKind.EqualEqual, "==", start);
         }
+        if (this.peek() === ">") {
+          this.advance();
+          return this.makeToken(TokenKind.Arrow, "=>", start);
+        }
         return this.makeToken(TokenKind.Equal, ch, start);
       case "!":
         if (this.peek() === "=") {

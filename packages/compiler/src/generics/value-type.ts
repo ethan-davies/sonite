@@ -6,7 +6,12 @@ export type MonoValueType =
   | { readonly kind: "array"; readonly element: MonoValueType }
   | { readonly kind: "tuple"; readonly elements: readonly MonoValueType[] }
   | { readonly kind: "struct" | "class" | "interface" | "enum"; readonly name: string }
-  | { readonly kind: "typeParam"; readonly name: string };
+  | { readonly kind: "typeParam"; readonly name: string }
+  | {
+      readonly kind: "function";
+      readonly params: readonly MonoValueType[];
+      readonly returnType: MonoValueType | "void";
+    };
 
 const EMPTY_SPAN = {
   start: { line: 1, column: 1, offset: 0 },
@@ -38,6 +43,17 @@ export function valueTypeToAnnotation(type: MonoValueType): TypeAnnotation {
       namespace: null,
       name: type.name,
       typeArgs: [],
+      span: EMPTY_SPAN,
+    };
+  }
+  if (type.kind === "function") {
+    return {
+      kind: "FunctionType",
+      params: type.params.map(valueTypeToAnnotation),
+      returnType:
+        type.returnType === "void"
+          ? { kind: "PrimitiveType", name: "void", span: EMPTY_SPAN }
+          : valueTypeToAnnotation(type.returnType),
       span: EMPTY_SPAN,
     };
   }

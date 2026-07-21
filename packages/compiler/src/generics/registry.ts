@@ -49,6 +49,10 @@ export class InstantiationCollector {
   readonly newRewrites = new Map<number, string>();
   readonly structLiteralRewrites = new Map<number, string>();
   readonly typeRewrites = new Map<number, string>();
+  readonly lambdaCaptures = new Map<
+    number,
+    readonly { readonly name: string; readonly mutable: boolean }[]
+  >();
   private readonly seen = new Set<string>();
 
   add(record: InstantiationRecord): void {
@@ -68,6 +72,7 @@ export class InstantiationCollector {
       newRewrites: new Map(this.newRewrites),
       structLiteralRewrites: new Map(this.structLiteralRewrites),
       typeRewrites: new Map(this.typeRewrites),
+      lambdaCaptures: new Map(this.lambdaCaptures),
     };
   }
 }

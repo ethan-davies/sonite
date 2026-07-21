@@ -37,7 +37,10 @@ import type {
   InterfaceMethodSignature,
   IntersectionType,
   IsExpression,
+  FunctionType,
   KeyofType,
+  LambdaExpression,
+  LambdaParameter,
   LiteralType,
   MappedType,
   MemberExpression,
@@ -2270,7 +2273,9 @@ export class Parser {
   private parsePrimary(): Expression | null {
     let expr: Expression | null = null;
 
-    if (this.check(TokenKind.LParen)) {
+    if (this.check(TokenKind.LParen) && this.looksLikeLambda()) {
+      expr = this.parseLambdaExpression();
+    } else if (this.check(TokenKind.LParen)) {
       this.advance();
       const inner = this.parseExpression();
       if (!inner) {
@@ -2519,6 +2524,15 @@ export class Parser {
         continue;
       }
 
+      if (this.check(TokenKind.LParen) || this.looksLikeTypeArgsThen(TokenKind.LParen)) {
+        const call = this.parseCallArgs(current);
+        if (!call) {
+          return null;
+        }
+        current = call;
+        continue;
+      }
+
       break;
     }
 
@@ -2680,7 +2694,7 @@ export class Parser {
   }
 
   private parseCallArgs(
-    callee: Identifier | MemberExpression | SuperExpression,
+    callee: Expression,
     start = callee.span.start,
   ): CallExpression | null {
     const typeArgs = this.parseTypeArgumentListOptional(TokenKind.LParen);
@@ -2900,6 +2914,10 @@ export class Parser {
   }
 
   private parsePrimaryType(): TypeAnnotation | null {
+    if (this.check(TokenKind.LParen) && this.looksLikeFunctionType()) {
+      return this.parseFunctionType();
+    }
+
     if (this.check(TokenKind.LParen)) {
       this.advance();
       const inner = this.parseType();
@@ -3310,6 +3328,224 @@ export class Parser {
       return null;
     }
     return args;
+  }
+
+  /** True when current `(` starts a lambda `(...) =>` or `(...): T =>`. */
+  private looksLikeLambda(): boolean {
+    if (!this.check(TokenKind.LParen)) {
+      return false;
+    }
+    const saved = this.current;
+    const diagCount = this.diagnostics.diagnostics.length;
+    this.advance(); // (
+    let depth = 1;
+    while (depth > 0 && !this.isAtEnd()) {
+      const kind = this.peek().kind;
+      if (kind === TokenKind.LParen) {
+        depth++;
+      } else if (kind === TokenKind.RParen) {
+        depth--;
+        if (depth === 0) {
+          break;
+        }
+      }
+      this.advance();
+    }
+    if (!this.check(TokenKind.RParen)) {
+      this.current = saved;
+      this.diagnostics.truncate(diagCount);
+      return false;
+    }
+    this.advance(); // )
+    if (this.check(TokenKind.Colon)) {
+      this.advance();
+      const ret = this.parseType();
+      if (!ret) {
+        this.current = saved;
+        this.diagnostics.truncate(diagCount);
+        return false;
+      }
+    }
+    const ok = this.check(TokenKind.Arrow);
+    this.current = saved;
+    this.diagnostics.truncate(diagCount);
+    return ok;
+  }
+
+  /** True when current `(` starts a function type `(...) => T`. */
+  private looksLikeFunctionType(): boolean {
+    if (!this.check(TokenKind.LParen)) {
+      return false;
+    }
+    const saved = this.current;
+    const diagCount = this.diagnostics.diagnostics.length;
+    this.advance(); // (
+    let depth = 1;
+    while (depth > 0 && !this.isAtEnd()) {
+      const kind = this.peek().kind;
+      if (kind === TokenKind.LParen) {
+        depth++;
+      } else if (kind === TokenKind.RParen) {
+        depth--;
+        if (depth === 0) {
+          break;
+        }
+      }
+      this.advance();
+    }
+    if (!this.check(TokenKind.RParen)) {
+      this.current = saved;
+      this.diagnostics.truncate(diagCount);
+      return false;
+    }
+    this.advance(); // )
+    const ok = this.check(TokenKind.Arrow);
+    this.current = saved;
+    this.diagnostics.truncate(diagCount);
+    return ok;
+  }
+
+  private parseLambdaExpression(): LambdaExpression | null {
+    const start = this.peek().span.start;
+    if (!this.expect(TokenKind.LParen, "Expected '(' to start lambda")) {
+      return null;
+    }
+
+    const params: LambdaParameter[] = [];
+    if (!this.check(TokenKind.RParen)) {
+      const first = this.parseLambdaParameter();
+      if (!first) {
+        return null;
+      }
+      params.push(first);
+      while (this.check(TokenKind.Comma)) {
+        this.advance();
+        if (this.check(TokenKind.RParen)) {
+          break;
+        }
+        const param = this.parseLambdaParameter();
+        if (!param) {
+          return null;
+        }
+        params.push(param);
+      }
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after lambda parameters")) {
+      return null;
+    }
+
+    let returnType: TypeAnnotation | null = null;
+    if (this.check(TokenKind.Colon)) {
+      this.advance();
+      returnType = this.parseType();
+      if (!returnType) {
+        return null;
+      }
+    }
+
+    if (!this.expect(TokenKind.Arrow, "Expected '=>' after lambda parameters")) {
+      return null;
+    }
+
+    if (this.check(TokenKind.LBrace)) {
+      const block = this.parseBlock();
+      if (!block) {
+        return null;
+      }
+      return {
+        kind: "LambdaExpression",
+        params,
+        returnType,
+        body: { kind: "block", statements: block.statements },
+        span: { start, end: block.end },
+      };
+    }
+
+    const expression = this.parseExpression();
+    if (!expression) {
+      return null;
+    }
+    return {
+      kind: "LambdaExpression",
+      params,
+      returnType,
+      body: { kind: "expression", expression },
+      span: { start, end: expression.span.end },
+    };
+  }
+
+  private parseLambdaParameter(): LambdaParameter | null {
+    const nameToken = this.expect(TokenKind.Identifier, "Expected parameter name");
+    if (!nameToken) {
+      return null;
+    }
+    const name: Identifier = {
+      kind: "Identifier",
+      name: nameToken.lexeme,
+      span: nameToken.span,
+    };
+    let typeAnnotation: TypeAnnotation | null = null;
+    if (this.check(TokenKind.Colon)) {
+      this.advance();
+      typeAnnotation = this.parseType();
+      if (!typeAnnotation) {
+        return null;
+      }
+    }
+    return {
+      kind: "LambdaParameter",
+      name,
+      typeAnnotation,
+      span: {
+        start: name.span.start,
+        end: typeAnnotation ? typeAnnotation.span.end : name.span.end,
+      },
+    };
+  }
+
+  private parseFunctionType(): FunctionType | null {
+    const start = this.peek().span.start;
+    if (!this.expect(TokenKind.LParen, "Expected '(' to start function type")) {
+      return null;
+    }
+
+    const params: TypeAnnotation[] = [];
+    if (!this.check(TokenKind.RParen)) {
+      const first = this.parseType();
+      if (!first) {
+        return null;
+      }
+      params.push(first);
+      while (this.check(TokenKind.Comma)) {
+        this.advance();
+        if (this.check(TokenKind.RParen)) {
+          break;
+        }
+        const param = this.parseType();
+        if (!param) {
+          return null;
+        }
+        params.push(param);
+      }
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after function type parameters")) {
+      return null;
+    }
+    if (!this.expect(TokenKind.Arrow, "Expected '=>' in function type")) {
+      return null;
+    }
+    const returnType = this.parseType();
+    if (!returnType) {
+      return null;
+    }
+    return {
+      kind: "FunctionType",
+      params,
+      returnType,
+      span: { start, end: returnType.span.end },
+    };
   }
 
   /** True when current Ident is followed by `<...>(`. */

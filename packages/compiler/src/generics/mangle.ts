@@ -46,6 +46,8 @@ export function mangleTypeAnnotation(ann: TypeAnnotation): string {
       return `mapped__${mangleTypeAnnotation(ann.constraint)}__${mangleTypeAnnotation(ann.type)}`;
     case "IndexedAccessType":
       return `idxacc__${mangleTypeAnnotation(ann.objectType)}__${mangleTypeAnnotation(ann.indexType)}`;
+    case "FunctionType":
+      return `fn__${ann.params.map(mangleTypeAnnotation).join("__")}__to__${mangleTypeAnnotation(ann.returnType)}`;
   }
 }
 

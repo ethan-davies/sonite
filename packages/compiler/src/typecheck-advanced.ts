@@ -51,13 +51,20 @@ export interface MapValueType {
   readonly valueType: ExtendedValueType;
 }
 
+export interface FunctionValueType {
+  readonly kind: "function";
+  readonly params: readonly ExtendedValueType[];
+  readonly returnType: ExtendedValueType | "void";
+}
+
 export type ExtendedValueType =
   | BaseValueType
   | UnionValueType
   | IntersectionValueType
   | ObjectValueType
   | LiteralValueType
-  | MapValueType;
+  | MapValueType
+  | FunctionValueType;
 
 export interface TypeAliasDef {
   readonly name: string;
@@ -84,6 +91,10 @@ export function isLiteralType(type: ExtendedValueType): type is LiteralValueType
 
 export function isMapType(type: ExtendedValueType): type is MapValueType {
   return typeof type === "object" && type.kind === "map";
+}
+
+export function isFunctionType(type: ExtendedValueType): type is FunctionValueType {
+  return typeof type === "object" && type.kind === "function";
 }
 
 export function isTupleType(
@@ -193,6 +204,12 @@ export function advancedTypeToString(type: ExtendedValueType): string {
       return type.literalKind === "string" ? `"${type.value}"` : String(type.value);
     case "map":
       return `{ [key: string]: ${advancedTypeToString(type.valueType)} }`;
+    case "function": {
+      const params = type.params.map(advancedTypeToString).join(", ");
+      const ret =
+        type.returnType === "void" ? "void" : advancedTypeToString(type.returnType);
+      return `(${params}) => ${ret}`;
+    }
     case "typeParam":
       return type.constraintName
         ? `${type.name} extends ${type.constraintName}`
@@ -252,6 +269,16 @@ export function advancedTypesEqual(a: ExtendedValueType, b: ExtendedValueType): 
       return b.kind === "literal" && a.literalKind === b.literalKind && a.value === b.value;
     case "map":
       return b.kind === "map" && advancedTypesEqual(a.valueType, b.valueType);
+    case "function":
+      return (
+        b.kind === "function" &&
+        a.params.length === b.params.length &&
+        a.params.every((p, i) => advancedTypesEqual(p, b.params[i]!)) &&
+        ((a.returnType === "void" && b.returnType === "void") ||
+          (a.returnType !== "void" &&
+            b.returnType !== "void" &&
+            advancedTypesEqual(a.returnType, b.returnType)))
+      );
     case "typeParam":
       return b.kind === "typeParam" && a.name === b.name;
     case "struct":
@@ -457,6 +484,20 @@ export function advancedIsAssignable(
       from.elements.length === to.elements.length &&
       from.elements.every((el, i) => advancedIsAssignable(el, to.elements[i]!, baseAssign))
     );
+  }
+
+  if (isFunctionType(from) && isFunctionType(to)) {
+    if (from.params.length !== to.params.length) {
+      return false;
+    }
+    // Invariant params/return for now (no variance).
+    if (!from.params.every((p, i) => advancedTypesEqual(p, to.params[i]!))) {
+      return false;
+    }
+    if (from.returnType === "void" || to.returnType === "void") {
+      return from.returnType === to.returnType;
+    }
+    return advancedTypesEqual(from.returnType, to.returnType);
   }
 
   return baseAssign(from, to);

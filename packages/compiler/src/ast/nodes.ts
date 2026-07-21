@@ -47,6 +47,8 @@ export type AstNode =
   | TypeAliasDeclaration
   | TypeParameter
   | Parameter
+  | LambdaParameter
+  | LambdaExpression
   | VariableDeclaration
   | ArrayBindingPattern
   | ArrayBindingElement
@@ -348,6 +350,7 @@ export interface ContinueStatement extends AstNodeBase {
 
 export type Expression =
   | CallExpression
+  | LambdaExpression
   | BinaryExpression
   | UnaryExpression
   | TypeofExpression
@@ -367,7 +370,7 @@ export type Expression =
   | CharLiteral
   | NullLiteral;
 
-export type CallCallee = Identifier | MemberExpression | SuperExpression;
+export type CallCallee = Expression;
 
 export interface CallExpression extends AstNodeBase {
   readonly kind: "CallExpression";
@@ -375,6 +378,24 @@ export interface CallExpression extends AstNodeBase {
   /** Explicit type arguments from `foo<T>(...)`; empty when inferred or non-generic. */
   readonly typeArgs: TypeAnnotation[];
   readonly args: Expression[];
+}
+
+export interface LambdaParameter extends AstNodeBase {
+  readonly kind: "LambdaParameter";
+  readonly name: Identifier;
+  /** Null when the type is inferred from context. */
+  readonly typeAnnotation: TypeAnnotation | null;
+}
+
+export type LambdaBody =
+  | { readonly kind: "expression"; readonly expression: Expression }
+  | { readonly kind: "block"; readonly statements: Statement[] };
+
+export interface LambdaExpression extends AstNodeBase {
+  readonly kind: "LambdaExpression";
+  readonly params: LambdaParameter[];
+  readonly returnType: TypeAnnotation | null;
+  readonly body: LambdaBody;
 }
 
 export interface BinaryExpression extends AstNodeBase {
@@ -503,7 +524,14 @@ export type TypeAnnotation =
   | TypeofType
   | ConditionalType
   | MappedType
-  | IndexedAccessType;
+  | IndexedAccessType
+  | FunctionType;
+
+export interface FunctionType extends AstNodeBase {
+  readonly kind: "FunctionType";
+  readonly params: TypeAnnotation[];
+  readonly returnType: TypeAnnotation;
+}
 
 export interface PrimitiveType extends AstNodeBase {
   readonly kind: "PrimitiveType";

@@ -946,4 +946,59 @@ describe("Parser", () => {
       expect(body[2].binding.elements[2]?.name?.name).toBe("third");
     }
   });
+
+  it("parses expression-bodied and block-bodied lambdas", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        let add = (a: i32, b: i32) => a + b;
+        let mul = (a: i32, b: i32): i32 => {
+          return a * b;
+        };
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const body = functionAt(ast, 0).body;
+    expect(body[0]?.kind).toBe("VariableDeclaration");
+    if (body[0]?.kind === "VariableDeclaration") {
+      expect(body[0].initializer?.kind).toBe("LambdaExpression");
+      if (body[0].initializer?.kind === "LambdaExpression") {
+        expect(body[0].initializer.params).toHaveLength(2);
+        expect(body[0].initializer.params[0]?.typeAnnotation).toMatchObject({
+          kind: "PrimitiveType",
+          name: "i32",
+        });
+        expect(body[0].initializer.body.kind).toBe("expression");
+      }
+    }
+    expect(body[1]?.kind).toBe("VariableDeclaration");
+    if (body[1]?.kind === "VariableDeclaration") {
+      expect(body[1].initializer?.kind).toBe("LambdaExpression");
+      if (body[1].initializer?.kind === "LambdaExpression") {
+        expect(body[1].initializer.returnType).toMatchObject({
+          kind: "PrimitiveType",
+          name: "i32",
+        });
+        expect(body[1].initializer.body.kind).toBe("block");
+      }
+    }
+  });
+
+  it("parses function type annotations", () => {
+    const { ast, diagnostics } = parse(`
+      function execute(op: (i32, i32) => i32): i32 {
+        return op(1, 2);
+      }
+      function main(): void {}
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const fn = functionAt(ast, 0);
+    expect(fn.params[0]?.typeAnnotation.kind).toBe("FunctionType");
+    if (fn.params[0]?.typeAnnotation.kind === "FunctionType") {
+      expect(fn.params[0].typeAnnotation.params).toHaveLength(2);
+      expect(fn.params[0].typeAnnotation.returnType).toMatchObject({
+        kind: "PrimitiveType",
+        name: "i32",
+      });
+    }
+  });
 });

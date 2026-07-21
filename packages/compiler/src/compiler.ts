@@ -3,7 +3,7 @@ import { resolve as resolvePath } from "node:path";
 import type { Program } from "./ast/nodes.js";
 import { LlvmCodegen } from "./codegen/llvm.js";
 import { DiagnosticCollector, type Diagnostic } from "./diagnostics/diagnostic.js";
-import { monomorphizeModules } from "./generics/monomorphize.js";
+import { monomorphizeModules, type TypecheckInstantiations } from "./generics/monomorphize.js";
 import { Lexer } from "./lexer/lexer.js";
 import { resolveModules, type ResolvedModule } from "./modules/resolve.js";
 import { Parser } from "./parser/parser.js";
@@ -53,6 +53,14 @@ export function compile(source: string, _options: CompileOptions = {}): CompileR
     const inst = typecheck(ast, diagnostics);
     if (!diagnostics.hasErrors) {
       monoModules = monomorphizeModules([synthetic], inst);
+      const ir = new LlvmCodegen().emitModules(monoModules, inst);
+      return {
+        ast: monoModules[0]?.ast ?? ast,
+        modules: monoModules,
+        ir,
+        diagnostics: diagnostics.diagnostics,
+        success: true,
+      };
     }
   }
 
@@ -116,8 +124,9 @@ export function compileFile(
   validateModules(resolved.modules, diagnostics);
 
   let monoModules = resolved.modules;
+  let inst: TypecheckInstantiations | undefined;
   if (!diagnostics.hasErrors) {
-    const inst = typecheckModules(resolved.modules, diagnostics);
+    inst = typecheckModules(resolved.modules, diagnostics);
     if (!diagnostics.hasErrors) {
       monoModules = monomorphizeModules(resolved.modules, inst);
     }
@@ -133,7 +142,7 @@ export function compileFile(
     };
   }
 
-  const ir = new LlvmCodegen().emitModules(monoModules);
+  const ir = new LlvmCodegen().emitModules(monoModules, inst);
   return {
     ast: monoModules.find((m) => m.isEntry)?.ast ?? entry.ast,
     modules: monoModules,

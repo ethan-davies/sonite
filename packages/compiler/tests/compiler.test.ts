@@ -334,6 +334,7 @@ describe("compile pipeline", () => {
         "multi-constraints.tsn",
         "dictionaries.tsn",
         "type-operators.tsn",
+        "lambdas.tsn",
       ]) {
         const source = readFileSync(join(examplesDir, name), "utf8");
         const result = compile(source);
@@ -1743,6 +1744,98 @@ describe("nullability and control-flow narrowing", () => {
       }
     `);
     expect(result.success).toBe(true);
+  });
+});
+
+describe("lambdas and closures", () => {
+  it("compiles expression-bodied lambdas and indirect calls", () => {
+    const result = compile(`
+      function main(): void {
+        let add = (a: i32, b: i32) => a + b;
+        print(add(2, 3));
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("%__Callable = type { ptr, ptr }");
+    expect(result.ir).toMatch(/define i32 @lambda_\d+\(ptr %env/);
+  });
+
+  it("applies contextual typing for lambda arguments", () => {
+    const result = compile(`
+      function execute(op: (i32, i32) => i32): i32 {
+        return op(10, 20);
+      }
+      function main(): void {
+        print(execute((a, b) => a + b));
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects untyped lambda parameters without context", () => {
+    const result = compile(`
+      function main(): void {
+        let add = (a, b) => a + b;
+      }
+    `);
+    expect(result.success).toBe(false);
+    expect(result.diagnostics.some((d) => d.code === "E0398")).toBe(true);
+  });
+
+  it("rejects return type mismatches on lambdas", () => {
+    const result = compile(`
+      function main(): void {
+        let add = (a: i32, b: i32): i32 => "hello";
+      }
+    `);
+    expect(result.success).toBe(false);
+    expect(result.diagnostics.some((d) => d.code === "E0303")).toBe(true);
+  });
+
+  it("compiles closures that capture outer parameters", () => {
+    const result = compile(`
+      function createAdder(x: i32): (i32) => i32 {
+        return (y: i32) => x + y;
+      }
+      function main(): void {
+        let addTen = createAdder(10);
+        print(addTen(5));
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call ptr @malloc");
+  });
+
+  it("compiles mutable captures with heap boxes", () => {
+    const result = compile(`
+      function createCounter(): () => i32 {
+        let count: i32 = 0;
+        return (): i32 => {
+          count++;
+          return count;
+        };
+      }
+      function main(): void {
+        let counter = createCounter();
+        print(counter());
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call ptr @malloc");
+  });
+
+  it("promotes named functions to callable values", () => {
+    const result = compile(`
+      function add(a: i32, b: i32): i32 {
+        return a + b;
+      }
+      function main(): void {
+        let f = add;
+        print(f(1, 2));
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("add__as_closure");
   });
 });
 

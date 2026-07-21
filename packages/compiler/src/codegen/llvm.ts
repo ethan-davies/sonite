@@ -12,6 +12,7 @@ import type {
   FunctionDeclaration,
   IfStatement,
   InterfaceDeclaration,
+  LambdaExpression,
   MemberExpression,
   NewExpression,
   Parameter,
@@ -28,6 +29,7 @@ import type {
   VariableDeclaration,
   WhileStatement,
 } from "../ast/nodes.js";
+import type { TypecheckInstantiations } from "../generics/monomorphize.js";
 import { mangleTypeAnnotation } from "../generics/mangle.js";
 import { valueTypeToAnnotation } from "../generics/value-type.js";
 import { mangleSymbol } from "../modules/mangle.js";
@@ -42,12 +44,14 @@ import {
   isTupleType,
   typesEqual,
   type EnumValueType,
+  type FunctionValueType,
   type StructValueType,
   type TupleValueType,
   type ValueType,
 } from "../typecheck.js";
 import {
   flattenUnion,
+  isFunctionType,
   isLiteralType,
   isMapType,
   isObjectType,
@@ -99,6 +103,14 @@ const UNION_TAG = {
 
 interface LocalBinding {
   readonly ptr: string;
+  readonly type: ValueType;
+  /** When true, `ptr` is an alloca of a heap-box pointer (mutable capture). */
+  readonly boxed: boolean;
+}
+
+interface LambdaCaptureLowering {
+  readonly name: string;
+  readonly mutable: boolean;
   readonly type: ValueType;
 }
 
@@ -242,6 +254,7 @@ export class LlvmCodegen {
   private needsSprintf = false;
   private needsUnionRuntime = false;
   private needsMapRuntime = false;
+  private needsCallableRuntime = false;
   /** Synthetic tuple LLVM type name → element types. */
   private readonly registeredTuples = new Map<string, readonly ValueType[]>();
   /** Local type alias expansions (local name → annotation). */
@@ -256,6 +269,20 @@ export class LlvmCodegen {
   private thisType: ValueType | null = null;
   /** Return type of the function/method currently being emitted. */
   private currentReturnType: ValueType | "void" | null = null;
+  private currentModuleId = "";
+  private lambdaCaptures = new Map<
+    number,
+    readonly { readonly name: string; readonly mutable: boolean }[]
+  >();
+  private lambdaCounter = 0;
+  private readonly emittedLambdas = new Set<number>();
+  private readonly emittedTrampolines = new Set<string>();
+  /** Mutable locals that must be heap-boxed in the current function. */
+  private boxedNames = new Set<string>();
+  /** When emitting a lambda body: env pointer SSA + capture layout. */
+  private currentLambdaEnv: string | null = null;
+  private currentLambdaEnvTypeName: string | null = null;
+  private currentLambdaCaptureLayout: LambdaCaptureLowering[] = [];
 
   emit(program: Program): string {
     return this.emitModules([
@@ -270,13 +297,21 @@ export class LlvmCodegen {
     ]);
   }
 
-  emitModules(modules: readonly ResolvedModule[]): string {
+  emitModules(
+    modules: readonly ResolvedModule[],
+    instantiations?: TypecheckInstantiations,
+  ): string {
     this.stringCounter = 0;
     this.tempCounter = 0;
     this.labelCounter = 0;
     this.stringGlobals.clear();
     this.locals = new Map();
     this.functions.clear();
+    this.lambdaCaptures = new Map(instantiations?.lambdaCaptures ?? []);
+    this.lambdaCounter = 0;
+    this.emittedLambdas.clear();
+    this.emittedTrampolines.clear();
+    this.needsCallableRuntime = false;
     this.localFunctions.clear();
     this.structs.clear();
     this.localStructs.clear();
@@ -540,6 +575,7 @@ export class LlvmCodegen {
       this.localEnums = symbols.enums;
       this.localClasses = symbols.classes;
       this.localInterfaces = symbols.interfaces;
+      this.currentModuleId = mod.moduleId;
 
       const namespaces = new Map<string, NamespaceInfo>();
       for (const binding of mod.imports) {
@@ -632,12 +668,16 @@ export class LlvmCodegen {
     const interfaceTypeLines = this.emitInterfaceTypeDefs();
     const classTypeLines = this.emitClassTypeDefs();
     const unionTypeLines = this.needsUnionRuntime ? ["%__Union = type { i32, ptr }"] : [];
+    const callableTypeLines = this.needsCallableRuntime
+      ? ["%__Callable = type { ptr, ptr }"]
+      : [];
     const typeLines = [
       ...structTypeLines,
       ...tupleTypeLines,
       ...interfaceTypeLines,
       ...classTypeLines,
       ...unionTypeLines,
+      ...callableTypeLines,
     ];
     const globalLines = [...this.globalDefs, ...this.emitStringGlobals()];
     const declares: string[] = [];
@@ -649,7 +689,8 @@ export class LlvmCodegen {
       this.needsArrayRuntime ||
       this.needsClassRuntime ||
       this.needsUnionRuntime ||
-      this.needsMapRuntime
+      this.needsMapRuntime ||
+      this.needsCallableRuntime
     ) {
       declares.push("declare ptr @malloc(i64 noundef) nounwind");
     }
@@ -1358,6 +1399,38 @@ export class LlvmCodegen {
           return (field?.type as ValueType) ?? null;
         }
         return null;
+      }
+      case "FunctionType": {
+        const params: ValueType[] = [];
+        for (const p of ann.params) {
+          const vt = this.resolveAnnotationInModule(
+            p,
+            localStructs,
+            localEnums,
+            localClasses,
+            localInterfaces,
+            namespaces,
+          );
+          if (vt === null) {
+            return null;
+          }
+          params.push(vt);
+        }
+        if (ann.returnType.kind === "PrimitiveType" && ann.returnType.name === "void") {
+          return { kind: "function", params, returnType: "void" };
+        }
+        const returnType = this.resolveAnnotationInModule(
+          ann.returnType,
+          localStructs,
+          localEnums,
+          localClasses,
+          localInterfaces,
+          namespaces,
+        );
+        if (returnType === null) {
+          return null;
+        }
+        return { kind: "function", params, returnType };
       }
       case "NamedType": {
         if (ann.typeArgs.length > 0) {
@@ -2069,6 +2142,7 @@ export class LlvmCodegen {
     this.locals = new Map();
     this.tempCounter = 0;
     this.loopStack.length = 0;
+    this.boxedNames = this.collectBoxedNamesInStmts(fn.body);
     const sig = this.localFunctions.get(fn.name.name);
     this.currentReturnType = sig?.returnType ?? "void";
     const lines: string[] = [];
@@ -2107,6 +2181,7 @@ export class LlvmCodegen {
     lines.push("");
     this.functionBodies.push(...lines);
     this.currentReturnType = null;
+    this.boxedNames = new Set();
   }
 
   private emitFunctionHeader(fn: FunctionDeclaration): string {
@@ -2125,7 +2200,7 @@ export class LlvmCodegen {
     const ptr = `%v.${param.name.name}`;
     lines.push(`  ${ptr} = alloca ${llvmType}`);
     lines.push(`  store ${llvmType} %arg${index}, ptr ${ptr}`);
-    this.locals.set(param.name.name, { ptr, type });
+    this.locals.set(param.name.name, { ptr, type, boxed: false });
   }
 
   /** Returns true if the statement terminates the block (return/break/continue). */
@@ -2275,7 +2350,7 @@ export class LlvmCodegen {
     const elemLlvm = toLlvmType(elemType);
     const elemPtr = `%v.${stmt.name.name}`;
     lines.push(`  ${elemPtr} = alloca ${elemLlvm}`);
-    this.locals.set(stmt.name.name, { ptr: elemPtr, type: elemType });
+    this.locals.set(stmt.name.name, { ptr: elemPtr, type: elemType, boxed: false });
 
     const length = this.emitArrayLength(iterable.llvm, lines);
 
@@ -2379,9 +2454,30 @@ export class LlvmCodegen {
     const name = stmt.binding.name;
     const type = this.resolveDeclType(stmt);
     const llvmType = toLlvmType(type);
+    const mutable = stmt.mutability === "let";
+    const shouldBox = mutable && this.boxedNames.has(name);
+
+    if (shouldBox) {
+      this.needsCallableRuntime = true;
+      const boxHolder = `%v.${name}`;
+      lines.push(`  ${boxHolder} = alloca ptr`);
+      const heap = this.nextTemp();
+      const size = elementByteSize(type, this.structs);
+      lines.push(`  ${heap} = call ptr @malloc(i64 noundef ${size})`);
+      lines.push(`  store ptr ${heap}, ptr ${boxHolder}`);
+      this.locals.set(name, { ptr: boxHolder, type, boxed: true });
+      if (stmt.initializer === null) {
+        lines.push(`  store ${llvmType} ${zeroInitializer(type)}, ptr ${heap}`);
+        return;
+      }
+      const init = this.emitExpression(stmt.initializer, lines, type);
+      lines.push(`  store ${llvmType} ${init.llvm}, ptr ${heap}`);
+      return;
+    }
+
     const ptr = `%v.${name}`;
     lines.push(`  ${ptr} = alloca ${llvmType}`);
-    this.locals.set(name, { ptr, type });
+    this.locals.set(name, { ptr, type, boxed: false });
 
     if (stmt.initializer === null) {
       lines.push(`  store ${llvmType} ${zeroInitializer(type)}, ptr ${ptr}`);
@@ -2423,7 +2519,7 @@ export class LlvmCodegen {
       const ptr = `%v.${el.name.name}`;
       lines.push(`  ${ptr} = alloca ${elemLlvm}`);
       lines.push(`  store ${elemLlvm} ${loaded}, ptr ${ptr}`);
-      this.locals.set(el.name.name, { ptr, type: elemType });
+      this.locals.set(el.name.name, { ptr, type: elemType, boxed: false });
     }
   }
 
@@ -2434,15 +2530,16 @@ export class LlvmCodegen {
         throw new Error(`Codegen: unknown variable '${stmt.target.name}'`);
       }
       const llvmType = toLlvmType(local.type);
+      const storePtr = this.storagePtr(local, lines);
 
       if (stmt.operator === "=") {
         const value = this.emitExpression(stmt.value, lines, local.type);
-        lines.push(`  store ${llvmType} ${value.llvm}, ptr ${local.ptr}`);
+        lines.push(`  store ${llvmType} ${value.llvm}, ptr ${storePtr}`);
         return;
       }
 
       const loaded = this.nextTemp();
-      lines.push(`  ${loaded} = load ${llvmType}, ptr ${local.ptr}`);
+      lines.push(`  ${loaded} = load ${llvmType}, ptr ${storePtr}`);
       const rhs = this.emitExpression(stmt.value, lines, local.type);
       const result = this.nextTemp();
       const isFloat = local.type === "f32" || local.type === "f64";
@@ -2455,7 +2552,7 @@ export class LlvmCodegen {
             ? "fsub"
             : "sub";
       lines.push(`  ${result} = ${opcode} ${llvmType} ${loaded}, ${rhs.llvm}`);
-      lines.push(`  store ${llvmType} ${result}, ptr ${local.ptr}`);
+      lines.push(`  store ${llvmType} ${result}, ptr ${storePtr}`);
       return;
     }
 
@@ -2592,8 +2689,9 @@ export class LlvmCodegen {
       throw new Error(`Codegen: unknown variable '${stmt.name.name}'`);
     }
     const llvmType = toLlvmType(local.type);
+    const storePtr = this.storagePtr(local, lines);
     const loaded = this.nextTemp();
-    lines.push(`  ${loaded} = load ${llvmType}, ptr ${local.ptr}`);
+    lines.push(`  ${loaded} = load ${llvmType}, ptr ${storePtr}`);
     const result = this.nextTemp();
     const isFloat = local.type === "f32" || local.type === "f64";
     const one = typedOne(local.type);
@@ -2604,7 +2702,7 @@ export class LlvmCodegen {
       const opcode = isFloat ? "fsub" : "sub";
       lines.push(`  ${result} = ${opcode} ${llvmType} ${loaded}, ${one}`);
     }
-    lines.push(`  store ${llvmType} ${result}, ptr ${local.ptr}`);
+    lines.push(`  store ${llvmType} ${result}, ptr ${storePtr}`);
   }
 
   private emitReturn(stmt: ReturnStatement, lines: string[]): void {
@@ -2633,11 +2731,11 @@ export class LlvmCodegen {
       this.emitMethodCall(call, lines, true);
       return;
     }
-    if (call.callee.name === "print") {
+    if (call.callee.kind === "Identifier" && call.callee.name === "print") {
       this.emitPrintCall(call, lines);
       return;
     }
-    if (call.callee.name === "createMap") {
+    if (call.callee.kind === "Identifier" && call.callee.name === "createMap") {
       this.emitCreateMap(lines);
       return;
     }
@@ -2835,10 +2933,14 @@ export class LlvmCodegen {
       }
       case "Identifier": {
         const local = this.locals.get(expr.name);
-        if (!local) {
-          throw new Error(`Codegen: unknown variable '${expr.name}'`);
+        if (local) {
+          return local.type;
         }
-        return local.type;
+        const sig = this.localFunctions.get(expr.name);
+        if (sig) {
+          return { kind: "function", params: sig.params, returnType: sig.returnType };
+        }
+        throw new Error(`Codegen: unknown variable '${expr.name}'`);
       }
       case "UnaryExpression":
         if (expr.operator === "!") {
@@ -2921,14 +3023,69 @@ export class LlvmCodegen {
           }
           throw new Error(`Codegen: unexpected method '${method}' in inference`);
         }
+        if (expr.callee.kind !== "Identifier") {
+          // Indirect / lambda call — use expected or i32 fallback for inference
+          if (expected && isFunctionType(expected)) {
+            return expected.returnType === "void" ? "i32" : (expected.returnType as ValueType);
+          }
+          return "i32";
+        }
         const sig = this.localFunctions.get(expr.callee.name);
         if (!sig || sig.returnType === "void") {
           if (expr.callee.name === "createMap") {
             return { kind: "map", valueType: "string" };
           }
+          const local = this.locals.get(expr.callee.name);
+          if (local && isFunctionType(local.type) && local.type.returnType !== "void") {
+            return local.type.returnType as ValueType;
+          }
           throw new Error(`Codegen: unexpected call in type inference '${expr.callee.name}'`);
         }
         return sig.returnType;
+      }
+      case "LambdaExpression": {
+        if (expected && isFunctionType(expected)) {
+          return expected;
+        }
+        const params: ValueType[] = [];
+        for (const p of expr.params) {
+          if (!p.typeAnnotation) {
+            throw new Error("Codegen: lambda param missing type in inference");
+          }
+          const t = this.resolveAnnotation(p.typeAnnotation);
+          if (!t) {
+            throw new Error("Codegen: invalid lambda param type");
+          }
+          params.push(t);
+        }
+        let returnType: ValueType | "void" = "i32";
+        if (expr.returnType) {
+          if (expr.returnType.kind === "PrimitiveType" && expr.returnType.name === "void") {
+            returnType = "void";
+          } else {
+            const rt = this.resolveAnnotation(expr.returnType);
+            if (!rt) {
+              throw new Error("Codegen: invalid lambda return type");
+            }
+            returnType = rt;
+          }
+        } else if (expr.body.kind === "expression") {
+          const saved = this.locals;
+          this.locals = new Map(saved);
+          for (let i = 0; i < expr.params.length; i += 1) {
+            this.locals.set(expr.params[i]!.name.name, {
+              ptr: `%infer.${expr.params[i]!.name.name}`,
+              type: params[i]!,
+              boxed: false,
+            });
+          }
+          try {
+            returnType = this.inferExpressionType(expr.body.expression);
+          } finally {
+            this.locals = saved;
+          }
+        }
+        return { kind: "function", params, returnType };
       }
     }
   }
@@ -3154,13 +3311,20 @@ export class LlvmCodegen {
       }
       case "Identifier": {
         const local = this.locals.get(expr.name);
-        if (!local) {
-          throw new Error(`Codegen: unknown variable '${expr.name}'`);
+        if (local) {
+          const storePtr = this.storagePtr(local, lines);
+          const tmp = this.nextTemp();
+          lines.push(`  ${tmp} = load ${toLlvmType(local.type)}, ptr ${storePtr}`);
+          return { llvm: tmp, type: local.type };
         }
-        const tmp = this.nextTemp();
-        lines.push(`  ${tmp} = load ${toLlvmType(local.type)}, ptr ${local.ptr}`);
-        return { llvm: tmp, type: local.type };
+        const sig = this.localFunctions.get(expr.name);
+        if (sig) {
+          return this.emitNamedFunctionRef(sig, lines);
+        }
+        throw new Error(`Codegen: unknown variable '${expr.name}'`);
       }
+      case "LambdaExpression":
+        return this.emitLambdaExpression(expr, lines, expected);
       case "UnaryExpression":
         return this.emitUnary(expr, lines);
       case "BinaryExpression":
@@ -3176,7 +3340,7 @@ export class LlvmCodegen {
           }
           return this.emitMethodCall(expr, lines, false);
         }
-        if (expr.callee.name === "createMap") {
+        if (expr.callee.kind === "Identifier" && expr.callee.name === "createMap") {
           return this.emitCreateMap(lines, expected);
         }
         return this.emitUserCall(expr, lines, false);
@@ -4360,14 +4524,450 @@ export class LlvmCodegen {
     lines: string[],
     asStatement: boolean,
   ): EmittedValue {
-    if (call.callee.kind !== "Identifier") {
-      throw new Error("Codegen: expected identifier callee");
+    if (call.callee.kind === "Identifier") {
+      const sig = this.localFunctions.get(call.callee.name);
+      if (sig) {
+        return this.emitCallWithSig(sig, call.args, lines, asStatement);
+      }
     }
-    const sig = this.localFunctions.get(call.callee.name);
-    if (!sig) {
-      throw new Error(`Codegen: unknown function '${call.callee.name}'`);
+    const callee = this.emitExpression(call.callee, lines);
+    if (!isFunctionType(callee.type)) {
+      throw new Error("Codegen: calling non-function value");
     }
-    return this.emitCallWithSig(sig, call.args, lines, asStatement);
+    return this.emitIndirectCall(callee, callee.type, call.args, lines, asStatement);
+  }
+
+  private storagePtr(local: LocalBinding, lines: string[]): string {
+    if (!local.boxed) {
+      return local.ptr;
+    }
+    const box = this.nextTemp();
+    lines.push(`  ${box} = load ptr, ptr ${local.ptr}`);
+    return box;
+  }
+
+  private collectBoxedNamesInStmts(stmts: Statement[]): Set<string> {
+    const names = new Set<string>();
+    const visitExpr = (e: Expression): void => {
+      if (e.kind === "LambdaExpression") {
+        const caps = this.lambdaCaptures.get(e.span.start.offset) ?? [];
+        for (const c of caps) {
+          if (c.mutable) {
+            names.add(c.name);
+          }
+        }
+        if (e.body.kind === "expression") {
+          visitExpr(e.body.expression);
+        } else {
+          for (const s of e.body.statements) visitStmt(s);
+        }
+        return;
+      }
+      if (e.kind === "CallExpression") {
+        visitExpr(e.callee);
+        for (const a of e.args) visitExpr(a);
+      } else if (e.kind === "BinaryExpression") {
+        visitExpr(e.left);
+        visitExpr(e.right);
+      } else if (e.kind === "UnaryExpression" || e.kind === "TypeofExpression") {
+        visitExpr(e.operand);
+      } else if (e.kind === "IsExpression") {
+        visitExpr(e.value);
+      } else if (e.kind === "IndexExpression") {
+        visitExpr(e.object);
+        visitExpr(e.index);
+      } else if (e.kind === "MemberExpression") {
+        visitExpr(e.object);
+      } else if (e.kind === "ArrayLiteral") {
+        for (const el of e.elements) visitExpr(el);
+      } else if (e.kind === "StructLiteral") {
+        for (const f of e.fields) visitExpr(f.value);
+      } else if (e.kind === "NewExpression") {
+        for (const a of e.args) visitExpr(a);
+      }
+    };
+    const visitStmt = (s: Statement): void => {
+      switch (s.kind) {
+        case "VariableDeclaration":
+          if (s.initializer) visitExpr(s.initializer);
+          break;
+        case "AssignmentStatement":
+          visitExpr(s.value);
+          break;
+        case "ExpressionStatement":
+          visitExpr(s.expression);
+          break;
+        case "ReturnStatement":
+          if (s.value) visitExpr(s.value);
+          break;
+        case "IfStatement":
+          visitExpr(s.condition);
+          for (const st of s.consequent) visitStmt(st);
+          if (Array.isArray(s.alternate)) for (const st of s.alternate) visitStmt(st);
+          else if (s.alternate) visitStmt(s.alternate);
+          break;
+        case "WhileStatement":
+          visitExpr(s.condition);
+          for (const st of s.body) visitStmt(st);
+          break;
+        case "ForStatement":
+          if (s.initializer) visitStmt(s.initializer);
+          if (s.condition) visitExpr(s.condition);
+          for (const st of s.body) visitStmt(st);
+          break;
+        case "ForInStatement":
+          visitExpr(s.iterable);
+          for (const st of s.body) visitStmt(st);
+          break;
+        default:
+          break;
+      }
+    };
+    for (const s of stmts) visitStmt(s);
+    return names;
+  }
+
+  private emitNamedFunctionRef(sig: FunctionSig, lines: string[]): EmittedValue {
+    this.needsCallableRuntime = true;
+    const trampoline = this.ensureTrampoline(sig);
+    return this.emitCallableValue(`@${trampoline}`, "null", {
+      kind: "function",
+      params: sig.params,
+      returnType: sig.returnType,
+    }, lines);
+  }
+
+  private ensureTrampoline(sig: FunctionSig): string {
+    const name = `${sig.mangledName}__as_closure`;
+    if (this.emittedTrampolines.has(name)) {
+      return name;
+    }
+    this.emittedTrampolines.add(name);
+    const ret = sig.returnType === "void" ? "void" : toLlvmType(sig.returnType);
+    const params = [
+      "ptr %env",
+      ...sig.params.map((t, i) => `${toLlvmType(t)} %arg${i}`),
+    ].join(", ");
+    const lines: string[] = [];
+    lines.push(`define ${ret} @${name}(${params}) {`);
+    lines.push("entry:");
+    const argList = sig.params.map((t, i) => `${toLlvmType(t)} %arg${i}`).join(", ");
+    if (sig.returnType === "void") {
+      lines.push(`  call void @${sig.mangledName}(${argList})`);
+      lines.push("  ret void");
+    } else {
+      const tmp = "%ret";
+      const retTy = toLlvmType(sig.returnType);
+      lines.push(`  ${tmp} = call ${retTy} @${sig.mangledName}(${argList})`);
+      lines.push(`  ret ${retTy} ${tmp}`);
+    }
+    lines.push("}");
+    lines.push("");
+    this.functionBodies.push(...lines);
+    return name;
+  }
+
+  private emitCallableValue(
+    codePtr: string,
+    envPtr: string,
+    type: FunctionValueType,
+    lines: string[],
+  ): EmittedValue {
+    this.needsCallableRuntime = true;
+    const alloca = this.nextTemp();
+    lines.push(`  ${alloca} = alloca %__Callable`);
+    const codeSlot = this.nextTemp();
+    lines.push(`  ${codeSlot} = getelementptr inbounds %__Callable, ptr ${alloca}, i32 0, i32 0`);
+    lines.push(`  store ptr ${codePtr}, ptr ${codeSlot}`);
+    const envSlot = this.nextTemp();
+    lines.push(`  ${envSlot} = getelementptr inbounds %__Callable, ptr ${alloca}, i32 0, i32 1`);
+    lines.push(`  store ptr ${envPtr}, ptr ${envSlot}`);
+    const loaded = this.nextTemp();
+    lines.push(`  ${loaded} = load %__Callable, ptr ${alloca}`);
+    return { llvm: loaded, type };
+  }
+
+  private emitIndirectCall(
+    callee: EmittedValue,
+    fnType: FunctionValueType,
+    args: Expression[],
+    lines: string[],
+    asStatement: boolean,
+  ): EmittedValue {
+    this.needsCallableRuntime = true;
+    const tmpAlloca = this.nextTemp();
+    lines.push(`  ${tmpAlloca} = alloca %__Callable`);
+    lines.push(`  store %__Callable ${callee.llvm}, ptr ${tmpAlloca}`);
+    const codeSlot = this.nextTemp();
+    lines.push(`  ${codeSlot} = getelementptr inbounds %__Callable, ptr ${tmpAlloca}, i32 0, i32 0`);
+    const code = this.nextTemp();
+    lines.push(`  ${code} = load ptr, ptr ${codeSlot}`);
+    const envSlot = this.nextTemp();
+    lines.push(`  ${envSlot} = getelementptr inbounds %__Callable, ptr ${tmpAlloca}, i32 0, i32 1`);
+    const env = this.nextTemp();
+    lines.push(`  ${env} = load ptr, ptr ${envSlot}`);
+
+    const emittedArgs: EmittedValue[] = [];
+    for (let i = 0; i < args.length; i += 1) {
+      emittedArgs.push(this.emitExpression(args[i]!, lines, fnType.params[i] as ValueType));
+    }
+    const argList = [
+      `ptr ${env}`,
+      ...emittedArgs.map((a) => `${toLlvmType(a.type)} ${a.llvm}`),
+    ].join(", ");
+
+    if (fnType.returnType === "void") {
+      lines.push(`  call void ${code}(${argList})`);
+      if (!asStatement) {
+        throw new Error("Codegen: void indirect call used as value");
+      }
+      return { llvm: "void", type: "i32" };
+    }
+    const retTy = toLlvmType(fnType.returnType as ValueType);
+    const tmp = this.nextTemp();
+    lines.push(`  ${tmp} = call ${retTy} ${code}(${argList})`);
+    return { llvm: tmp, type: fnType.returnType as ValueType };
+  }
+
+  private emitLambdaExpression(
+    expr: LambdaExpression,
+    lines: string[],
+    expected?: ValueType,
+  ): EmittedValue {
+    this.needsCallableRuntime = true;
+    const fnType = this.inferExpressionType(expr, expected) as FunctionValueType;
+    const capRecords = this.lambdaCaptures.get(expr.span.start.offset) ?? [];
+    const captures: LambdaCaptureLowering[] = capRecords.map((c) => {
+      const local = this.locals.get(c.name);
+      const fromLayout = this.currentLambdaCaptureLayout.find((x) => x.name === c.name);
+      const type = local?.type ?? fromLayout?.type;
+      if (!type) {
+        throw new Error(`Codegen: missing capture type for '${c.name}'`);
+      }
+      return { name: c.name, mutable: c.mutable, type };
+    });
+    const mangled = this.ensureLambdaFunction(expr, fnType, captures);
+
+    let envPtr = "null";
+    if (captures.length > 0) {
+      const envTypeName = this.envTypeName(expr.span.start.offset, captures);
+      const envSize = this.envByteSize(captures);
+      envPtr = this.nextTemp();
+      lines.push(`  ${envPtr} = call ptr @malloc(i64 noundef ${envSize})`);
+      for (let i = 0; i < captures.length; i += 1) {
+        const cap = captures[i]!;
+        const fieldPtr = this.nextTemp();
+        lines.push(
+          `  ${fieldPtr} = getelementptr inbounds %${envTypeName}, ptr ${envPtr}, i32 0, i32 ${i}`,
+        );
+        if (cap.mutable) {
+          const local = this.locals.get(cap.name);
+          if (local?.boxed) {
+            const box = this.nextTemp();
+            lines.push(`  ${box} = load ptr, ptr ${local.ptr}`);
+            lines.push(`  store ptr ${box}, ptr ${fieldPtr}`);
+          } else if (local) {
+            lines.push(`  store ptr ${local.ptr}, ptr ${fieldPtr}`);
+          } else {
+            const outer = this.loadCaptureFromCurrentEnv(cap.name, lines);
+            lines.push(`  store ptr ${outer}, ptr ${fieldPtr}`);
+          }
+        } else {
+          const value = this.loadCaptureValue(cap.name, cap.type, lines);
+          lines.push(`  store ${toLlvmType(cap.type)} ${value}, ptr ${fieldPtr}`);
+        }
+      }
+    }
+
+    return this.emitCallableValue(`@${mangled}`, envPtr, fnType, lines);
+  }
+
+  private loadCaptureValue(name: string, type: ValueType, lines: string[]): string {
+    const local = this.locals.get(name);
+    if (local) {
+      const ptr = this.storagePtr(local, lines);
+      const tmp = this.nextTemp();
+      lines.push(`  ${tmp} = load ${toLlvmType(type)}, ptr ${ptr}`);
+      return tmp;
+    }
+    const idx = this.currentLambdaCaptureLayout.findIndex((c) => c.name === name);
+    if (idx < 0 || !this.currentLambdaEnv || !this.currentLambdaEnvTypeName) {
+      throw new Error(`Codegen: cannot load capture '${name}'`);
+    }
+    const fieldPtr = this.nextTemp();
+    lines.push(
+      `  ${fieldPtr} = getelementptr inbounds %${this.currentLambdaEnvTypeName}, ptr ${this.currentLambdaEnv}, i32 0, i32 ${idx}`,
+    );
+    const tmp = this.nextTemp();
+    const llvmTy = this.currentLambdaCaptureLayout[idx]!.mutable ? "ptr" : toLlvmType(type);
+    lines.push(`  ${tmp} = load ${llvmTy}, ptr ${fieldPtr}`);
+    if (this.currentLambdaCaptureLayout[idx]!.mutable) {
+      const val = this.nextTemp();
+      lines.push(`  ${val} = load ${toLlvmType(type)}, ptr ${tmp}`);
+      return val;
+    }
+    return tmp;
+  }
+
+  private loadCaptureFromCurrentEnv(name: string, lines: string[]): string {
+    const idx = this.currentLambdaCaptureLayout.findIndex((c) => c.name === name);
+    if (idx < 0 || !this.currentLambdaEnv || !this.currentLambdaEnvTypeName) {
+      throw new Error(`Codegen: capture '${name}' not in current env`);
+    }
+    const fieldPtr = this.nextTemp();
+    lines.push(
+      `  ${fieldPtr} = getelementptr inbounds %${this.currentLambdaEnvTypeName}, ptr ${this.currentLambdaEnv}, i32 0, i32 ${idx}`,
+    );
+    const tmp = this.nextTemp();
+    lines.push(`  ${tmp} = load ptr, ptr ${fieldPtr}`);
+    return tmp;
+  }
+
+  private envTypeName(offset: number, captures: LambdaCaptureLowering[]): string {
+    const name =
+      `__env_${captures.map((c) => `${c.name}_${c.mutable ? "m" : "c"}`).join("__") || "empty"}` +
+      `_${offset}`;
+    if (!this.globalDefs.some((l) => l.startsWith(`%${name} =`))) {
+      const fields = captures
+        .map((c) => (c.mutable ? "ptr" : toLlvmType(c.type)))
+        .join(", ");
+      this.globalDefs.push(`%${name} = type { ${fields || "i8"} }`);
+    }
+    return name;
+  }
+
+  private envByteSize(captures: LambdaCaptureLowering[]): number {
+    let size = 0;
+    for (const c of captures) {
+      size = alignUp(size, 8);
+      size += c.mutable ? 8 : elementByteSize(c.type, this.structs);
+    }
+    return alignUp(size, 8) || 8;
+  }
+
+  private ensureLambdaFunction(
+    expr: LambdaExpression,
+    fnType: FunctionValueType,
+    captures: LambdaCaptureLowering[],
+  ): string {
+    const offset = expr.span.start.offset;
+    const mangled =
+      (this.currentModuleId ? `${this.currentModuleId}__` : "") + `lambda_${offset}`;
+    if (this.emittedLambdas.has(offset)) {
+      return mangled;
+    }
+    this.emittedLambdas.add(offset);
+    return this.emitLambdaFunctionBody(expr, fnType, mangled, captures);
+  }
+
+  private emitLambdaFunctionBody(
+    expr: LambdaExpression,
+    fnType: FunctionValueType,
+    mangled: string,
+    layout: LambdaCaptureLowering[],
+  ): string {
+    const envName = layout.length > 0 ? this.envTypeName(expr.span.start.offset, layout) : "";
+
+    const savedLocals = this.locals;
+    const savedTemp = this.tempCounter;
+    const savedReturn = this.currentReturnType;
+    const savedEnv = this.currentLambdaEnv;
+    const savedEnvType = this.currentLambdaEnvTypeName;
+    const savedLayout = this.currentLambdaCaptureLayout;
+    const savedBoxed = this.boxedNames;
+
+    this.locals = new Map();
+    this.tempCounter = 0;
+    this.currentReturnType =
+      fnType.returnType === "void" ? "void" : (fnType.returnType as ValueType);
+    this.currentLambdaEnv = "%env";
+    this.currentLambdaEnvTypeName = envName || null;
+    this.currentLambdaCaptureLayout = layout;
+    this.boxedNames = this.collectBoxedNamesInStmts(
+      expr.body.kind === "block" ? expr.body.statements : [],
+    );
+
+    const ret =
+      fnType.returnType === "void" ? "void" : toLlvmType(fnType.returnType as ValueType);
+    const params = [
+      "ptr %env",
+      ...fnType.params.map((t, i) => `${toLlvmType(t as ValueType)} %arg${i}`),
+    ].join(", ");
+    const lines: string[] = [];
+    lines.push(`define ${ret} @${mangled}(${params}) {`);
+    lines.push("entry:");
+
+    for (let i = 0; i < layout.length; i += 1) {
+      const cap = layout[i]!;
+      const fieldPtr = this.nextTemp();
+      lines.push(
+        `  ${fieldPtr} = getelementptr inbounds %${envName}, ptr %env, i32 0, i32 ${i}`,
+      );
+      if (cap.mutable) {
+        const boxHolder = `%v.${cap.name}`;
+        lines.push(`  ${boxHolder} = alloca ptr`);
+        const box = this.nextTemp();
+        lines.push(`  ${box} = load ptr, ptr ${fieldPtr}`);
+        lines.push(`  store ptr ${box}, ptr ${boxHolder}`);
+        this.locals.set(cap.name, { ptr: boxHolder, type: cap.type, boxed: true });
+      } else {
+        const llvmTy = toLlvmType(cap.type);
+        const ptr = `%v.${cap.name}`;
+        lines.push(`  ${ptr} = alloca ${llvmTy}`);
+        const val = this.nextTemp();
+        lines.push(`  ${val} = load ${llvmTy}, ptr ${fieldPtr}`);
+        lines.push(`  store ${llvmTy} ${val}, ptr ${ptr}`);
+        this.locals.set(cap.name, { ptr, type: cap.type, boxed: false });
+      }
+    }
+
+    for (let i = 0; i < expr.params.length; i += 1) {
+      const p = expr.params[i]!;
+      const type = fnType.params[i]! as ValueType;
+      const llvmType = toLlvmType(type);
+      const ptr = `%v.${p.name.name}`;
+      lines.push(`  ${ptr} = alloca ${llvmType}`);
+      lines.push(`  store ${llvmType} %arg${i}, ptr ${ptr}`);
+      this.locals.set(p.name.name, { ptr, type, boxed: false });
+    }
+
+    let terminated = false;
+    if (expr.body.kind === "expression") {
+      const expectedRet =
+        fnType.returnType !== "void" ? (fnType.returnType as ValueType) : undefined;
+      const value = this.emitExpression(expr.body.expression, lines, expectedRet);
+      if (fnType.returnType === "void") {
+        lines.push("  ret void");
+      } else {
+        lines.push(`  ret ${toLlvmType(value.type)} ${value.llvm}`);
+      }
+      terminated = true;
+    } else {
+      for (const stmt of expr.body.statements) {
+        if (terminated) break;
+        terminated = this.emitStatement(stmt, lines);
+      }
+      if (!terminated) {
+        if (fnType.returnType === "void") {
+          lines.push("  ret void");
+        } else {
+          throw new Error("Codegen: lambda missing return");
+        }
+      }
+    }
+
+    lines.push("}");
+    lines.push("");
+    this.functionBodies.push(...lines);
+
+    this.locals = savedLocals;
+    this.tempCounter = savedTemp;
+    this.currentReturnType = savedReturn;
+    this.currentLambdaEnv = savedEnv;
+    this.currentLambdaEnvTypeName = savedEnvType;
+    this.currentLambdaCaptureLayout = savedLayout;
+    this.boxedNames = savedBoxed;
+    return mangled;
   }
 
   private emitCallWithSig(
@@ -4765,6 +5365,9 @@ function toLlvmType(type: ValueType | "void"): string {
     if (type.kind === "map") {
       return "ptr";
     }
+    if (type.kind === "function") {
+      return "%__Callable";
+    }
     if (type.kind === "intersection") {
       for (const arm of type.arms) {
         if (typeof arm === "object" && (arm.kind === "object" || arm.kind === "struct")) {
@@ -4825,6 +5428,9 @@ function zeroInitializer(type: ValueType): string {
     if (type.kind === "literal") {
       return type.literalKind === "string" ? "null" : "0";
     }
+    if (type.kind === "function") {
+      return "zeroinitializer";
+    }
     return "null";
   }
   switch (type) {
@@ -4878,6 +5484,12 @@ function elementByteSize(type: ValueType, structs?: Map<string, StructInfo>): nu
     }
     if (type.kind === "enum") {
       return 4;
+    }
+    if (type.kind === "map") {
+      return 8;
+    }
+    if (type.kind === "function") {
+      return 16;
     }
     // class / array ptr
     return 8;

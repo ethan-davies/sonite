@@ -134,12 +134,49 @@ static void test_typeinfo(void) {
       .key_ref_class = TSN_REF_VALUE,
       .value_type_id = 0,
       .value_ref_class = TSN_REF_VALUE,
+      .parent_type_id = 0,
   };
   tsn_typeinfo_register(&class_ti);
   const TsnTypeInfo *got = tsn_typeinfo_get(TSN_TYPEID_CLASS_BASE);
   assert(got == &class_ti);
   assert(got->field_count == 1);
   assert(got->fields[0].ref_class == TSN_REF_PTR);
+  assert(got->parent_type_id == 0);
+}
+
+static void test_is_instance(void) {
+  typedef struct {
+    TsnObjectHeader header;
+  } BaseObj;
+
+  static const TsnTypeInfo base_ti = {
+      .type_id = TSN_TYPEID_CLASS_BASE,
+      .kind = TSN_KIND_CLASS,
+      .size = (int32_t)sizeof(BaseObj),
+      .field_count = 0,
+      .fields = NULL,
+      .parent_type_id = 0,
+  };
+  static const TsnTypeInfo sub_ti = {
+      .type_id = TSN_TYPEID_CLASS_BASE + 1,
+      .kind = TSN_KIND_CLASS,
+      .size = (int32_t)sizeof(BaseObj),
+      .field_count = 0,
+      .fields = NULL,
+      .parent_type_id = TSN_TYPEID_CLASS_BASE,
+  };
+  tsn_typeinfo_register(&base_ti);
+  tsn_typeinfo_register(&sub_ti);
+
+  BaseObj *sub = (BaseObj *)tsn_alloc((int64_t)sizeof(BaseObj));
+  sub->header.type_id = TSN_TYPEID_CLASS_BASE + 1;
+  sub->header.vtable = NULL;
+  tsn_gc_set_type(sub, TSN_TYPEID_CLASS_BASE + 1);
+
+  assert(tsn_is_instance(sub, TSN_TYPEID_CLASS_BASE + 1));
+  assert(tsn_is_instance(sub, TSN_TYPEID_CLASS_BASE));
+  assert(!tsn_is_instance(sub, TSN_TYPEID_CLASS_BASE + 2));
+  assert(!tsn_is_instance(NULL, TSN_TYPEID_CLASS_BASE));
 }
 
 static void test_gc_unreachable(void) {
@@ -993,6 +1030,7 @@ int main(void) {
   test_maps();
   test_print_and_format();
   test_typeinfo();
+  test_is_instance();
   test_gc_unreachable();
   test_gc_rooted_survives();
   test_gc_cycle();

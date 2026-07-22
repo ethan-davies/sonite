@@ -1487,6 +1487,10 @@ function collectInterfaces(
         interfaces.delete(localName);
         return null;
       }
+      if (!assertMapValueType(indexType, decl.indexSignature.valueType.span, diagnostics)) {
+        interfaces.delete(localName);
+        return null;
+      }
     }
 
     const def: InterfaceDef = {
@@ -2092,12 +2096,13 @@ export {
   typeCategory,
   typeKind,
   isValueCategory,
-  isReferenceCategory,
   isCompileTimeOnlyCategory,
   type TypeCategory,
   type TypeKind,
   type ClassifiableType,
 } from "./types/category.js";
+export { isReferenceCategory } from "./types/category.js";
+import { isReferenceCategory } from "./types/category.js";
 
 export function isArrayType(type: ValueType): type is ArrayValueType {
   return typeof type === "object" && type.kind === "array";
@@ -2148,6 +2153,63 @@ export function isEnumType(type: ValueType): type is EnumValueType {
 
 export function isNumericType(type: ValueType): type is PrimitiveValueType {
   return typeof type === "string" && NUMERIC_PRIMITIVES.has(type);
+}
+
+/** Scalars that can be coerced to string via tsn_*_to_string for `+`. */
+function isStringConcatScalar(type: ValueType): boolean {
+  return (
+    type === "i32" ||
+    type === "i64" ||
+    type === "f32" ||
+    type === "f64" ||
+    type === "bool" ||
+    type === "char"
+  );
+}
+
+/** Map / index-signature values must be pointer-sized reference types (runtime void** ABI). */
+function assertMapValueType(
+  valueType: ValueType,
+  span: SourceSpan,
+  diagnostics: DiagnosticCollector,
+): boolean {
+  if (isReferenceCategory(valueType)) {
+    return true;
+  }
+  diagnostics.error(
+    `Map values must be reference types (string, class, array, map, or function), got '${typeToString(valueType)}'`,
+    span,
+    "E0410",
+  );
+  return false;
+}
+
+/** Types accepted by the `print` builtin (matches codegen emitPrintValue). */
+function isPrintableType(type: ValueType): boolean {
+  if (
+    type === "i32" ||
+    type === "i64" ||
+    type === "f32" ||
+    type === "f64" ||
+    type === "bool" ||
+    type === "char" ||
+    type === "string"
+  ) {
+    return true;
+  }
+  if (isEnumType(type)) {
+    return true;
+  }
+  if (isLiteralType(type)) {
+    return true;
+  }
+  if (isArrayType(type)) {
+    return isPrintableType(type.element as ValueType);
+  }
+  if (isUnionType(type)) {
+    return flattenUnion(type).every((arm) => isPrintableType(arm as ValueType));
+  }
+  return false;
 }
 
 export function isIntegerType(type: ValueType): boolean {
@@ -2504,6 +2566,9 @@ function resolveObjectType(
   if (ann.indexSignature) {
     indexType = resolveAnnotation(ann.indexSignature.valueType, structs, enums, diagnostics);
     if (indexType === null) {
+      return null;
+    }
+    if (!assertMapValueType(indexType, ann.indexSignature.valueType.span, diagnostics)) {
       return null;
     }
   }
@@ -6470,11 +6535,17 @@ function checkExpression(
         if (left === "string" && right === "string") {
           return "string";
         }
+        if (
+          (left === "string" && isStringConcatScalar(right)) ||
+          (right === "string" && isStringConcatScalar(left))
+        ) {
+          return "string";
+        }
         if (isNumericType(left) && typesEqual(left, right)) {
           return left;
         }
         diagnostics.error(
-          `Operator '+' requires two string or two matching numeric operands, got '${typeToString(left)}' and '${typeToString(right)}'`,
+          `Operator '+' requires two string (or string + scalar) or two matching numeric operands, got '${typeToString(left)}' and '${typeToString(right)}'`,
           expr.span,
           "E0306",
         );
@@ -6608,9 +6679,9 @@ function checkExpression(
           if (!argType) {
             return null;
           }
-          if (isStructType(argType) || isClassType(argType)) {
+          if (!isPrintableType(argType)) {
             diagnostics.error(
-              `Cannot print ${argType.kind} value of type '${typeToString(argType)}'; print individual fields instead`,
+              `Cannot print value of type '${typeToString(argType)}'`,
               arg.span,
               "E0333",
             );

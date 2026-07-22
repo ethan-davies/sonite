@@ -737,7 +737,8 @@ TypeInfo
 ├── size          (fixed byte size, or -1 if variable)
 ├── fields[]      (offset, size, ref_class, nested type_id)
 ├── elem_*        (arrays: element type_id + ref_class)
-└── key_* / value_* (maps)
+├── key_* / value_* (maps)
+└── parent_type_id (class inheritance; 0 if none — used by `tsn_is_instance`)
 ```
 
 ### Reference classification (`ref_class`)

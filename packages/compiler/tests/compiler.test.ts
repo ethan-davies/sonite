@@ -1049,11 +1049,23 @@ describe("compile pipeline", () => {
     it("fails on mismatched arithmetic operands", () => {
       const result = compile(`
         function main(): void {
-          print(1 + "a");
+          print(true + 1);
         }
       `);
       expect(result.success).toBe(false);
       expect(result.diagnostics.some((d) => d.code === "E0306")).toBe(true);
+    });
+
+    it("allows string + scalar concatenation", () => {
+      const result = compile(`
+        function main(): void {
+          print("n=" + 1);
+          print(2 + "!");
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("tsn_i32_to_string");
+      expect(result.ir).toContain("tsn_str_concat");
     });
 
     it("fails on mixed numeric widths in arithmetic", () => {
@@ -1481,6 +1493,28 @@ describe("compile pipeline", () => {
       `);
       expect(result.success).toBe(false);
       expect(result.diagnostics.some((d) => d.code === "E0333")).toBe(true);
+    });
+
+    it("fails when printing a map value", () => {
+      const result = compile(`
+        function main(): void {
+          let m: { [key: string]: string } = createMap();
+          print(m);
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0333")).toBe(true);
+    });
+
+    it("fails when map values are not reference types", () => {
+      const result = compile(`
+        function main(): void {
+          let scores: { [key: string]: i32 } = createMap();
+          scores["a"] = 1;
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0410")).toBe(true);
     });
 
     it("fails on unknown enum variants", () => {

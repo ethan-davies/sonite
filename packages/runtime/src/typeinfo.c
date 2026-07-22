@@ -20,6 +20,7 @@ static const TsnTypeInfo BUILTIN_STRING = {
     .key_ref_class = TSN_REF_VALUE,
     .value_type_id = 0,
     .value_ref_class = TSN_REF_VALUE,
+    .parent_type_id = 0,
 };
 
 static const TsnTypeInfo BUILTIN_ARRAY = {
@@ -34,6 +35,7 @@ static const TsnTypeInfo BUILTIN_ARRAY = {
     .key_ref_class = TSN_REF_VALUE,
     .value_type_id = 0,
     .value_ref_class = TSN_REF_VALUE,
+    .parent_type_id = 0,
 };
 
 static const TsnTypeInfo BUILTIN_MAP = {
@@ -48,6 +50,7 @@ static const TsnTypeInfo BUILTIN_MAP = {
     .key_ref_class = TSN_REF_PTR,
     .value_type_id = 0,
     .value_ref_class = TSN_REF_PTR,
+    .parent_type_id = 0,
 };
 
 /* Closure handle is { ptr code, ptr env } — 16 bytes on LP64; not always heap. */
@@ -71,6 +74,7 @@ static const TsnTypeInfo BUILTIN_CLOSURE = {
     .key_ref_class = TSN_REF_VALUE,
     .value_type_id = 0,
     .value_ref_class = TSN_REF_VALUE,
+    .parent_type_id = 0,
 };
 
 static const TsnTypeInfo BUILTIN_ENV = {
@@ -85,6 +89,7 @@ static const TsnTypeInfo BUILTIN_ENV = {
     .key_ref_class = TSN_REF_VALUE,
     .value_type_id = 0,
     .value_ref_class = TSN_REF_VALUE,
+    .parent_type_id = 0,
 };
 
 static const TsnTypeInfo *builtins_by_id(int32_t type_id) {
@@ -146,4 +151,22 @@ const TsnTypeInfo *tsn_typeinfo_get(int32_t type_id) {
     }
   }
   return NULL;
+}
+
+bool tsn_is_instance(void *obj, int32_t type_id) {
+  if (obj == NULL || type_id == 0) {
+    return false;
+  }
+  int32_t id = ((TsnObjectHeader *)obj)->type_id;
+  while (id != 0) {
+    if (id == type_id) {
+      return true;
+    }
+    const TsnTypeInfo *info = tsn_typeinfo_get(id);
+    if (info == NULL) {
+      return false;
+    }
+    id = info->parent_type_id;
+  }
+  return false;
 }

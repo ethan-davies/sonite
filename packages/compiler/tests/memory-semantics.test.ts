@@ -69,7 +69,7 @@ describe("value vs reference memory semantics", () => {
       }
     `);
     expect(result.success).toBe(true);
-    expect(result.ir).toContain("%TsnTypeInfo = type { i32, i32, i32, i32, ptr, i32, i32, i32, i32, i32, i32 }");
+    expect(result.ir).toContain("%TsnTypeInfo = type { i32, i32, i32, i32, ptr, i32, i32, i32, i32, i32, i32, i32 }");
     expect(result.ir).toContain("@Person__typeinfo_fields");
     // string → PTR (ref_class 1), related type_id 1 (TSN_TYPEID_STRING)
     expect(result.ir).toMatch(/i32 1, i32 1\s*\}/);
@@ -124,6 +124,73 @@ describe("value vs reference memory semantics", () => {
     `);
     expect(result.success).toBe(true);
     expect(result.ir).toContain("%Dog = type { %ObjectHeader, ptr, ptr }");
+  });
+
+  it("emits tsn_is_instance for subclass is-checks and parent_type_id", () => {
+    const result = compile(`
+      class Animal {
+        name: string;
+        constructor(name: string) {
+          this.name = name;
+        }
+      }
+      class Dog extends Animal {
+        constructor(name: string) {
+          super(name);
+        }
+      }
+      function main(): void {
+        let d: Animal = new Dog("Rex");
+        if (d is Animal) {
+          print("yes");
+        }
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call i1 @tsn_is_instance");
+    expect(result.ir).toContain("%TsnTypeInfo = type { i32, i32, i32, i32, ptr, i32, i32, i32, i32, i32, i32, i32 }");
+    // Animal has no parent (trailing i32 0); Dog's parent_type_id is Animal's non-zero type_id.
+    expect(result.ir).toMatch(/@Animal__typeinfo = .* i32 0 \}/);
+    expect(result.ir).toMatch(/@Dog__typeinfo = .* i32 (2\d{2}|[3-9]\d{2}|[1-9]\d{3,}) \}/);
+  });
+
+  it("registers static reference fields as global GC roots", () => {
+    const result = compile(`
+      class Holder {
+        static item: string;
+        constructor() {}
+      }
+      function main(): void {
+        Holder.item = "hi";
+        print(Holder.item);
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call void @tsn_gc_add_global_root");
+  });
+
+  it("compares strings by content via strcmp", () => {
+    const result = compile(`
+      function main(): void {
+        let a = "hel" + "lo";
+        let b = "hello";
+        print(a == b);
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call i32 @strcmp");
+    expect(result.ir).not.toMatch(/icmp eq ptr %.*a.*, %.*b/);
+  });
+
+  it("coerces scalars with tsn_*_to_string for string +", () => {
+    const result = compile(`
+      function main(): void {
+        print("n=" + 42);
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call ptr @tsn_i32_to_string");
+    expect(result.ir).toContain("call ptr @tsn_str_concat");
   });
 
   it("passes struct params by value and class params by reference", () => {
@@ -240,12 +307,12 @@ describe("value vs reference memory semantics", () => {
   it("treats maps as references (shared identity on assign)", () => {
     const result = compile(`
       interface Dictionary {
-        [key: string]: i32;
+        [key: string]: string;
       }
       function main(): void {
         let a: Dictionary = createMap();
         let b = a;
-        b["name"] = 1;
+        b["name"] = "Ethan";
       }
     `);
     expect(result.success).toBe(true);
@@ -289,7 +356,7 @@ describe("value vs reference memory semantics", () => {
   it("returns arrays, strings, and maps by reference", () => {
     const result = compile(`
       interface Dictionary {
-        [key: string]: i32;
+        [key: string]: string;
       }
       function makeArr(): i32[] {
         return [1, 2];
@@ -488,11 +555,11 @@ describe("heap allocation contract (tsn_alloc)", () => {
   it("creates maps via tsn_map_new", () => {
     const result = compile(`
       interface Dictionary {
-        [key: string]: i32;
+        [key: string]: string;
       }
       function main(): void {
         let m: Dictionary = createMap();
-        m["name"] = 1;
+        m["name"] = "Ethan";
       }
     `);
     expect(result.success).toBe(true);

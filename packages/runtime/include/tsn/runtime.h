@@ -98,10 +98,14 @@ typedef struct TsnTypeInfo {
   int32_t key_ref_class;
   int32_t value_type_id;
   int32_t value_ref_class;
+  /* Class inheritance: superclass type_id, or 0 if none. */
+  int32_t parent_type_id;
 } TsnTypeInfo;
 
 const TsnTypeInfo *tsn_typeinfo_get(int32_t type_id);
 void tsn_typeinfo_register(const TsnTypeInfo *info);
+/* True if obj is non-null and its type_id (or an ancestor) equals type_id. */
+bool tsn_is_instance(void *obj, int32_t type_id);
 
 /* --- Mark-and-sweep GC (side-table tracking; object layouts unchanged) --- */
 

@@ -329,6 +329,7 @@ export class LlvmCodegen {
   private needsCallableRuntime = false;
   private needsStrcmp = false;
   private needsTsnException = false;
+  private needsIsInstance = false;
   /** Deferred return through a finally block. */
   private pendingReturn: { readonly llvm: string; readonly type: ValueType | "void" } | null =
     null;
@@ -416,6 +417,9 @@ export class LlvmCodegen {
     this.needsTsnFormat = false;
     this.needsAbort = false;
     this.needsUnionRuntime = false;
+    this.needsStrcmp = false;
+    this.needsTsnException = false;
+    this.needsIsInstance = false;
     this.registeredTuples.clear();
     this.typeAliases = new Map();
     this.genericTypeAliases = new Map();
@@ -858,7 +862,7 @@ export class LlvmCodegen {
     const typeInfoTypeLines = this.needsTypeInfo
       ? [
           `${TSN_FIELD_INFO_TYPE} = type { i32, i32, i32, i32 }`,
-          `${TSN_TYPE_INFO_TYPE} = type { i32, i32, i32, i32, ptr, i32, i32, i32, i32, i32, i32 }`,
+          `${TSN_TYPE_INFO_TYPE} = type { i32, i32, i32, i32, ptr, i32, i32, i32, i32, i32, i32, i32 }`,
         ]
       : [];
     const unionTypeLines = this.needsUnionRuntime ? ["%__Union = type { i32, ptr }"] : [];
@@ -1876,8 +1880,13 @@ export class LlvmCodegen {
 
       const fieldsPtr = fields.length === 0 ? "ptr null" : `ptr @${fieldsGlobal}`;
       const sizeExpr = llvmSizeofI32Expr(`%${info.name}`);
+      let parentTypeId = 0;
+      if (info.superclass) {
+        const parent = this.classes.get(info.superclass);
+        parentTypeId = parent?.typeId ?? 0;
+      }
       this.globalDefs.push(
-        `@${info.name}__typeinfo = private unnamed_addr constant ${TSN_TYPE_INFO_TYPE} { i32 ${info.typeId}, i32 ${TSN_KIND_CLASS}, i32 ${sizeExpr}, i32 ${fields.length}, ${fieldsPtr}, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0 }`,
+        `@${info.name}__typeinfo = private unnamed_addr constant ${TSN_TYPE_INFO_TYPE} { i32 ${info.typeId}, i32 ${TSN_KIND_CLASS}, i32 ${sizeExpr}, i32 ${fields.length}, ${fieldsPtr}, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 ${parentTypeId} }`,
       );
     }
 
@@ -1898,7 +1907,7 @@ export class LlvmCodegen {
       const fieldsPtr = env.fields.length === 0 ? "ptr null" : `ptr @${fieldsGlobal}`;
       const sizeExpr = llvmSizeofI32Expr(env.llvmType);
       this.globalDefs.push(
-        `@${env.globalName}__typeinfo = private unnamed_addr constant ${TSN_TYPE_INFO_TYPE} { i32 ${env.typeId}, i32 ${env.kind}, i32 ${sizeExpr}, i32 ${env.fields.length}, ${fieldsPtr}, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0 }`,
+        `@${env.globalName}__typeinfo = private unnamed_addr constant ${TSN_TYPE_INFO_TYPE} { i32 ${env.typeId}, i32 ${env.kind}, i32 ${sizeExpr}, i32 ${env.fields.length}, ${fieldsPtr}, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0 }`,
       );
     }
 
@@ -1912,6 +1921,17 @@ export class LlvmCodegen {
       initLines.push(
         `  call void @tsn_typeinfo_register(ptr noundef @${env.globalName}__typeinfo)`,
       );
+    }
+    for (const info of this.classes.values()) {
+      for (const field of info.staticFields) {
+        if (!field.staticGlobal || !isReferenceCategory(field.type)) {
+          continue;
+        }
+        this.needsGc = true;
+        initLines.push(
+          `  call void @tsn_gc_add_global_root(ptr noundef @${field.staticGlobal})`,
+        );
+      }
     }
     initLines.push("  ret void", "}", "");
     this.functionBodies.push(...initLines);
@@ -2658,6 +2678,9 @@ export class LlvmCodegen {
     if (this.needsTypeInfo) {
       declares.push("declare void @tsn_typeinfo_register(ptr noundef) nounwind");
     }
+    if (this.needsIsInstance) {
+      declares.push("declare i1 @tsn_is_instance(ptr noundef, i32 noundef) nounwind");
+    }
     if (this.needsGc) {
       declares.push("declare void @tsn_gc_set_type(ptr noundef, i32 noundef) nounwind");
       declares.push(
@@ -2667,7 +2690,6 @@ export class LlvmCodegen {
         "declare void @tsn_gc_set_map_meta(ptr noundef, i32 noundef, i32 noundef, i32 noundef, i32 noundef) nounwind",
       );
       declares.push("declare void @tsn_gc_root_push(ptr noundef) nounwind");
-      declares.push("declare void @tsn_gc_root_pop(i32 noundef) nounwind");
       declares.push("declare i32 @tsn_gc_root_checkpoint() nounwind");
       declares.push("declare void @tsn_gc_root_restore(i32 noundef) nounwind");
       declares.push("declare void @tsn_gc_add_global_root(ptr noundef) nounwind");
@@ -2688,7 +2710,6 @@ export class LlvmCodegen {
     }
     if (this.needsTsnArray) {
       declares.push("declare ptr @tsn_array_new(i64 noundef, i64 noundef, i64 noundef) nounwind");
-      declares.push("declare i32 @tsn_array_length(ptr noundef) nounwind");
       declares.push(
         "declare void @tsn_array_push(ptr noundef, ptr noundef, i64 noundef) nounwind",
       );
@@ -2715,7 +2736,6 @@ export class LlvmCodegen {
       declares.push("declare void @tsn_throw(ptr noundef)");
       declares.push("declare ptr @tsn_eh_caught_exception()");
       declares.push("declare void @tsn_eh_clear_exception()");
-      declares.push("declare void @tsn_uncaught_exception(ptr noundef)");
     }
     if (this.needsTsnPrint) {
       declares.push("declare void @tsn_print_i32(i32 noundef) nounwind");
@@ -5627,7 +5647,7 @@ export class LlvmCodegen {
       return { llvm: tmp, type: "bool" };
     }
 
-    // Class exact match via vtable pointer
+    // Class match via type_id ancestry (subclass is Base succeeds).
     if (typeof targetType === "object" && targetType.kind === "class") {
       const classInfo = this.localClasses.get(targetType.name) ?? [...this.localClasses.values()].find((c) => c.name === targetType.name);
       // Also search all modules
@@ -5654,9 +5674,24 @@ export class LlvmCodegen {
           }
         }
       }
+      // Search all classes (mangled names)
+      if (!info) {
+        info = this.classes.get(targetType.name);
+      }
+      if (!info) {
+        for (const c of this.classes.values()) {
+          if (c.name === targetType.name || c.localName === targetType.name) {
+            info = c;
+            break;
+          }
+        }
+      }
       if (!info) {
         throw new Error(`Codegen: unknown class for is-check '${targetType.name}'`);
       }
+
+      this.needsTypeInfo = true;
+      this.needsIsInstance = true;
 
       let objPtr = value.llvm;
       if (isUnionType(value.type) && !isNullablePointerUnion(value.type)) {
@@ -5669,24 +5704,17 @@ export class LlvmCodegen {
         lines.push(`  ${payload} = extractvalue %__Union ${value.llvm}, 1`);
         const loaded = this.nextTemp();
         lines.push(`  ${loaded} = load ptr, ptr ${payload}`);
-        const vt = this.emitLoadObjectVtable(loaded, lines);
         const match = this.nextTemp();
-        lines.push(`  ${match} = icmp eq ptr ${vt}, @${info.vtableGlobalName}`);
+        lines.push(
+          `  ${match} = call i1 @tsn_is_instance(ptr noundef ${loaded}, i32 noundef ${info.typeId})`,
+        );
         lines.push(`  ${tmp} = and i1 ${isObj}, ${match}`);
         return { llvm: tmp, type: "bool" };
       }
       if (isNullablePointerUnion(value.type) || isClassType(value.type)) {
-        if (isNullablePointerUnion(value.type)) {
-          const notNull = this.nextTemp();
-          lines.push(`  ${notNull} = icmp ne ptr ${objPtr}, null`);
-          const vt = this.emitLoadObjectVtable(objPtr, lines);
-          const match = this.nextTemp();
-          lines.push(`  ${match} = icmp eq ptr ${vt}, @${info.vtableGlobalName}`);
-          lines.push(`  ${tmp} = and i1 ${notNull}, ${match}`);
-          return { llvm: tmp, type: "bool" };
-        }
-        const vt = this.emitLoadObjectVtable(objPtr, lines);
-        lines.push(`  ${tmp} = icmp eq ptr ${vt}, @${info.vtableGlobalName}`);
+        lines.push(
+          `  ${tmp} = call i1 @tsn_is_instance(ptr noundef ${objPtr}, i32 noundef ${info.typeId})`,
+        );
         return { llvm: tmp, type: "bool" };
       }
     }
@@ -5747,7 +5775,8 @@ export class LlvmCodegen {
   private emitBinary(expr: BinaryExpression, lines: string[]): EmittedValue {
     if (expr.operator === "+") {
       const leftType = this.inferExpressionType(expr.left);
-      if (leftType === "string") {
+      const rightType = this.inferExpressionType(expr.right);
+      if (leftType === "string" || rightType === "string") {
         return this.emitStringConcat(expr, lines);
       }
     }
@@ -5808,6 +5837,20 @@ export class LlvmCodegen {
       return { llvm: tmp, type: "bool" };
     }
 
+    // String content equality (not pointer identity).
+    if (
+      (expr.operator === "==" || expr.operator === "!=") &&
+      left.type === "string" &&
+      right.type === "string"
+    ) {
+      this.needsStrcmp = true;
+      const cmp = this.nextTemp();
+      lines.push(`  ${cmp} = call i32 @strcmp(ptr ${left.llvm}, ptr ${right.llvm})`);
+      const pred = expr.operator === "==" ? "eq" : "ne";
+      lines.push(`  ${tmp} = icmp ${pred} i32 ${cmp}, 0`);
+      return { llvm: tmp, type: "bool" };
+    }
+
     if (COMPARISON_OPS.has(expr.operator)) {
       const pred = comparisonPredicate(expr.operator, left.type);
       const isFloat = left.type === "f32" || left.type === "f64";
@@ -5854,12 +5897,45 @@ export class LlvmCodegen {
 
     this.needsTsnString = true;
     this.needsGc = true;
-    const left = this.emitExpression(expr.left, lines);
-    const right = this.emitExpression(expr.right, lines);
+    let left = this.emitExpression(expr.left, lines);
+    let right = this.emitExpression(expr.right, lines);
+    left = this.coerceToString(left, lines);
+    right = this.coerceToString(right, lines);
     const buf = this.nextTemp();
     lines.push(
       `  ${buf} = call ptr @tsn_str_concat(ptr noundef ${left.llvm}, ptr noundef ${right.llvm})`,
     );
+    this.rootHeapPtr(buf, lines);
+    return { llvm: buf, type: "string" };
+  }
+
+  /** Coerce a printable scalar to a heap string via tsn_*_to_string. */
+  private coerceToString(value: EmittedValue, lines: string[]): EmittedValue {
+    if (value.type === "string" || (isLiteralType(value.type) && value.type.literalKind === "string")) {
+      return { llvm: value.llvm, type: "string" };
+    }
+    this.needsTsnFormat = true;
+    this.needsGc = true;
+    const buf = this.nextTemp();
+    if (value.type === "i32" || isEnumType(value.type)) {
+      lines.push(`  ${buf} = call ptr @tsn_i32_to_string(i32 noundef ${value.llvm})`);
+    } else if (value.type === "i64") {
+      lines.push(`  ${buf} = call ptr @tsn_i64_to_string(i64 noundef ${value.llvm})`);
+    } else if (value.type === "f32") {
+      lines.push(`  ${buf} = call ptr @tsn_f32_to_string(float noundef ${value.llvm})`);
+    } else if (value.type === "f64") {
+      lines.push(`  ${buf} = call ptr @tsn_f64_to_string(double noundef ${value.llvm})`);
+    } else if (value.type === "bool") {
+      lines.push(`  ${buf} = call ptr @tsn_bool_to_string(i1 noundef ${value.llvm})`);
+    } else if (value.type === "char") {
+      lines.push(`  ${buf} = call ptr @tsn_char_to_string(i8 noundef ${value.llvm})`);
+    } else if (isLiteralType(value.type) && value.type.literalKind === "number") {
+      lines.push(`  ${buf} = call ptr @tsn_i32_to_string(i32 noundef ${value.llvm})`);
+    } else {
+      throw new Error(
+        `Codegen: cannot coerce type '${typeof value.type === "object" ? value.type.kind : value.type}' to string`,
+      );
+    }
     this.rootHeapPtr(buf, lines);
     return { llvm: buf, type: "string" };
   }

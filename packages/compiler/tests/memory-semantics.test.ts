@@ -188,4 +188,82 @@ describe("value vs reference memory semantics", () => {
     expect(result.ir).toMatch(/load ptr, ptr %v\.a/);
     expect(result.ir).toMatch(/store ptr .*, ptr %v\.b/);
   });
+
+  it("mutates arrays through reference parameters", () => {
+    const result = compile(`
+      function addItem(items: i32[]): void {
+        items.push(10);
+      }
+      function main(): void {
+        let a: i32[] = [1, 2];
+        addItem(a);
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("define void @addItem(ptr %arg0)");
+    expect(result.ir).toContain("call void @tsn_array_push");
+  });
+
+  it("returns arrays, strings, and maps by reference", () => {
+    const result = compile(`
+      interface Dictionary {
+        [key: string]: i32;
+      }
+      function makeArr(): i32[] {
+        return [1, 2];
+      }
+      function makeStr(): string {
+        return "hello";
+      }
+      function makeMap(): Dictionary {
+        return createMap();
+      }
+      function main(): void {
+        let a = makeArr();
+        let s = makeStr();
+        let m = makeMap();
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("define ptr @makeArr()");
+    expect(result.ir).toContain("define ptr @makeStr()");
+    expect(result.ir).toContain("define ptr @makeMap()");
+    expect(result.ir).toMatch(/ret ptr /);
+  });
+
+  it("shallow-copies structs that contain string references", () => {
+    const result = compile(`
+      struct PersonData {
+        name: string;
+      }
+      function main(): void {
+        let a = PersonData { name: "Ethan" };
+        let b = a;
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("%PersonData = type { ptr }");
+    expect(result.ir).toContain("%v.a = alloca %PersonData");
+    expect(result.ir).toContain("%v.b = alloca %PersonData");
+    expect(result.ir).toMatch(/load %PersonData, ptr %v\.a/);
+    expect(result.ir).toMatch(/store %PersonData .*, ptr %v\.b/);
+  });
+
+  it("copies function handles on assignment (shared identity)", () => {
+    const result = compile(`
+      function add(a: i32, b: i32): i32 {
+        return a + b;
+      }
+      function main(): void {
+        let a: (i32, i32) => i32 = add;
+        let b = a;
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("%__Callable = type { ptr, ptr }");
+    expect(result.ir).toContain("%v.a = alloca %__Callable");
+    expect(result.ir).toContain("%v.b = alloca %__Callable");
+    expect(result.ir).toMatch(/load %__Callable, ptr %v\.a/);
+    expect(result.ir).toMatch(/store %__Callable .*, ptr %v\.b/);
+  });
 });

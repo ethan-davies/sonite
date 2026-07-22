@@ -2054,6 +2054,17 @@ function baseIsAssignable(from: ExtendedValueType, to: ExtendedValueType): boole
   return false;
 }
 
+export {
+  typeCategory,
+  typeKind,
+  isValueCategory,
+  isReferenceCategory,
+  isCompileTimeOnlyCategory,
+  type TypeCategory,
+  type TypeKind,
+  type ClassifiableType,
+} from "./types/category.js";
+
 export function isArrayType(type: ValueType): type is ArrayValueType {
   return typeof type === "object" && type.kind === "array";
 }

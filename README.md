@@ -24,6 +24,7 @@ This repository is a pnpm workspace:
 | [`packages/compiler`](./packages/compiler) | `@typescript-native/compiler` | Lexer, parser, validation, typecheck, LLVM codegen |
 | [`packages/runtime`](./packages/runtime) | `@typescript-native/runtime` | C runtime (`libtsn_runtime.a`) for print, strings, arrays, maps |
 | [`packages/cli`](./packages/cli) | `@typescript-native/cli` | `tsn` command-line tool |
+| [`packages/vscode`](./packages/vscode) | `typescript-native-vscode` | TextMate grammar and VS Code / Cursor language support for `.tsn` |
 
 ## Requirements
 

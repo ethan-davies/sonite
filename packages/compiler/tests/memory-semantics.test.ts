@@ -530,3 +530,71 @@ describe("heap allocation contract (tsn_alloc)", () => {
     expect(result.ir).not.toContain("@malloc");
   });
 });
+
+describe("GC root registration and type hooks", () => {
+  it("registers and unregisters shadow-stack roots for reference locals", () => {
+    const result = compile(`
+      class Box {
+        value: i32;
+        constructor(value: i32) {
+          this.value = value;
+        }
+      }
+      function main(): void {
+        let a = new Box(1);
+        let b = a;
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call void @tsn_gc_root_push");
+    expect(result.ir).toContain("call void @tsn_gc_root_pop");
+  });
+
+  it("emits tsn_gc_set_type after class allocation", () => {
+    const result = compile(`
+      class Person {
+        name: string;
+        constructor(name: string) {
+          this.name = name;
+        }
+      }
+      function main(): void {
+        let p = new Person("A");
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call void @tsn_gc_set_type");
+    expect(result.ir).not.toContain("@malloc");
+    expect(result.ir).not.toContain("@free");
+  });
+
+  it("emits tsn_gc_set_array_meta for array literals", () => {
+    const result = compile(`
+      function main(): void {
+        let a: i32[] = [1, 2];
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("call void @tsn_gc_set_array_meta");
+  });
+
+  it("roots function parameters that are references", () => {
+    const result = compile(`
+      class Item {
+        id: i32;
+        constructor(id: i32) {
+          this.id = id;
+        }
+      }
+      function use(item: Item): void {
+        print(item.id);
+      }
+      function main(): void {
+        use(new Item(1));
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toMatch(/define void @use\(ptr %arg0\)/);
+    expect(result.ir).toContain("call void @tsn_gc_root_push");
+  });
+});

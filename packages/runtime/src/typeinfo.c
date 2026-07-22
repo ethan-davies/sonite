@@ -2,6 +2,8 @@
 
 #include "tsn/runtime.h"
 
+/* TypeInfo registry uses system malloc — never tsn_alloc — so it is not GC-managed. */
+
 /* Builtin TypeInfo entries for reserved type_ids 1–5.
  * Array/map elem/key/value classifications are filled by per-instantiation
  * metadata later; builtins describe the header shapes only. */
@@ -115,7 +117,10 @@ void tsn_typeinfo_register(const TsnTypeInfo *info) {
   if (registered_len == registered_cap) {
     int32_t new_cap = registered_cap == 0 ? REGISTERED_CAP_INITIAL : registered_cap * 2;
     const TsnTypeInfo **next =
-        (const TsnTypeInfo **)tsn_realloc(registered, (int64_t)new_cap * (int64_t)sizeof(*next));
+        (const TsnTypeInfo **)realloc(registered, (size_t)new_cap * sizeof(*next));
+    if (next == NULL) {
+      abort();
+    }
     registered = next;
     registered_cap = new_cap;
   }

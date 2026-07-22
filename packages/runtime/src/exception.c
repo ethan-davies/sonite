@@ -16,6 +16,14 @@ _Static_assert(sizeof(TsnEhFrame) <= TSN_EH_FRAME_SIZE, "TSN_EH_FRAME_SIZE is to
 
 static _Thread_local struct TsnEhFrame *tsn_eh_stack = NULL;
 static _Thread_local void *tsn_eh_current_exception = NULL;
+static _Thread_local int tsn_eh_exception_root_registered = 0;
+
+static void ensure_exception_root(void) {
+  if (!tsn_eh_exception_root_registered) {
+    tsn_gc_set_exception_root(&tsn_eh_current_exception);
+    tsn_eh_exception_root_registered = 1;
+  }
+}
 
 void tsn_eh_init_frame(void *frame, int32_t has_catch, TsnFinallyFn finally_fn, void *finally_ctx) {
   TsnEhFrame *f = (TsnEhFrame *)frame;
@@ -26,6 +34,7 @@ void tsn_eh_init_frame(void *frame, int32_t has_catch, TsnFinallyFn finally_fn, 
 }
 
 void tsn_eh_push(void *frame) {
+  ensure_exception_root();
   TsnEhFrame *f = (TsnEhFrame *)frame;
   f->parent = tsn_eh_stack;
   tsn_eh_stack = f;
@@ -58,6 +67,7 @@ void tsn_uncaught_exception(void *error) {
 }
 
 void tsn_throw(void *error) {
+  ensure_exception_root();
   tsn_eh_current_exception = error;
   struct TsnEhFrame *f = tsn_eh_stack;
   while (f != NULL) {

@@ -538,7 +538,7 @@ Call graph today (ABIs unchanged):
 | Map | `tsn_map_new` / `tsn_map_set` | `tsn_alloc` / `tsn_realloc` |
 | Closure environment | `tsn_alloc(sizeof(env))` | `tsn_alloc` |
 
-Generated IR must not call libc `malloc` / `calloc` / `realloc` / `free` for TSN-managed objects. Those stay inside `alloc.c` as the current implementation of `tsn_alloc` / `tsn_realloc` / `tsn_free`. A future GC can replace that file without changing codegen call sites.
+A future GC can replace the allocator implementation without changing most codegen call sites; root registration and `tsn_gc_set_type` / `tsn_gc_set_array_meta` are the additional compiler/runtime hooks for the collector.
 
 ---
 
@@ -554,10 +554,10 @@ TSN uses **automatic garbage collection**.
 
 ## 14. GC strategy
 
-**First implementation:** tracing GC, specifically a simple **mark-and-sweep** collector.
+**Implemented:** tracing **mark-and-sweep** collector with an explicit **shadow stack**.
 
 ```text
-Heap
+Heap (side table)
 │
 ├── Person A ← reachable
 ├── Person B ← unreachable
@@ -565,16 +565,43 @@ Heap
 └── String A ← unreachable
 ```
 
-Roots include:
+### Allocation tracking
+
+Every `tsn_alloc` / `tsn_realloc` registers the payload pointer in a runtime side table (`ptr`, `size`, `type_id`, mark bit, array scan meta). Object byte layouts are unchanged — arrays/maps/strings still do not embed `type_id` in-object; the side table carries type identity instead.
+
+GC-internal structures (the side table, root stack, TypeInfo registry growth) use system `malloc`, never `tsn_alloc`, to avoid reentrancy.
+
+Secondary buffers (array `data`, map `keys`/`vals`) are separate GC objects with opaque `type_id = 0`; they are marked only when a parent array/map is marked.
+
+String literals are not in the side table; marking them is a no-op, so they are never swept.
+
+### Roots (shadow stack)
+
+The compiler emits:
 
 ```text
-Stack
-Global variables
-Active closures
-Runtime roots
+tsn_gc_root_push(slot)   // on reference locals / params / this / callable env fields
+… function body …
+tsn_gc_root_pop(N)       // on every return
 ```
 
-The collector follows references from roots; unreachable objects are freed. Generational or concurrent GC can come later as optimizations.
+Roots also include global slots (`tsn_gc_add_global_root`) and the pending exception pointer (`tsn_gc_set_exception_root`).
+
+Rule: anything reachable from a GC root stays alive.
+
+### Mark and sweep
+
+1. Clear marks
+2. Mark every object reachable from roots, following TypeInfo field/`elem_*`/`key_*`/`value_*` metadata (including nested structs via `AGG`)
+3. Free unmarked objects and remove them from the side table; clear marks on survivors
+
+Cycles are handled naturally (no root → neither object is marked → both swept).
+
+### When GC runs
+
+Before `tsn_alloc` / `tsn_realloc`, if `bytes_allocated > threshold` (default 1 MiB), the runtime runs `tsn_gc_collect()`. Tests and tools can call `tsn_gc_collect` / `tsn_gc_set_threshold` directly.
+
+Generational or concurrent GC can come later as optimizations.
 
 ---
 
@@ -741,7 +768,7 @@ Runtime TypeInfo
 └── Closure   — handle shape + environment / capture layout
 ```
 
-Identification today: class instances via `ObjectHeader.type_id`; other kinds via reserved builtin `TypeInfo` entries until an ABI bump embeds `type_id` on every heap object.
+Identification today: class instances via `ObjectHeader.type_id` and the GC side table; other kinds via reserved builtin `TypeInfo` entries plus `tsn_gc_set_type` / `tsn_gc_set_array_meta` at allocation time. A future ABI bump may also embed `type_id` on every heap object.
 
 ### Design decisions (canonical)
 
@@ -751,8 +778,8 @@ Identification today: class instances via `ObjectHeader.type_id`; other kinds vi
 | Reference types | Classes, arrays, strings, maps, closures |
 | Interfaces | Compile-time abstractions; runtime dispatch only when necessary |
 | Storage | Compiler chooses stack/register vs heap |
-| Memory management | Automatic tracing GC (initially mark-and-sweep) |
-| Object header | Classes: `{ type_id, vtable }`; arrays/maps/strings: layout as above (type_id prefix later) |
+| Memory management | Automatic tracing GC (mark-and-sweep + shadow stack) |
+| Object header | Classes: `{ type_id, vtable }`; arrays/maps/strings: layout as above; GC type identity also in side table |
 | Type metadata | `TypeInfo` registry (`tsn_typeinfo_get` / `tsn_typeinfo_register`) |
 | References | Implicit for reference types |
 | Pointers | Optional future low-level feature |

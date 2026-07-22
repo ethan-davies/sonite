@@ -14,6 +14,7 @@ static void sb_init(TsnStringBuilder *sb) {
   sb->cap = 64;
   sb->len = 0;
   sb->buf = tsn_alloc(sb->cap);
+  tsn_gc_set_type(sb->buf, TSN_TYPEID_STRING);
   sb->buf[0] = '\0';
 }
 
@@ -26,6 +27,7 @@ static void sb_grow(TsnStringBuilder *sb, int64_t needed) {
     new_cap *= 2;
   }
   sb->buf = tsn_realloc(sb->buf, new_cap);
+  tsn_gc_set_type(sb->buf, TSN_TYPEID_STRING);
   sb->cap = new_cap;
 }
 
@@ -84,24 +86,28 @@ void tsn_print_newline(void) {
 
 char *tsn_i32_to_string(int32_t value) {
   char *buf = tsn_alloc(32);
+  tsn_gc_set_type(buf, TSN_TYPEID_STRING);
   snprintf(buf, 32, "%d", value);
   return buf;
 }
 
 char *tsn_i64_to_string(int64_t value) {
   char *buf = tsn_alloc(32);
+  tsn_gc_set_type(buf, TSN_TYPEID_STRING);
   snprintf(buf, 32, "%lld", (long long)value);
   return buf;
 }
 
 char *tsn_f32_to_string(float value) {
   char *buf = tsn_alloc(32);
+  tsn_gc_set_type(buf, TSN_TYPEID_STRING);
   snprintf(buf, 32, "%g", (double)value);
   return buf;
 }
 
 char *tsn_f64_to_string(double value) {
   char *buf = tsn_alloc(32);
+  tsn_gc_set_type(buf, TSN_TYPEID_STRING);
   snprintf(buf, 32, "%g", value);
   return buf;
 }
@@ -113,6 +119,7 @@ char *tsn_bool_to_string(bool value) {
 
 char *tsn_char_to_string(char value) {
   char *buf = tsn_alloc(2);
+  tsn_gc_set_type(buf, TSN_TYPEID_STRING);
   buf[0] = value;
   buf[1] = '\0';
   return buf;

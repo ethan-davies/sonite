@@ -12,5 +12,6 @@ char *tsn_str_concat(const char *left, const char *right) {
   char *buf = tsn_alloc((int64_t)(left_len + right_len + 1));
   memcpy(buf, left, left_len);
   memcpy(buf + left_len, right, right_len + 1);
+  tsn_gc_set_type(buf, TSN_TYPEID_STRING);
   return buf;
 }

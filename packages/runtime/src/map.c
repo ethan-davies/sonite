@@ -21,6 +21,9 @@ void *tsn_map_new(void) {
   map->cap = TSN_MAP_INITIAL_CAP;
   map->keys = tsn_alloc(map->cap * (int64_t)sizeof(char *));
   map->vals = tsn_alloc(map->cap * (int64_t)sizeof(void *));
+  tsn_gc_set_type(map, TSN_TYPEID_MAP);
+  tsn_gc_set_type(map->keys, 0);
+  tsn_gc_set_type(map->vals, 0);
   return map;
 }
 

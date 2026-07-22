@@ -141,6 +141,135 @@ static void test_typeinfo(void) {
   assert(got->fields[0].ref_class == TSN_REF_PTR);
 }
 
+static void test_gc_unreachable(void) {
+  tsn_gc_set_threshold(0);
+  tsn_gc_collect();
+  int64_t before = tsn_gc_bytes_allocated();
+  void *a = tsn_alloc(64);
+  tsn_gc_set_type(a, 0);
+  assert(tsn_gc_bytes_allocated() >= before + 64);
+  /* Never rooted → collect should free. */
+  tsn_gc_collect();
+  assert(tsn_gc_bytes_allocated() == before);
+}
+
+static void test_gc_rooted_survives(void) {
+  tsn_gc_set_threshold(0);
+  tsn_gc_collect();
+  void *obj = NULL;
+  tsn_gc_root_push(&obj);
+  obj = tsn_alloc(128);
+  tsn_gc_set_type(obj, 0);
+  int64_t mid = tsn_gc_bytes_allocated();
+  tsn_gc_collect();
+  assert(tsn_gc_bytes_allocated() == mid);
+  assert(obj != NULL);
+  obj = NULL;
+  tsn_gc_collect();
+  assert(tsn_gc_bytes_allocated() == mid - 128);
+  tsn_gc_root_pop(1);
+}
+
+static void test_gc_cycle(void) {
+  tsn_gc_set_threshold(0);
+  tsn_gc_collect();
+  static const TsnFieldInfo cycle_fields[] = {
+      {.offset = 16, .size = 8, .ref_class = TSN_REF_PTR, .type_id = 0},
+  };
+  static const TsnTypeInfo cycle_ti = {
+      .type_id = TSN_TYPEID_CLASS_BASE + 1,
+      .kind = TSN_KIND_CLASS,
+      .size = 24,
+      .field_count = 1,
+      .fields = cycle_fields,
+      .elem_type_id = 0,
+      .elem_ref_class = TSN_REF_VALUE,
+      .key_type_id = 0,
+      .key_ref_class = TSN_REF_VALUE,
+      .value_type_id = 0,
+      .value_ref_class = TSN_REF_VALUE,
+  };
+  tsn_typeinfo_register(&cycle_ti);
+
+  void *a = NULL;
+  void *b = NULL;
+  tsn_gc_root_push(&a);
+  tsn_gc_root_push(&b);
+
+  a = tsn_alloc(24);
+  b = tsn_alloc(24);
+  tsn_gc_set_type(a, TSN_TYPEID_CLASS_BASE + 1);
+  tsn_gc_set_type(b, TSN_TYPEID_CLASS_BASE + 1);
+  ((TsnObjectHeader *)a)->type_id = TSN_TYPEID_CLASS_BASE + 1;
+  ((TsnObjectHeader *)b)->type_id = TSN_TYPEID_CLASS_BASE + 1;
+  ((TsnObjectHeader *)a)->vtable = NULL;
+  ((TsnObjectHeader *)b)->vtable = NULL;
+  /* friend field at offset 16 */
+  *(void **)((char *)a + 16) = b;
+  *(void **)((char *)b + 16) = a;
+
+  int64_t mid = tsn_gc_bytes_allocated();
+  tsn_gc_collect();
+  assert(tsn_gc_bytes_allocated() == mid);
+
+  a = NULL;
+  b = NULL;
+  tsn_gc_collect();
+  assert(tsn_gc_bytes_allocated() == mid - 48);
+  tsn_gc_root_pop(2);
+}
+
+static void test_gc_array_keeps_elements(void) {
+  tsn_gc_set_threshold(0);
+  tsn_gc_collect();
+  void *arr = NULL;
+  tsn_gc_root_push(&arr);
+
+  arr = tsn_array_new(0, 4, (int64_t)sizeof(void *));
+  tsn_gc_set_array_meta(arr, TSN_REF_PTR, 0, (int64_t)sizeof(void *));
+
+  void *elem = tsn_alloc(32);
+  tsn_gc_set_type(elem, 0);
+  tsn_array_push(arr, &elem, (int64_t)sizeof(void *));
+
+  int64_t mid = tsn_gc_bytes_allocated();
+  tsn_gc_collect();
+  assert(tsn_gc_bytes_allocated() == mid);
+
+  arr = NULL;
+  tsn_gc_collect();
+  assert(tsn_gc_bytes_allocated() < mid);
+  tsn_gc_root_pop(1);
+}
+
+static void test_gc_threshold(void) {
+  tsn_gc_collect();
+  tsn_gc_set_threshold(64);
+  /* Unrooted allocs that push past threshold should be collected on next alloc. */
+  (void)tsn_alloc(40);
+  (void)tsn_alloc(40);
+  /* After second alloc, maybe_collect ran; at least some garbage should be gone. */
+  void *keep = NULL;
+  tsn_gc_root_push(&keep);
+  keep = tsn_alloc(16);
+  tsn_gc_set_type(keep, 0);
+  tsn_gc_collect();
+  assert(keep != NULL);
+  keep = NULL;
+  tsn_gc_root_pop(1);
+  tsn_gc_set_threshold(0);
+  tsn_gc_collect();
+}
+
+static void test_gc_string_literal_root(void) {
+  tsn_gc_set_threshold(0);
+  void *lit = (void *)"literal";
+  tsn_gc_root_push(&lit);
+  tsn_gc_collect(); /* must not free or crash */
+  assert(strcmp((char *)lit, "literal") == 0);
+  tsn_gc_root_pop(1);
+}
+
 int main(void) {
   test_alloc();
   test_strings();
@@ -148,5 +277,11 @@ int main(void) {
   test_maps();
   test_print_and_format();
   test_typeinfo();
+  test_gc_unreachable();
+  test_gc_rooted_survives();
+  test_gc_cycle();
+  test_gc_array_keeps_elements();
+  test_gc_threshold();
+  test_gc_string_literal_root();
   return 0;
 }

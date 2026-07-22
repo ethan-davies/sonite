@@ -53,6 +53,8 @@ void *tsn_array_new(int64_t length, int64_t capacity, int64_t elem_size) {
   arr->length = length;
   arr->capacity = capacity;
   arr->data = tsn_alloc(capacity * elem_size);
+  tsn_gc_set_type(arr, TSN_TYPEID_ARRAY);
+  tsn_gc_set_type(arr->data, 0);
   return arr;
 }
 

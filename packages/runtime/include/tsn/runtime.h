@@ -101,6 +101,18 @@ typedef struct TsnTypeInfo {
 const TsnTypeInfo *tsn_typeinfo_get(int32_t type_id);
 void tsn_typeinfo_register(const TsnTypeInfo *info);
 
+/* --- Mark-and-sweep GC (side-table tracking; object layouts unchanged) --- */
+
+void tsn_gc_set_type(void *ptr, int32_t type_id);
+void tsn_gc_set_array_meta(void *arr, int32_t elem_ref_class, int32_t elem_type_id, int64_t elem_size);
+void tsn_gc_root_push(void **slot);
+void tsn_gc_root_pop(int32_t n);
+void tsn_gc_add_global_root(void **slot);
+void tsn_gc_set_exception_root(void **slot);
+void tsn_gc_collect(void);
+void tsn_gc_set_threshold(int64_t bytes);
+int64_t tsn_gc_bytes_allocated(void);
+
 /* Element comparison kinds for array search helpers. */
 #define TSN_CMP_I32 0
 #define TSN_CMP_I64 1

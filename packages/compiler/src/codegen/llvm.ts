@@ -23,6 +23,7 @@ import type {
   StructDeclaration,
   StructLiteral,
   StructMethod,
+  SwitchStatement,
   TypeAnnotation,
   TypeAliasDeclaration,
   UnaryExpression,
@@ -52,12 +53,14 @@ import {
 } from "../typecheck.js";
 import {
   flattenUnion,
+  includesNull,
   isFunctionType,
   isLiteralType,
   isMapType,
   isObjectType,
   isUnionType,
   makeUnion,
+  stripNull,
   typeofTagForType,
 } from "../typecheck-advanced.js";
 import { substituteAnnotation } from "../generics/substitute.js";
@@ -132,10 +135,9 @@ interface FunctionSig {
   readonly returnType: ValueType | "void";
 }
 
-interface LoopContext {
-  readonly continueLabel: string;
-  readonly breakLabel: string;
-}
+type ControlContext =
+  | { readonly kind: "loop"; readonly continueLabel: string; readonly breakLabel: string }
+  | { readonly kind: "switch"; readonly breakLabel: string };
 
 interface StructFieldInfo {
   readonly name: string;
@@ -261,6 +263,7 @@ export class LlvmCodegen {
   private needsAbort = false;
   private needsUnionRuntime = false;
   private needsCallableRuntime = false;
+  private needsStrcmp = false;
   /** Synthetic tuple LLVM type name → element types. */
   private readonly registeredTuples = new Map<string, readonly ValueType[]>();
   /** Local type alias expansions (local name → annotation). */
@@ -269,7 +272,7 @@ export class LlvmCodegen {
   private genericTypeAliases = new Map<string, TypeAliasDeclaration>();
   private readonly functionBodies: string[] = [];
   private readonly globalDefs: string[] = [];
-  private readonly loopStack: LoopContext[] = [];
+  private readonly controlStack: ControlContext[] = [];
   /** When emitting a method/constructor, the `this` pointer SSA value. */
   private thisPtr: string | null = null;
   private thisType: ValueType | null = null;
@@ -341,7 +344,7 @@ export class LlvmCodegen {
     this.genericTypeAliases = new Map();
     this.functionBodies.length = 0;
     this.globalDefs.length = 0;
-    this.loopStack.length = 0;
+    this.controlStack.length = 0;
     this.thisPtr = null;
     this.thisType = null;
 
@@ -1858,6 +1861,9 @@ export class LlvmCodegen {
       declares.push("declare i32 @tsn_str_len(ptr noundef) nounwind");
       declares.push("declare ptr @tsn_str_concat(ptr noundef, ptr noundef) nounwind");
     }
+    if (this.needsStrcmp) {
+      declares.push("declare i32 @strcmp(ptr noundef, ptr noundef) nounwind");
+    }
     if (this.needsTsnArray) {
       declares.push("declare ptr @tsn_array_new(i64 noundef, i64 noundef, i64 noundef) nounwind");
       declares.push("declare i32 @tsn_array_length(ptr noundef) nounwind");
@@ -1936,7 +1942,7 @@ export class LlvmCodegen {
   private emitStructMethod(struct: StructInfo, method: StructMethodInfo): void {
     this.locals = new Map();
     this.tempCounter = 0;
-    this.loopStack.length = 0;
+    this.controlStack.length = 0;
     this.thisPtr = "%this";
     this.thisType = { kind: "struct", name: struct.name };
     this.currentReturnType = method.returnType;
@@ -1996,7 +2002,7 @@ export class LlvmCodegen {
   private emitClassConstructor(info: ClassInfo): void {
     this.locals = new Map();
     this.tempCounter = 0;
-    this.loopStack.length = 0;
+    this.controlStack.length = 0;
     this.thisPtr = "%this";
     this.thisType = { kind: "class", name: info.name };
     this.currentReturnType = "void";
@@ -2047,7 +2053,7 @@ export class LlvmCodegen {
     }
     this.locals = new Map();
     this.tempCounter = 0;
-    this.loopStack.length = 0;
+    this.controlStack.length = 0;
     this.thisPtr = method.isStatic ? null : "%this";
     this.thisType = method.isStatic ? null : { kind: "class", name: info.name };
     this.currentReturnType = method.returnType;
@@ -2118,7 +2124,7 @@ export class LlvmCodegen {
   private emitFunction(fn: FunctionDeclaration): void {
     this.locals = new Map();
     this.tempCounter = 0;
-    this.loopStack.length = 0;
+    this.controlStack.length = 0;
     this.boxedNames = this.collectBoxedNamesInStmts(fn.body);
     const sig = this.localFunctions.get(fn.name.name);
     this.currentReturnType = sig?.returnType ?? "void";
@@ -2208,25 +2214,121 @@ export class LlvmCodegen {
         return this.emitForStatement(stmt, lines);
       case "ForInStatement":
         return this.emitForInStatement(stmt, lines);
+      case "SwitchStatement":
+        return this.emitSwitchStatement(stmt, lines);
       case "BreakStatement": {
-        const loop = this.currentLoop();
-        lines.push(`  br label %${loop.breakLabel}`);
+        lines.push(`  br label %${this.currentBreakLabel()}`);
         return true;
       }
       case "ContinueStatement": {
-        const loop = this.currentLoop();
-        lines.push(`  br label %${loop.continueLabel}`);
+        lines.push(`  br label %${this.currentContinueLabel()}`);
         return true;
       }
     }
   }
 
-  private currentLoop(): LoopContext {
-    const loop = this.loopStack[this.loopStack.length - 1];
-    if (!loop) {
-      throw new Error("Codegen: break/continue outside loop");
+  private currentBreakLabel(): string {
+    const ctx = this.controlStack[this.controlStack.length - 1];
+    if (!ctx) {
+      throw new Error("Codegen: break outside loop or switch");
     }
-    return loop;
+    return ctx.breakLabel;
+  }
+
+  private currentContinueLabel(): string {
+    for (let i = this.controlStack.length - 1; i >= 0; i -= 1) {
+      const ctx = this.controlStack[i]!;
+      if (ctx.kind === "loop") {
+        return ctx.continueLabel;
+      }
+    }
+    throw new Error("Codegen: continue outside loop");
+  }
+
+  private emitSwitchStatement(stmt: SwitchStatement, lines: string[]): boolean {
+    const id = this.labelCounter;
+    this.labelCounter += 1;
+    const exitLabel = `switch.exit.${id}`;
+
+    const disc = this.emitExpression(stmt.discriminant, lines);
+
+    this.controlStack.push({ kind: "switch", breakLabel: exitLabel });
+
+    const caseBodyLabels = stmt.cases.map((_, i) => `switch.case.${id}.${i}`);
+    const nonDefaultIndices: number[] = [];
+    stmt.cases.forEach((switchCase, i) => {
+      if (!switchCase.isDefault) {
+        nonDefaultIndices.push(i);
+      }
+    });
+    const defaultIndex = stmt.cases.findIndex((switchCase) => switchCase.isDefault);
+
+    if (nonDefaultIndices.length > 0) {
+      lines.push(`  br label %switch.check.${id}.0`);
+      for (let ci = 0; ci < nonDefaultIndices.length; ci += 1) {
+        const caseIdx = nonDefaultIndices[ci]!;
+        const switchCase = stmt.cases[caseIdx]!;
+        const checkLabel = `switch.check.${id}.${ci}`;
+        const targetBody = caseBodyLabels[caseIdx]!;
+        const failLabel =
+          ci + 1 < nonDefaultIndices.length
+            ? `switch.check.${id}.${ci + 1}`
+            : defaultIndex >= 0
+              ? caseBodyLabels[defaultIndex]!
+              : exitLabel;
+
+        lines.push(`${checkLabel}:`);
+        const eq = this.emitSwitchCaseComparison(disc, switchCase.test!, lines);
+        lines.push(`  br i1 ${eq}, label %${targetBody}, label %${failLabel}`);
+      }
+    } else if (defaultIndex >= 0) {
+      lines.push(`  br label %${caseBodyLabels[defaultIndex]}`);
+    }
+
+    for (let i = 0; i < stmt.cases.length; i += 1) {
+      lines.push(`${caseBodyLabels[i]}:`);
+      let terminated = false;
+      for (const s of stmt.cases[i]!.body) {
+        if (terminated) {
+          break;
+        }
+        terminated = this.emitStatement(s, lines);
+      }
+      if (!terminated) {
+        const nextLabel =
+          i + 1 < stmt.cases.length ? caseBodyLabels[i + 1]! : exitLabel;
+        lines.push(`  br label %${nextLabel}`);
+      }
+    }
+
+    this.controlStack.pop();
+    lines.push(`${exitLabel}:`);
+    return false;
+  }
+
+  private emitSwitchCaseComparison(
+    disc: EmittedValue,
+    caseTest: Expression,
+    lines: string[],
+  ): string {
+    const caseVal = this.emitExpression(caseTest, lines);
+    const right = this.coerceValue(caseVal, disc.type, lines);
+    const tmp = this.nextTemp();
+
+    if (disc.type === "string") {
+      this.needsStrcmp = true;
+      const cmp = this.nextTemp();
+      lines.push(`  ${cmp} = call i32 @strcmp(ptr ${disc.llvm}, ptr ${right.llvm})`);
+      lines.push(`  ${tmp} = icmp eq i32 ${cmp}, 0`);
+      return tmp;
+    }
+
+    const llvmType = toLlvmType(disc.type);
+    const isFloat = disc.type === "f32" || disc.type === "f64";
+    const cmp = isFloat ? "fcmp" : "icmp";
+    const pred = isFloat ? "oeq" : "eq";
+    lines.push(`  ${tmp} = ${cmp} ${pred} ${llvmType} ${disc.llvm}, ${right.llvm}`);
+    return tmp;
   }
 
   private emitWhileStatement(stmt: WhileStatement, lines: string[]): boolean {
@@ -2243,7 +2345,7 @@ export class LlvmCodegen {
     lines.push(`  br i1 ${cond.llvm}, label %${bodyLabel}, label %${exitLabel}`);
 
     lines.push(`${bodyLabel}:`);
-    this.loopStack.push({ continueLabel: condLabel, breakLabel: exitLabel });
+    this.controlStack.push({ kind: "loop", continueLabel: condLabel, breakLabel: exitLabel });
     let terminated = false;
     for (const s of stmt.body) {
       if (terminated) {
@@ -2251,7 +2353,7 @@ export class LlvmCodegen {
       }
       terminated = this.emitStatement(s, lines);
     }
-    this.loopStack.pop();
+    this.controlStack.pop();
     if (!terminated) {
       lines.push(`  br label %${condLabel}`);
     }
@@ -2283,7 +2385,7 @@ export class LlvmCodegen {
     }
 
     lines.push(`${bodyLabel}:`);
-    this.loopStack.push({ continueLabel: latchLabel, breakLabel: exitLabel });
+    this.controlStack.push({ kind: "loop", continueLabel: latchLabel, breakLabel: exitLabel });
     let terminated = false;
     for (const s of stmt.body) {
       if (terminated) {
@@ -2291,7 +2393,7 @@ export class LlvmCodegen {
       }
       terminated = this.emitStatement(s, lines);
     }
-    this.loopStack.pop();
+    this.controlStack.pop();
     if (!terminated) {
       lines.push(`  br label %${latchLabel}`);
     }
@@ -2346,7 +2448,7 @@ export class LlvmCodegen {
     const element = this.emitArrayIndexLoad(iterable.llvm, idxForLoad, elemType, lines);
     lines.push(`  store ${elemLlvm} ${element.llvm}, ptr ${elemPtr}`);
 
-    this.loopStack.push({ continueLabel: latchLabel, breakLabel: exitLabel });
+    this.controlStack.push({ kind: "loop", continueLabel: latchLabel, breakLabel: exitLabel });
     let terminated = false;
     for (const s of stmt.body) {
       if (terminated) {
@@ -2354,7 +2456,7 @@ export class LlvmCodegen {
       }
       terminated = this.emitStatement(s, lines);
     }
-    this.loopStack.pop();
+    this.controlStack.pop();
     if (!terminated) {
       lines.push(`  br label %${latchLabel}`);
     }
@@ -2756,6 +2858,109 @@ export class LlvmCodegen {
     return this.inferExpressionType(stmt.initializer);
   }
 
+  private emitIsNullValue(value: EmittedValue, lines: string[]): string {
+    const tmp = this.nextTemp();
+    if (value.type === "null") {
+      lines.push(`  ${tmp} = add i1 true, false`);
+      return tmp;
+    }
+    if (
+      isNullablePointerUnion(value.type) ||
+      isSinglePtrType(value.type) ||
+      value.type === "string" ||
+      (typeof value.type === "object" &&
+        (value.type.kind === "class" || value.type.kind === "array" || value.type.kind === "map"))
+    ) {
+      lines.push(`  ${tmp} = icmp eq ptr ${value.llvm}, null`);
+      return tmp;
+    }
+    if (isUnionType(value.type)) {
+      this.needsUnionRuntime = true;
+      const tag = this.nextTemp();
+      lines.push(`  ${tag} = extractvalue %__Union ${value.llvm}, 0`);
+      lines.push(`  ${tmp} = icmp eq i32 ${tag}, ${UNION_TAG.null}`);
+      return tmp;
+    }
+    lines.push(`  ${tmp} = add i1 false, false`);
+    return tmp;
+  }
+
+  private emitNullForResultType(resultType: ValueType, lines: string[]): EmittedValue {
+    if (isUnionType(resultType)) {
+      if (isNullablePointerUnion(resultType)) {
+        return { llvm: "null", type: resultType };
+      }
+      return this.boxNullUnion(resultType, lines);
+    }
+    return { llvm: "null", type: "null" };
+  }
+
+  private emitOptionalBranch(
+    object: EmittedValue,
+    resultType: ValueType,
+    lines: string[],
+    access: (object: EmittedValue) => EmittedValue,
+  ): EmittedValue {
+    const isNull = this.emitIsNullValue(object, lines);
+    const nullBb = this.nextLabel("opt_null");
+    const accessBb = this.nextLabel("opt_access");
+    const mergeBb = this.nextLabel("opt_merge");
+    lines.push(`  br i1 ${isNull}, label %${nullBb}, label %${accessBb}`);
+
+    lines.push(`${nullBb}:`);
+    const nullVal = this.emitNullForResultType(resultType, lines);
+    lines.push(`  br label %${mergeBb}`);
+
+    lines.push(`${accessBb}:`);
+    const accessed = access(object);
+    const innerType = includesNull(resultType) ? (stripNull(resultType) as ValueType) : resultType;
+    let accessVal = this.coerceValue(accessed, innerType, lines);
+    if (isUnionType(resultType) && !isNullablePointerUnion(resultType)) {
+      accessVal = this.boxUnion(accessVal, resultType, lines);
+    } else if (isNullablePointerUnion(resultType)) {
+      accessVal = { llvm: accessVal.llvm, type: resultType };
+    }
+    lines.push(`  br label %${mergeBb}`);
+
+    lines.push(`${mergeBb}:`);
+    const phi = this.nextTemp();
+    const llvmType = toLlvmType(resultType);
+    lines.push(
+      `  ${phi} = phi ${llvmType} [ ${accessVal.llvm}, %${accessBb} ], [ ${nullVal.llvm}, %${nullBb} ]`,
+    );
+    return { llvm: phi, type: resultType };
+  }
+
+  private emitNullCoalescing(
+    expr: Extract<Expression, { kind: "NullCoalescingExpression" }>,
+    lines: string[],
+  ): EmittedValue {
+    const resultType = this.inferExpressionType(expr);
+    const left = this.emitExpression(expr.left, lines);
+    const isNull = this.emitIsNullValue(left, lines);
+    const rhsBb = this.nextLabel("coalesce_rhs");
+    const useLeftBb = this.nextLabel("coalesce_left");
+    const mergeBb = this.nextLabel("coalesce_merge");
+    lines.push(`  br i1 ${isNull}, label %${rhsBb}, label %${useLeftBb}`);
+
+    lines.push(`${useLeftBb}:`);
+    const leftCoerced = this.coerceValue(left, resultType, lines);
+    lines.push(`  br label %${mergeBb}`);
+
+    lines.push(`${rhsBb}:`);
+    const right = this.emitExpression(expr.right, lines, resultType);
+    const coercedRight = this.coerceValue(right, resultType, lines);
+    lines.push(`  br label %${mergeBb}`);
+
+    lines.push(`${mergeBb}:`);
+    const phi = this.nextTemp();
+    const llvmType = toLlvmType(resultType);
+    lines.push(
+      `  ${phi} = phi ${llvmType} [ ${leftCoerced.llvm}, %${useLeftBb} ], [ ${coercedRight.llvm}, %${rhsBb} ]`,
+    );
+    return { llvm: phi, type: resultType };
+  }
+
   private inferExpressionType(expr: Expression, expected?: ValueType): ValueType {
     switch (expr.kind) {
       case "IntegerLiteral":
@@ -2816,34 +3021,43 @@ export class LlvmCodegen {
       case "TypeofExpression":
         return "string";
       case "IndexExpression": {
-        const objectType = this.inferExpressionType(expr.object);
+        let objectType = this.inferExpressionType(expr.object);
+        if (expr.optional && (includesNull(objectType) || objectType === "null")) {
+          if (objectType === "null") {
+            return "null";
+          }
+          objectType = stripNull(objectType) as ValueType;
+        }
+        let inner: ValueType;
         if (isMapType(objectType)) {
-          return objectType.valueType as ValueType;
-        }
-        if (isObjectType(objectType) && objectType.indexType) {
-          return objectType.indexType as ValueType;
-        }
-        if (isTupleType(objectType)) {
+          inner = objectType.valueType as ValueType;
+        } else if (isObjectType(objectType) && objectType.indexType) {
+          inner = objectType.indexType as ValueType;
+        } else if (isTupleType(objectType)) {
           if (expr.index.kind === "IntegerLiteral") {
             const i = expr.index.value;
             if (i < 0 || i >= objectType.elements.length) {
               throw new Error(`Codegen: tuple index ${i} out of bounds`);
             }
-            return objectType.elements[i]!;
-          }
-          if (
+            inner = objectType.elements[i]!;
+          } else if (
             expr.index.kind === "UnaryExpression" &&
             expr.index.operator === "-" &&
             expr.index.operand.kind === "IntegerLiteral"
           ) {
             throw new Error("Codegen: negative tuple index");
+          } else {
+            inner = makeUnion(objectType.elements) as ValueType;
           }
-          return makeUnion(objectType.elements) as ValueType;
-        }
-        if (!isArrayType(objectType)) {
+        } else if (!isArrayType(objectType)) {
           throw new Error("Codegen: index into non-array");
+        } else {
+          inner = objectType.element;
         }
-        return objectType.element;
+        if (expr.optional) {
+          return makeUnion([inner, "null"]) as ValueType;
+        }
+        return inner;
       }
       case "MemberExpression": {
         if (
@@ -2875,39 +3089,57 @@ export class LlvmCodegen {
           }
         }
         const objectType = this.inferExpressionType(expr.object);
-        if (isObjectType(objectType)) {
-          const field = objectType.fields.find((f) => f.name === expr.property.name);
+        let resolvedObjectType: ValueType = objectType;
+        if (expr.optional && (includesNull(objectType) || objectType === "null")) {
+          if (objectType === "null") {
+            return "null";
+          }
+          resolvedObjectType = stripNull(objectType) as ValueType;
+        }
+        let inner: ValueType;
+        if (isObjectType(resolvedObjectType)) {
+          const field = resolvedObjectType.fields.find((f) => f.name === expr.property.name);
           if (!field) {
             throw new Error(`Codegen: unknown field '${expr.property.name}'`);
           }
-          return field.type as ValueType;
-        }
-        if (isStructType(objectType)) {
-          const def = this.structs.get(objectType.name);
+          inner = field.type as ValueType;
+        } else if (isStructType(resolvedObjectType)) {
+          const def = this.structs.get(resolvedObjectType.name);
           if (!def) {
-            throw new Error(`Codegen: unknown struct '${objectType.name}'`);
+            throw new Error(`Codegen: unknown struct '${resolvedObjectType.name}'`);
           }
           const field = def.fields.find((f) => f.name === expr.property.name);
           if (!field) {
             throw new Error(`Codegen: unknown field '${expr.property.name}'`);
           }
-          return field.type;
-        }
-        if (isClassType(objectType)) {
-          const def = this.classes.get(objectType.name);
+          inner = field.type;
+        } else if (isClassType(resolvedObjectType)) {
+          const def = this.classes.get(resolvedObjectType.name);
           if (!def) {
-            throw new Error(`Codegen: unknown class '${objectType.name}'`);
+            throw new Error(`Codegen: unknown class '${resolvedObjectType.name}'`);
           }
           const field = def.fields.find((f) => f.name === expr.property.name);
           if (!field) {
             throw new Error(`Codegen: unknown field '${expr.property.name}'`);
           }
-          return field.type;
+          inner = field.type;
+        } else if (expr.property.name === "length") {
+          inner = "i32";
+        } else {
+          throw new Error(`Codegen: unknown property '${expr.property.name}'`);
         }
-        if (expr.property.name === "length") {
-          return "i32";
+        if (expr.optional) {
+          return makeUnion([inner, "null"]) as ValueType;
         }
-        throw new Error(`Codegen: unknown property '${expr.property.name}'`);
+        return inner;
+      }
+      case "NonNullExpression": {
+        const operand = this.inferExpressionType(expr.expression);
+        return stripNull(operand) as ValueType;
+      }
+      case "NullCoalescingExpression": {
+        const left = this.inferExpressionType(expr.left);
+        return stripNull(left) as ValueType;
       }
       case "Identifier": {
         const local = this.locals.get(expr.name);
@@ -2939,6 +3171,8 @@ export class LlvmCodegen {
         return this.inferExpressionType(expr.left);
       }
       case "CallExpression": {
+        const wrapOptionalCallType = (inner: ValueType): ValueType =>
+          expr.optional ? (makeUnion([inner, "null"]) as ValueType) : inner;
         if (expr.callee.kind === "SuperExpression") {
           throw new Error("Codegen: super call in type inference");
         }
@@ -2953,7 +3187,7 @@ export class LlvmCodegen {
                 `Codegen: unexpected namespace call in type inference '${expr.callee.property.name}'`,
               );
             }
-            return sig.returnType;
+            return wrapOptionalCallType(sig.returnType);
           }
           if (
             expr.callee.object.kind === "Identifier" &&
@@ -2966,18 +3200,24 @@ export class LlvmCodegen {
               if (method.returnType === "void") {
                 throw new Error("Codegen: void static method in inference");
               }
-              return method.returnType;
+              return wrapOptionalCallType(method.returnType);
             }
           }
           const method = expr.callee.property.name;
-          const objectType = this.inferExpressionType(expr.callee.object);
+          let objectType = this.inferExpressionType(expr.callee.object);
+          if (expr.optional && (includesNull(objectType) || objectType === "null")) {
+            if (objectType === "null") {
+              return "null";
+            }
+            objectType = stripNull(objectType) as ValueType;
+          }
           if (isStructType(objectType)) {
             const def = this.structs.get(objectType.name);
             const m = def?.methods.find((x) => x.name === method);
             if (!m || m.returnType === "void") {
               throw new Error("Codegen: unexpected struct method in inference");
             }
-            return m.returnType;
+            return wrapOptionalCallType(m.returnType);
           }
           if (isClassType(objectType)) {
             const def = this.classes.get(objectType.name);
@@ -2985,19 +3225,19 @@ export class LlvmCodegen {
             if (!m || m.returnType === "void") {
               throw new Error("Codegen: unexpected class method in inference");
             }
-            return m.returnType;
+            return wrapOptionalCallType(m.returnType);
           }
           if (!isArrayType(objectType)) {
             throw new Error("Codegen: method on non-array");
           }
           if (method === "pop") {
-            return objectType.element;
+            return wrapOptionalCallType(objectType.element);
           }
           if (method === "includes") {
-            return "bool";
+            return wrapOptionalCallType("bool");
           }
           if (method === "indexOf") {
-            return "i32";
+            return wrapOptionalCallType("i32");
           }
           throw new Error(`Codegen: unexpected method '${method}' in inference`);
         }
@@ -3156,27 +3396,20 @@ export class LlvmCodegen {
       }
       case "IsExpression":
         return this.emitIsExpression(expr, lines);
+      case "NonNullExpression":
+        return this.emitExpression(expr.expression, lines, expected);
+      case "NullCoalescingExpression":
+        return this.emitNullCoalescing(expr, lines);
       case "IndexExpression": {
+        if (expr.optional) {
+          const object = this.emitExpression(expr.object, lines);
+          const resultType = this.inferExpressionType(expr);
+          return this.emitOptionalBranch(object, resultType, lines, (obj) =>
+            this.emitIndexAccess(expr, obj, lines),
+          );
+        }
         const object = this.emitExpression(expr.object, lines);
-        if (isMapType(object.type) || (isObjectType(object.type) && object.type.indexType)) {
-          this.needsTsnMap = true;
-          const index = this.emitExpression(expr.index, lines, "string");
-          const result = this.nextTemp();
-          lines.push(`  ${result} = call ptr @tsn_map_get(ptr ${object.llvm}, ptr ${index.llvm})`);
-          const valueType = isMapType(object.type)
-            ? (object.type.valueType as ValueType)
-            : (object.type.indexType as ValueType);
-          return { llvm: result, type: valueType };
-        }
-        if (isTupleType(object.type)) {
-          return this.emitTupleIndexLoad(object, expr.index, lines);
-        }
-        if (!isArrayType(object.type)) {
-          throw new Error("Codegen: index into non-array");
-        }
-        const index = this.emitExpression(expr.index, lines);
-        const indexI32 = this.asI32Index(index, lines);
-        return this.emitArrayIndexLoad(object.llvm, indexI32, object.type.element, lines);
+        return this.emitIndexAccess(expr, object, lines);
       }
       case "MemberExpression": {
         if (
@@ -3223,66 +3456,73 @@ export class LlvmCodegen {
           }
         }
         const objectType = this.inferExpressionType(expr.object);
-        if (isStructType(objectType)) {
-          return this.emitStructFieldLoad(expr, lines);
-        }
-        if (isClassType(objectType)) {
-          return this.emitClassFieldLoad(expr, lines);
-        }
-        // After null-check narrowing, locals may still be typed as T | null (ptr)
-        if (isNullablePointerUnion(objectType)) {
-          const classArm = flattenUnion(objectType).find(
-            (a) => typeof a === "object" && a.kind === "class",
-          );
-          if (classArm && typeof classArm === "object" && classArm.kind === "class") {
-            const object = this.emitExpression(expr.object, lines);
-            const classInfo =
-              [...this.localClasses.values()].find((c) => c.name === classArm.name) ??
-              [...this.localClasses.values()].find((c) => c.localName === classArm.name);
-            if (!classInfo) {
-              throw new Error(`Codegen: unknown class '${classArm.name}'`);
-            }
-            const field = classInfo.fields.find((f) => f.name === expr.property.name);
-            if (!field) {
-              throw new Error(`Codegen: unknown field '${expr.property.name}'`);
-            }
-            const fieldPtr = this.nextTemp();
-            lines.push(
-              `  ${fieldPtr} = getelementptr inbounds %${classInfo.name}, ptr ${object.llvm}, i32 0, i32 ${field.fieldIndex}`,
+        const emitMemberValue = (): EmittedValue => {
+          if (isStructType(objectType)) {
+            return this.emitStructFieldLoad(expr, lines);
+          }
+          if (isClassType(objectType)) {
+            return this.emitClassFieldLoad(expr, lines);
+          }
+          if (isNullablePointerUnion(objectType)) {
+            const classArm = flattenUnion(objectType).find(
+              (a) => typeof a === "object" && a.kind === "class",
             );
-            const loaded = this.nextTemp();
-            lines.push(`  ${loaded} = load ${toLlvmType(field.type)}, ptr ${fieldPtr}`);
-            return { llvm: loaded, type: field.type };
-          }
-        }
-        if (expr.property.name !== "length") {
-          throw new Error(`Codegen: unknown property '${expr.property.name}'`);
-        }
-        // Prefer string length when object may be a union (post-narrowing)
-        const object = this.emitExpression(expr.object, lines);
-        if (object.type === "string" || isUnionType(object.type)) {
-          this.needsTsnString = true;
-          let asString = object;
-          if (isUnionType(object.type)) {
-            if (isNullablePointerUnion(object.type)) {
-              // Bare ptr — already the string pointer after null check
-              asString = { llvm: object.llvm, type: "string" };
-            } else {
-              asString = this.unboxUnion(object, "string", lines);
+            if (classArm && typeof classArm === "object" && classArm.kind === "class") {
+              const object = this.emitExpression(expr.object, lines);
+              const classInfo =
+                [...this.localClasses.values()].find((c) => c.name === classArm.name) ??
+                [...this.localClasses.values()].find((c) => c.localName === classArm.name);
+              if (!classInfo) {
+                throw new Error(`Codegen: unknown class '${classArm.name}'`);
+              }
+              const field = classInfo.fields.find((f) => f.name === expr.property.name);
+              if (!field) {
+                throw new Error(`Codegen: unknown field '${expr.property.name}'`);
+              }
+              const fieldPtr = this.nextTemp();
+              lines.push(
+                `  ${fieldPtr} = getelementptr inbounds %${classInfo.name}, ptr ${object.llvm}, i32 0, i32 ${field.fieldIndex}`,
+              );
+              const loaded = this.nextTemp();
+              lines.push(`  ${loaded} = load ${toLlvmType(field.type)}, ptr ${fieldPtr}`);
+              return { llvm: loaded, type: field.type };
             }
           }
-          const len32 = this.nextTemp();
-          lines.push(`  ${len32} = call i32 @tsn_str_len(ptr ${asString.llvm})`);
-          return { llvm: len32, type: "i32" };
+          if (expr.property.name !== "length") {
+            throw new Error(`Codegen: unknown property '${expr.property.name}'`);
+          }
+          const object = this.emitExpression(expr.object, lines);
+          if (object.type === "string" || isUnionType(object.type)) {
+            this.needsTsnString = true;
+            let asString = object;
+            if (isUnionType(object.type)) {
+              if (isNullablePointerUnion(object.type)) {
+                asString = { llvm: object.llvm, type: "string" };
+              } else {
+                asString = this.unboxUnion(object, "string", lines);
+              }
+            }
+            const len32 = this.nextTemp();
+            lines.push(`  ${len32} = call i32 @tsn_str_len(ptr ${asString.llvm})`);
+            return { llvm: len32, type: "i32" };
+          }
+          if (isTupleType(object.type)) {
+            return { llvm: String(object.type.elements.length), type: "i32" };
+          }
+          if (!isArrayType(object.type)) {
+            throw new Error("Codegen: .length on non-array");
+          }
+          const length = this.emitArrayLength(object.llvm, lines);
+          return { llvm: length, type: "i32" };
+        };
+        if (expr.optional) {
+          const object = this.emitExpression(expr.object, lines);
+          const resultType = this.inferExpressionType(expr);
+          return this.emitOptionalBranch(object, resultType, lines, (obj) =>
+            this.emitMemberValueWithObject(expr, obj, lines),
+          );
         }
-        if (isTupleType(object.type)) {
-          return { llvm: String(object.type.elements.length), type: "i32" };
-        }
-        if (!isArrayType(object.type)) {
-          throw new Error("Codegen: .length on non-array");
-        }
-        const length = this.emitArrayLength(object.llvm, lines);
-        return { llvm: length, type: "i32" };
+        return emitMemberValue();
       }
       case "Identifier": {
         const local = this.locals.get(expr.name);
@@ -3312,6 +3552,13 @@ export class LlvmCodegen {
         if (expr.callee.kind === "MemberExpression") {
           if (this.isNamespaceCallee(expr)) {
             return this.emitNamespaceCall(expr, lines, false);
+          }
+          if (expr.optional) {
+            const object = this.emitExpression(expr.callee.object, lines);
+            const resultType = this.inferExpressionType(expr);
+            return this.emitOptionalBranch(object, resultType, lines, (obj) =>
+              this.emitMethodCall(expr, lines, false, obj),
+            );
           }
           return this.emitMethodCall(expr, lines, false);
         }
@@ -3785,10 +4032,114 @@ export class LlvmCodegen {
     throw new Error(`Codegen: invalid index type '${index.type}'`);
   }
 
+  private emitIndexAccess(
+    expr: Extract<Expression, { kind: "IndexExpression" }>,
+    object: EmittedValue,
+    lines: string[],
+  ): EmittedValue {
+    let obj = object;
+    if (isNullablePointerUnion(obj.type)) {
+      const nonNullArms = flattenUnion(obj.type).filter((a) => a !== "null");
+      if (nonNullArms.length === 1) {
+        obj = { llvm: obj.llvm, type: nonNullArms[0] as ValueType };
+      }
+    }
+    if (isMapType(obj.type) || (isObjectType(obj.type) && obj.type.indexType)) {
+      this.needsTsnMap = true;
+      const index = this.emitExpression(expr.index, lines, "string");
+      const result = this.nextTemp();
+      lines.push(`  ${result} = call ptr @tsn_map_get(ptr ${obj.llvm}, ptr ${index.llvm})`);
+      const valueType = isMapType(obj.type)
+        ? (obj.type.valueType as ValueType)
+        : (obj.type.indexType as ValueType);
+      return { llvm: result, type: valueType };
+    }
+    if (isTupleType(obj.type)) {
+      return this.emitTupleIndexLoad(obj, expr.index, lines);
+    }
+    if (!isArrayType(obj.type)) {
+      throw new Error("Codegen: index into non-array");
+    }
+    const index = this.emitExpression(expr.index, lines);
+    const indexI32 = this.asI32Index(index, lines);
+    return this.emitArrayIndexLoad(obj.llvm, indexI32, obj.type.element, lines);
+  }
+
+  private emitMemberValueWithObject(
+    expr: MemberExpression,
+    object: EmittedValue,
+    lines: string[],
+  ): EmittedValue {
+    const objectType = object.type === "null" ? object.type : this.inferExpressionType(expr.object);
+    let resolvedType = objectType;
+    if (includesNull(objectType) || objectType === "null") {
+      resolvedType = stripNull(objectType) as ValueType;
+    }
+    if (isStructType(resolvedType)) {
+      const def = this.structs.get(resolvedType.name);
+      if (!def) {
+        throw new Error(`Codegen: unknown struct '${resolvedType.name}'`);
+      }
+      const fieldIndex = def.fields.findIndex((f) => f.name === expr.property.name);
+      if (fieldIndex < 0) {
+        throw new Error(`Codegen: unknown field '${expr.property.name}'`);
+      }
+      const field = def.fields[fieldIndex]!;
+      const fieldPtr = this.nextTemp();
+      lines.push(
+        `  ${fieldPtr} = getelementptr inbounds %${def.name}, ${toLlvmType(resolvedType)} ${object.llvm}, i32 0, i32 ${fieldIndex}`,
+      );
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load ${toLlvmType(field.type)}, ptr ${fieldPtr}`);
+      return { llvm: loaded, type: field.type };
+    }
+    if (isClassType(resolvedType)) {
+      const def = this.classes.get(resolvedType.name);
+      if (!def) {
+        throw new Error(`Codegen: unknown class '${resolvedType.name}'`);
+      }
+      const field = def.fields.find((f) => f.name === expr.property.name);
+      if (!field) {
+        throw new Error(`Codegen: unknown field '${expr.property.name}'`);
+      }
+      const fieldPtr = this.nextTemp();
+      lines.push(
+        `  ${fieldPtr} = getelementptr inbounds %${def.name}, ptr ${object.llvm}, i32 0, i32 ${field.fieldIndex}`,
+      );
+      const loaded = this.nextTemp();
+      lines.push(`  ${loaded} = load ${toLlvmType(field.type)}, ptr ${fieldPtr}`);
+      return { llvm: loaded, type: field.type };
+    }
+    if (expr.property.name === "length") {
+      if (object.type === "string" || isUnionType(object.type)) {
+        this.needsTsnString = true;
+        let asString = object;
+        if (isUnionType(object.type) && !isNullablePointerUnion(object.type)) {
+          asString = this.unboxUnion(object, "string", lines);
+        } else if (isNullablePointerUnion(object.type)) {
+          asString = { llvm: object.llvm, type: "string" };
+        }
+        const len32 = this.nextTemp();
+        lines.push(`  ${len32} = call i32 @tsn_str_len(ptr ${asString.llvm})`);
+        return { llvm: len32, type: "i32" };
+      }
+      if (isTupleType(object.type)) {
+        return { llvm: String(object.type.elements.length), type: "i32" };
+      }
+      if (!isArrayType(object.type)) {
+        throw new Error("Codegen: .length on non-array");
+      }
+      const length = this.emitArrayLength(object.llvm, lines);
+      return { llvm: length, type: "i32" };
+    }
+    throw new Error(`Codegen: unknown property '${expr.property.name}'`);
+  }
+
   private emitMethodCall(
     call: CallExpression,
     lines: string[],
     asStatement: boolean,
+    objectOverride?: EmittedValue,
   ): EmittedValue {
     if (call.callee.kind !== "MemberExpression") {
       throw new Error("Codegen: expected method call");
@@ -3819,7 +4170,16 @@ export class LlvmCodegen {
       }
     }
 
-    const objectType = this.inferExpressionType(callee.object);
+    let objectType = this.inferExpressionType(callee.object);
+    if (objectOverride) {
+      objectType = objectOverride.type;
+      if (objectType === "null") {
+        throw new Error("Codegen: optional call on null object in access block");
+      }
+      if (includesNull(objectType)) {
+        objectType = stripNull(objectType) as ValueType;
+      }
+    }
 
     if (isStructType(objectType)) {
       const def = this.structs.get(objectType.name);
@@ -3855,7 +4215,7 @@ export class LlvmCodegen {
       if (!def || !method) {
         throw new Error(`Codegen: unknown class method '${callee.property.name}'`);
       }
-      const obj = this.emitExpression(callee.object, lines);
+      const obj = objectOverride ?? this.emitExpression(callee.object, lines);
       const args: EmittedValue[] = [];
       for (let i = 0; i < call.args.length; i += 1) {
         args.push(this.emitExpression(asExpressions(call.args)[i]!, lines, method.params[i]));
@@ -3916,7 +4276,7 @@ export class LlvmCodegen {
       if (!def || !method) {
         throw new Error(`Codegen: unknown interface method '${callee.property.name}'`);
       }
-      const obj = this.emitExpression(callee.object, lines);
+      const obj = objectOverride ?? this.emitExpression(callee.object, lines);
       const args: EmittedValue[] = [];
       for (let i = 0; i < call.args.length; i += 1) {
         args.push(this.emitExpression(asExpressions(call.args)[i]!, lines, method.params[i]));
@@ -3948,7 +4308,7 @@ export class LlvmCodegen {
       return { llvm: tmp, type: method.returnType };
     }
 
-    const object = this.emitExpression(callee.object, lines);
+    const object = objectOverride ?? this.emitExpression(callee.object, lines);
     if (!isArrayType(object.type)) {
       throw new Error("Codegen: method on non-array");
     }
@@ -4462,6 +4822,15 @@ export class LlvmCodegen {
         case "ForInStatement":
           visitExpr(s.iterable);
           for (const st of s.body) visitStmt(st);
+          break;
+        case "SwitchStatement":
+          visitExpr(s.discriminant);
+          for (const switchCase of s.cases) {
+            if (switchCase.test) {
+              visitExpr(switchCase.test);
+            }
+            for (const st of switchCase.body) visitStmt(st);
+          }
           break;
         default:
           break;

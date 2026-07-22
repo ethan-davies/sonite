@@ -1,0 +1,68 @@
+class Address {
+  city: string;
+
+  constructor(city: string) {
+    this.city = city;
+  }
+}
+
+class Profile {
+  address: Address;
+
+  constructor(address: Address) {
+    this.address = address;
+  }
+}
+
+class Person {
+  name: string;
+  profile: Profile | null;
+
+  constructor(name: string, profile: Profile | null) {
+    this.name = name;
+    this.profile = profile;
+  }
+
+  getName(): string {
+    return this.name;
+  }
+}
+
+function getName(): string | null {
+  return "Ada";
+}
+
+function getDefaultName(): string {
+  return "Unknown";
+}
+
+function getPerson(): Person | null {
+  return new Person("Grace", new Profile(new Address("NYC")));
+}
+
+function main(): void {
+  let name: string | null = getName();
+  print(name!.length);
+
+  let display = name ?? "Unknown";
+  print(display);
+
+  let fallback = name ?? getDefaultName();
+  print(fallback);
+
+  let person: Person | null = getPerson();
+  print(person?.name ?? "none");
+  print(person?.getName() ?? "none");
+
+  let city = person?.profile?.address?.city ?? "Unknown";
+  print(city);
+
+  let asserted = person?.profile!.address?.city ?? "Unknown";
+  print(asserted);
+
+  let numbers: i32[] | null = [1, 2, 3];
+  print(numbers?[0] ?? 0);
+
+  let empty: i32[] | null = null;
+  print(empty?[0] ?? -1);
+}

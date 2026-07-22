@@ -1,0 +1,61 @@
+enum Direction {
+  Up,
+  Down,
+  Left,
+  Right
+}
+
+function main(): void {
+  const ONE: i32 = 1;
+  const TWO: i32 = 2;
+  let value: i32 = 1;
+
+  switch (value) {
+    case ONE:
+      print("one");
+      break;
+    case TWO:
+      print("two");
+      break;
+    default:
+      print("other");
+  }
+
+  // Fallthrough: matching case 1 runs case 1 then case 2
+  value = 1;
+  switch (value) {
+    case 1:
+      print("fall one");
+    case 2:
+      print("fall two");
+      break;
+  }
+
+  let direction: Direction = Direction.Left;
+  switch (direction) {
+    case Direction.Up:
+      print("up");
+      break;
+    case Direction.Down:
+      print("down");
+      break;
+    case Direction.Left:
+      print("left");
+      break;
+    case Direction.Right:
+      print("right");
+      break;
+  }
+
+  let n: i32 = 0;
+  while (n < 2) {
+    switch (n) {
+      case 0:
+        print("loop break");
+        break;
+      default:
+        print("unexpected");
+    }
+    n++;
+  }
+}

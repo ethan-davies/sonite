@@ -244,6 +244,14 @@ export function substituteExpression(expr: Expression, subst: TypeSubst): Expres
       };
     case "UnaryExpression":
       return { ...expr, operand: substituteExpression(expr.operand, subst) };
+    case "NonNullExpression":
+      return { ...expr, expression: substituteExpression(expr.expression, subst) };
+    case "NullCoalescingExpression":
+      return {
+        ...expr,
+        left: substituteExpression(expr.left, subst),
+        right: substituteExpression(expr.right, subst),
+      };
     case "TypeofExpression":
       return { ...expr, operand: substituteExpression(expr.operand, subst) };
     case "IsExpression":
@@ -343,6 +351,16 @@ function substStatement(stmt: Statement, subst: TypeSubst): Statement {
         ...stmt,
         iterable: substituteExpression(stmt.iterable, subst),
         body: stmt.body.map((s) => substStatement(s, subst)),
+      };
+    case "SwitchStatement":
+      return {
+        ...stmt,
+        discriminant: substituteExpression(stmt.discriminant, subst),
+        cases: stmt.cases.map((switchCase) => ({
+          ...switchCase,
+          test: switchCase.test ? substituteExpression(switchCase.test, subst) : null,
+          body: switchCase.body.map((s) => substStatement(s, subst)),
+        })),
       };
     case "BreakStatement":
     case "ContinueStatement":

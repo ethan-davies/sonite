@@ -253,6 +253,14 @@ function rewriteExpression(expr: Expression, inst: TypecheckInstantiations): Exp
       };
     case "UnaryExpression":
       return { ...expr, operand: rewriteExpression(expr.operand, inst) };
+    case "NonNullExpression":
+      return { ...expr, expression: rewriteExpression(expr.expression, inst) };
+    case "NullCoalescingExpression":
+      return {
+        ...expr,
+        left: rewriteExpression(expr.left, inst),
+        right: rewriteExpression(expr.right, inst),
+      };
     case "TypeofExpression":
       return { ...expr, operand: rewriteExpression(expr.operand, inst) };
     case "IsExpression":
@@ -352,6 +360,16 @@ function rewriteStatement(stmt: Statement, inst: TypecheckInstantiations): State
         ...stmt,
         iterable: rewriteExpression(stmt.iterable, inst),
         body: stmt.body.map((s) => rewriteStatement(s, inst)),
+      };
+    case "SwitchStatement":
+      return {
+        ...stmt,
+        discriminant: rewriteExpression(stmt.discriminant, inst),
+        cases: stmt.cases.map((switchCase) => ({
+          ...switchCase,
+          test: switchCase.test ? rewriteExpression(switchCase.test, inst) : null,
+          body: switchCase.body.map((s) => rewriteStatement(s, inst)),
+        })),
       };
     case "BreakStatement":
     case "ContinueStatement":

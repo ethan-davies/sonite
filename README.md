@@ -97,7 +97,7 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 - Comparisons (`== != < <= > >=`) and logical ops (`&& || !`)
 - Value-position `typeof` expression (returns type tags such as `"string"`, `"i32"`, `"bool"`, `"null"`, `"object"`)
 - `value is Type` type checks (including `is null` and class types) with narrowing
-- Control flow: `if` / `elseif` / `else`, `while`, C-style `for`, element `for (i in arr)`, `break`, `continue`
+- Control flow: `if` / `elseif` / `else`, `while`, C-style `for`, element `for (i in arr)`, `switch` / `case` / `default`, `break`, `continue`
 - `//` line comments and `/* */` block comments
 
 `print` is a builtin. It is lowered to `tsn_print_*` runtime calls in the generated LLVM IR, and `tsn run` links `libtsn_runtime.a` when building the native binary.
@@ -112,6 +112,7 @@ Programs are stored in `.tsn` files. Every program must define `function main():
 | [`examples/arithmetic.tsn`](./examples/arithmetic.tsn) | Arithmetic and precedence |
 | [`examples/control-flow.tsn`](./examples/control-flow.tsn) | `if` / `elseif` / `else`, comparisons |
 | [`examples/loops.tsn`](./examples/loops.tsn) | `for` / `while`, updates, `break` / `continue` |
+| [`examples/switch.tsn`](./examples/switch.tsn) | `switch` / `case` / `default`, fallthrough, enum cases |
 | [`examples/arrays.tsn`](./examples/arrays.tsn) | Array literals, indexing, methods, `for-in` |
 | [`examples/tuples.tsn`](./examples/tuples.tsn) | Tuple types, indexing, destructuring, generics |
 | [`examples/structs.tsn`](./examples/structs.tsn) | Struct decls, literals, fields, params |

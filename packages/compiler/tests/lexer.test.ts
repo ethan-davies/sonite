@@ -133,7 +133,7 @@ describe("Lexer", () => {
 
   it("tokenizes loop keywords and update operators", () => {
     const { tokens, diagnostics } = lex(
-      `while for break continue ++ -- += -=`,
+      `while for break continue switch case default ++ -- += -=`,
     );
     expect(diagnostics.hasErrors).toBe(false);
     expect(tokens.map((t) => t.kind)).toEqual([
@@ -141,6 +141,9 @@ describe("Lexer", () => {
       TokenKind.For,
       TokenKind.Break,
       TokenKind.Continue,
+      TokenKind.Switch,
+      TokenKind.Case,
+      TokenKind.Default,
       TokenKind.PlusPlus,
       TokenKind.MinusMinus,
       TokenKind.PlusEqual,
@@ -176,6 +179,27 @@ describe("Lexer", () => {
       TokenKind.Question,
       TokenKind.AmpAmp,
       TokenKind.PipePipe,
+      TokenKind.Eof,
+    ]);
+  });
+
+  it("tokenizes null coalescing and optional chaining operators", () => {
+    const { tokens, diagnostics } = lex(`a ?? b; obj?.prop; arr?[0]`);
+    expect(diagnostics.hasErrors).toBe(false);
+    expect(tokens.map((t) => t.kind)).toEqual([
+      TokenKind.Identifier,
+      TokenKind.QuestionQuestion,
+      TokenKind.Identifier,
+      TokenKind.Semicolon,
+      TokenKind.Identifier,
+      TokenKind.QuestionDot,
+      TokenKind.Identifier,
+      TokenKind.Semicolon,
+      TokenKind.Identifier,
+      TokenKind.Question,
+      TokenKind.LBracket,
+      TokenKind.Integer,
+      TokenKind.RBracket,
       TokenKind.Eof,
     ]);
   });

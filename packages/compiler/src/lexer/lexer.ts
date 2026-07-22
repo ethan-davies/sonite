@@ -142,6 +142,14 @@ export class Lexer {
         }
         return this.makeToken(TokenKind.Pipe, ch, start);
       case "?":
+        if (this.peek() === "?") {
+          this.advance();
+          return this.makeToken(TokenKind.QuestionQuestion, "??", start);
+        }
+        if (this.peek() === ".") {
+          this.advance();
+          return this.makeToken(TokenKind.QuestionDot, "?.", start);
+        }
         return this.makeToken(TokenKind.Question, ch, start);
     }
 

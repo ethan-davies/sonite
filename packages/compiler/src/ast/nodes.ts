@@ -61,11 +61,15 @@ export type AstNode =
   | WhileStatement
   | ForStatement
   | ForInStatement
+  | SwitchStatement
+  | SwitchCase
   | BreakStatement
   | ContinueStatement
   | CallExpression
   | BinaryExpression
   | UnaryExpression
+  | NonNullExpression
+  | NullCoalescingExpression
   | TypeofExpression
   | IsExpression
   | IndexExpression
@@ -121,6 +125,7 @@ export type Statement =
   | WhileStatement
   | ForStatement
   | ForInStatement
+  | SwitchStatement
   | BreakStatement
   | ContinueStatement;
 
@@ -352,6 +357,20 @@ export interface ForInStatement extends AstNodeBase {
   readonly body: Statement[];
 }
 
+export interface SwitchCase extends AstNodeBase {
+  readonly kind: "SwitchCase";
+  readonly isDefault: boolean;
+  /** Present when !isDefault */
+  readonly test: Expression | null;
+  readonly body: Statement[];
+}
+
+export interface SwitchStatement extends AstNodeBase {
+  readonly kind: "SwitchStatement";
+  readonly discriminant: Expression;
+  readonly cases: SwitchCase[];
+}
+
 export interface BreakStatement extends AstNodeBase {
   readonly kind: "BreakStatement";
 }
@@ -365,6 +384,8 @@ export type Expression =
   | LambdaExpression
   | BinaryExpression
   | UnaryExpression
+  | NonNullExpression
+  | NullCoalescingExpression
   | TypeofExpression
   | IsExpression
   | IndexExpression
@@ -390,6 +411,8 @@ export interface CallExpression extends AstNodeBase {
   /** Explicit type arguments from `foo<T>(...)`; empty when inferred or non-generic. */
   readonly typeArgs: TypeAnnotation[];
   readonly args: CallArgument[];
+  /** True for `obj?.method(...)` optional call syntax. */
+  readonly optional: boolean;
 }
 
 export interface LambdaParameter extends AstNodeBase {
@@ -423,6 +446,17 @@ export interface UnaryExpression extends AstNodeBase {
   readonly operand: Expression;
 }
 
+export interface NonNullExpression extends AstNodeBase {
+  readonly kind: "NonNullExpression";
+  readonly expression: Expression;
+}
+
+export interface NullCoalescingExpression extends AstNodeBase {
+  readonly kind: "NullCoalescingExpression";
+  readonly left: Expression;
+  readonly right: Expression;
+}
+
 export interface TypeofExpression extends AstNodeBase {
   readonly kind: "TypeofExpression";
   readonly operand: Expression;
@@ -438,12 +472,16 @@ export interface IndexExpression extends AstNodeBase {
   readonly kind: "IndexExpression";
   readonly object: Expression;
   readonly index: Expression;
+  /** True for `arr?[0]` or `obj?.[idx]` optional index syntax. */
+  readonly optional: boolean;
 }
 
 export interface MemberExpression extends AstNodeBase {
   readonly kind: "MemberExpression";
   readonly object: Expression;
   readonly property: Identifier;
+  /** True for `obj?.prop` optional member syntax. */
+  readonly optional: boolean;
 }
 
 export interface ArrayLiteral extends AstNodeBase {

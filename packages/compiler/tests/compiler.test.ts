@@ -310,6 +310,147 @@ describe("compile pipeline", () => {
       expect(result.ir).toContain("br label %for.exit.0");
     });
 
+    it("compiles switch with break and default", () => {
+      const result = compile(`
+        function main(): void {
+          let value: i32 = 1;
+          switch (value) {
+            case 1:
+              print("one");
+              break;
+            case 2:
+              print("two");
+              break;
+            default:
+              print("other");
+          }
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("switch.check.0.0:");
+      expect(result.ir).toContain("icmp eq i32");
+      expect(result.ir).toContain("switch.exit.0:");
+      expect(result.ir).toContain("br label %switch.exit.0");
+      expect(result.ir).toContain(encodeLlvmString("one"));
+      expect(result.ir).toContain(encodeLlvmString("other"));
+    });
+
+    it("compiles switch fallthrough between cases", () => {
+      const result = compile(`
+        function main(): void {
+          let value: i32 = 1;
+          switch (value) {
+            case 1:
+              print("one");
+            case 2:
+              print("two");
+              break;
+          }
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("switch.case.0.0:");
+      expect(result.ir).toContain("switch.case.0.1:");
+      expect(result.ir).toContain(encodeLlvmString("one"));
+      expect(result.ir).toContain(encodeLlvmString("two"));
+    });
+
+    it("compiles break in switch nested inside while", () => {
+      const result = compile(`
+        function main(): void {
+          let n: i32 = 0;
+          while (n < 3) {
+            switch (n) {
+              case 0:
+                break;
+            }
+            n++;
+          }
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("br label %switch.exit.");
+      expect(result.ir).toContain("while.cond.");
+    });
+
+    it("compiles continue in switch nested inside while", () => {
+      const result = compile(`
+        function main(): void {
+          let n: i32 = 0;
+          while (n < 3) {
+            switch (n) {
+              case 0:
+                continue;
+            }
+            n++;
+          }
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("br label %while.cond.");
+    });
+
+    it("fails when switch case type does not match discriminant", () => {
+      const result = compile(`
+        function main(): void {
+          let value: i32 = 10;
+          switch (value) {
+            case "hello":
+              print("bad");
+          }
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0335")).toBe(true);
+    });
+
+    it("fails on duplicate switch cases", () => {
+      const result = compile(`
+        function main(): void {
+          let value: i32 = 1;
+          switch (value) {
+            case 1:
+              print("a");
+            case 1:
+              print("b");
+          }
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0336")).toBe(true);
+    });
+
+    it("fails on duplicate default cases", () => {
+      const result = compile(`
+        function main(): void {
+          let value: i32 = 1;
+          switch (value) {
+            default:
+              print("a");
+            default:
+              print("b");
+          }
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0337")).toBe(true);
+    });
+
+    it("fails when switch case is not a compile-time constant", () => {
+      const result = compile(`
+        function getValue(): i32 { return 1; }
+        function main(): void {
+          let value: i32 = 1;
+          switch (value) {
+            case getValue():
+              print("bad");
+          }
+        }
+      `);
+      expect(result.success).toBe(false);
+      expect(result.diagnostics.some((d) => d.code === "E0322")).toBe(true);
+    });
+
     it("compiles the hello, variables, arithmetic, control-flow, loops, arrays, structs, enums, struct-methods, classes, inheritance, interfaces, and generics examples", () => {
       for (const name of [
         "hello.tsn",
@@ -317,6 +458,7 @@ describe("compile pipeline", () => {
         "arithmetic.tsn",
         "control-flow.tsn",
         "loops.tsn",
+        "switch.tsn",
         "arrays.tsn",
         "structs.tsn",
         "enums.tsn",
@@ -328,6 +470,7 @@ describe("compile pipeline", () => {
         "type-aliases.tsn",
         "unions.tsn",
         "nullability.tsn",
+        "null-operators.tsn",
         "multi-constraints.tsn",
         "dictionaries.tsn",
         "type-operators.tsn",
@@ -1738,6 +1881,135 @@ describe("nullability and control-flow narrowing", () => {
         if (user != null) {
           print(user.name);
         }
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+});
+
+describe("null operators", () => {
+  it("compiles non-null assertion on nullable string", () => {
+    const result = compile(`
+      function main(): void {
+        let name: string | null = "Ada";
+        print(name!.length);
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("still rejects property access on nullable without narrowing or optional chaining", () => {
+    const result = compile(`
+      class User {
+        name: string;
+        constructor(name: string) { this.name = name; }
+      }
+      function main(): void {
+        let user: User | null = null;
+        print(user.name);
+      }
+    `);
+    expect(result.success).toBe(false);
+    expect(result.diagnostics.some((d) => d.code === "E0397")).toBe(true);
+  });
+
+  it("compiles nullish coalescing with compatible fallback type", () => {
+    const result = compile(`
+      function getName(): string | null { return null; }
+      function main(): void {
+        let name: string | null = getName();
+        let display: string = name ?? "Unknown";
+        print(display);
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects nullish coalescing with incompatible fallback type", () => {
+    const result = compile(`
+      function main(): void {
+        let name: string | null = null;
+        let x = name ?? 123;
+      }
+    `);
+    expect(result.success).toBe(false);
+    expect(result.diagnostics.some((d) => d.code === "E0303")).toBe(true);
+  });
+
+  it("short-circuits nullish coalescing in generated IR", () => {
+    const result = compile(`
+      function getDefault(): string { return "Unknown"; }
+      function main(): void {
+        let name: string | null = "Ada";
+        let display = name ?? getDefault();
+        print(display);
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("coalesce_rhs");
+    expect(result.ir).toContain("coalesce_merge");
+  });
+
+  it("compiles optional member and method access", () => {
+    const result = compile(`
+      class User {
+        name: string;
+        constructor(name: string) { this.name = name; }
+        getName(): string { return this.name; }
+      }
+      function main(): void {
+        let user: User | null = new User("Ada");
+        let n = user?.name;
+        let m = user?.getName();
+        print(n ?? "none");
+        print(m ?? "none");
+      }
+    `);
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("opt_null");
+    expect(result.ir).toContain("opt_merge");
+  });
+
+  it("compiles optional array indexing", () => {
+    const result = compile(`
+      function main(): void {
+        let numbers: i32[] | null = [1, 2, 3];
+        let first = numbers?[0];
+        print(first ?? 0);
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("compiles optional chaining combined with nullish coalescing", () => {
+    const result = compile(`
+      class Address { city: string; constructor(city: string) { this.city = city; } }
+      class Profile { address: Address; constructor(address: Address) { this.address = address; } }
+      class User {
+        profile: Profile | null;
+        constructor(profile: Profile | null) { this.profile = profile; }
+      }
+      function main(): void {
+        let user: User | null = new User(new Profile(new Address("NYC")));
+        let city: string = user?.profile?.address?.city ?? "Unknown";
+        print(city);
+      }
+    `);
+    expect(result.success).toBe(true);
+  });
+
+  it("compiles non-null assertion after optional chaining", () => {
+    const result = compile(`
+      class Address { city: string; constructor(city: string) { this.city = city; } }
+      class Profile { address: Address; constructor(address: Address) { this.address = address; } }
+      class User {
+        profile: Profile | null;
+        constructor(profile: Profile | null) { this.profile = profile; }
+      }
+      function main(): void {
+        let user: User | null = new User(new Profile(new Address("NYC")));
+        let city = user?.profile!.address?.city ?? "Unknown";
+        print(city);
       }
     `);
     expect(result.success).toBe(true);

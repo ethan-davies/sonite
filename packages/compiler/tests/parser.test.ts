@@ -422,6 +422,38 @@ describe("Parser", () => {
     }
   });
 
+  it("parses switch with cases, default, fallthrough, and break", () => {
+    const { ast, diagnostics } = parse(`
+      function main(): void {
+        let value: i32 = 1;
+        switch (value) {
+          case 1:
+            print("one");
+            break;
+          case 2:
+            print("two");
+          default:
+            print("other");
+        }
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const body = functionAt(ast, 0).body;
+    expect(body[1]?.kind).toBe("SwitchStatement");
+    if (body[1]?.kind === "SwitchStatement") {
+      expect(body[1].discriminant.kind).toBe("Identifier");
+      expect(body[1].cases).toHaveLength(3);
+      expect(body[1].cases[0]?.isDefault).toBe(false);
+      expect(body[1].cases[0]?.test?.kind).toBe("IntegerLiteral");
+      expect(body[1].cases[0]?.body[0]?.kind).toBe("ExpressionStatement");
+      expect(body[1].cases[0]?.body[1]?.kind).toBe("BreakStatement");
+      expect(body[1].cases[1]?.isDefault).toBe(false);
+      expect(body[1].cases[1]?.body).toHaveLength(1);
+      expect(body[1].cases[2]?.isDefault).toBe(true);
+      expect(body[1].cases[2]?.test).toBeNull();
+    }
+  });
+
   it("parses while, for, updates, break, and continue", () => {
     const { ast, diagnostics } = parse(`
       function main(): void {
@@ -1127,5 +1159,69 @@ describe("Parser", () => {
         d.message.includes("Positional arguments must come before named arguments"),
       ),
     ).toBe(true);
+  });
+
+  it("parses non-null assertion, nullish coalescing, and optional chaining", () => {
+    const { ast, diagnostics } = parse(`
+      class User {
+        name: string;
+        profile: User | null;
+        constructor(name: string, profile: User | null) {
+          this.name = name;
+          this.profile = profile;
+        }
+        getName(): string { return this.name; }
+      }
+      function main(): void {
+        let name: string | null = null;
+        print(name!.length);
+        let display = name ?? "Unknown";
+        let user: User | null = null;
+        let n = user?.name;
+        let m = user?.getName();
+        let first = arr?[0];
+        let city = user?.profile?.address?.city ?? "Unknown";
+        let asserted = user?.profile!.address?.city;
+      }
+    `);
+    expect(diagnostics.hasErrors).toBe(false);
+    const main = functionAt(ast, 1);
+    const stmts = main.body;
+    expect(stmts[1]?.kind).toBe("ExpressionStatement");
+    if (stmts[1]?.kind === "ExpressionStatement") {
+      const call = stmts[1].expression;
+      expect(call.kind).toBe("CallExpression");
+      if (call.kind === "CallExpression" && call.args[0]?.kind !== "NamedArgument") {
+        const arg = call.args[0];
+        expect(arg?.kind).toBe("MemberExpression");
+        if (arg?.kind === "MemberExpression") {
+          expect(arg.object.kind).toBe("NonNullExpression");
+        }
+      }
+    }
+    expect(stmts[2]?.kind).toBe("VariableDeclaration");
+    if (stmts[2]?.kind === "VariableDeclaration") {
+      expect(stmts[2].initializer?.kind).toBe("NullCoalescingExpression");
+    }
+    expect(stmts[4]?.kind).toBe("VariableDeclaration");
+    if (stmts[4]?.kind === "VariableDeclaration") {
+      const init = stmts[4].initializer;
+      expect(init?.kind).toBe("MemberExpression");
+      if (init?.kind === "MemberExpression") {
+        expect(init.optional).toBe(true);
+      }
+    }
+    expect(stmts[6]?.kind).toBe("VariableDeclaration");
+    if (stmts[6]?.kind === "VariableDeclaration") {
+      const init = stmts[6].initializer;
+      expect(init?.kind).toBe("IndexExpression");
+      if (init?.kind === "IndexExpression") {
+        expect(init.optional).toBe(true);
+      }
+    }
+    expect(stmts[7]?.kind).toBe("VariableDeclaration");
+    if (stmts[7]?.kind === "VariableDeclaration") {
+      expect(stmts[7].initializer?.kind).toBe("NullCoalescingExpression");
+    }
   });
 });

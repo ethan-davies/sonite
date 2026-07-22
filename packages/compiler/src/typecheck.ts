@@ -57,6 +57,7 @@ import {
   makeIntersection,
   makeUnion,
   mutateScopeWithFacts,
+  stripNull,
   objectShapeName,
   typeofTagForType,
   type ExtendedValueType,
@@ -249,6 +250,8 @@ export interface EnumDef {
 interface Binding {
   readonly type: ValueType;
   readonly mutable: boolean;
+  /** For const bindings initialized with a compile-time constant expression */
+  readonly constantExpr?: Expression;
 }
 
 interface FunctionSig {
@@ -2980,7 +2983,7 @@ function checkGenericStructTemplate(
       // Use a synthetic struct this-type via type param — for template check, bind this as opaque.
       // Better: treat this as having the template's fields. Skip full this checking for MVP of methods.
       for (const stmt of method.body) {
-        checkStatement(stmt, scope, functions, structs, enums, returnType, diagnostics, 0);
+        checkStatement(stmt, scope, functions, structs, enums, returnType, diagnostics, 0, 0);
       }
     }
     activeTypeParams = bound;
@@ -3409,7 +3412,7 @@ function checkFunction(
   }
 
   for (const stmt of fn.body) {
-    checkStatement(stmt, scope, functions, structs, enums, returnType, diagnostics, 0);
+    checkStatement(stmt, scope, functions, structs, enums, returnType, diagnostics, 0, 0);
   }
 
   if (returnType !== "void") {
@@ -3461,7 +3464,7 @@ function checkStructMethods(
       diagnostics,
     );
     for (const stmt of method.decl.body) {
-      checkStatement(stmt, scope, functions, structs, enums, method.returnType, diagnostics, 0);
+      checkStatement(stmt, scope, functions, structs, enums, method.returnType, diagnostics, 0, 0);
     }
     if (method.returnType !== "void") {
       const last = method.decl.body[method.decl.body.length - 1];
@@ -3566,7 +3569,7 @@ function checkClassMembers(
           "E0357",
         );
       }
-      checkStatement(stmt, scope, functions, structs, enums, "void", diagnostics, 0);
+      checkStatement(stmt, scope, functions, structs, enums, "void", diagnostics, 0, 0);
     }
     memberContext = null;
   } else if (def.superclass) {
@@ -3610,7 +3613,7 @@ function checkClassMembers(
     );
     const body = method.decl.body ?? [];
     for (const stmt of body) {
-      checkStatement(stmt, scope, functions, structs, enums, method.returnType, diagnostics, 0);
+      checkStatement(stmt, scope, functions, structs, enums, method.returnType, diagnostics, 0, 0);
     }
     if (method.returnType !== "void") {
       const last = body[body.length - 1];
@@ -3653,7 +3656,7 @@ function checkClassMembers(
     const returnType = resolveReturnType(member.returnType, structs, enums, diagnostics);
     if (returnType !== undefined && member.body) {
       for (const stmt of member.body) {
-        checkStatement(stmt, scope, functions, structs, enums, returnType, diagnostics, 0);
+        checkStatement(stmt, scope, functions, structs, enums, returnType, diagnostics, 0, 0);
       }
     }
     activeTypeParams = prev;
@@ -3732,6 +3735,118 @@ function constantIndexValue(expr: Expression): number | null {
     return -expr.operand.value;
   }
   return null;
+}
+
+/** Expression shapes allowed as switch case labels when const-resolved. */
+function constantInitializerExpr(expr: Expression): Expression | null {
+  if (
+    expr.kind === "IntegerLiteral" ||
+    expr.kind === "FloatLiteral" ||
+    expr.kind === "BooleanLiteral" ||
+    expr.kind === "StringLiteral" ||
+    expr.kind === "CharLiteral"
+  ) {
+    return expr;
+  }
+  if (
+    expr.kind === "UnaryExpression" &&
+    expr.operator === "-" &&
+    expr.operand.kind === "IntegerLiteral"
+  ) {
+    return expr;
+  }
+  if (expr.kind === "MemberExpression" && expr.object.kind === "Identifier") {
+    return expr;
+  }
+  return null;
+}
+
+function resolveSwitchCaseConstantExpr(
+  expr: Expression,
+  scope: Map<string, Binding>,
+): Expression | null {
+  const direct = constantInitializerExpr(expr);
+  if (direct) {
+    return direct;
+  }
+  if (expr.kind === "Identifier") {
+    const binding = scope.get(expr.name);
+    if (binding && !binding.mutable && binding.constantExpr) {
+      return binding.constantExpr;
+    }
+  }
+  return null;
+}
+
+function switchCaseKey(
+  expr: Expression,
+  scope: Map<string, Binding>,
+  enums: Map<string, EnumDef>,
+): string | null {
+  const resolved = resolveSwitchCaseConstantExpr(expr, scope);
+  if (!resolved) {
+    return null;
+  }
+  if (resolved.kind === "IntegerLiteral") {
+    return `i32:${resolved.value}`;
+  }
+  if (resolved.kind === "FloatLiteral") {
+    return `f64:${resolved.value}`;
+  }
+  if (resolved.kind === "BooleanLiteral") {
+    return `bool:${resolved.value}`;
+  }
+  if (resolved.kind === "StringLiteral") {
+    return `string:${resolved.value}`;
+  }
+  if (resolved.kind === "CharLiteral") {
+    return `char:${resolved.value}`;
+  }
+  if (
+    resolved.kind === "UnaryExpression" &&
+    resolved.operator === "-" &&
+    resolved.operand.kind === "IntegerLiteral"
+  ) {
+    return `i32:${-resolved.operand.value}`;
+  }
+  if (resolved.kind === "MemberExpression" && resolved.object.kind === "Identifier") {
+    if (enums.has(resolved.object.name)) {
+      return `enum:${resolved.object.name}:${resolved.property.name}`;
+    }
+  }
+  return null;
+}
+
+function switchCaseDisplay(expr: Expression): string {
+  if (expr.kind === "IntegerLiteral") {
+    return String(expr.value);
+  }
+  if (expr.kind === "FloatLiteral") {
+    return String(expr.value);
+  }
+  if (expr.kind === "BooleanLiteral") {
+    return String(expr.value);
+  }
+  if (expr.kind === "StringLiteral") {
+    return JSON.stringify(expr.value);
+  }
+  if (expr.kind === "CharLiteral") {
+    return JSON.stringify(expr.value);
+  }
+  if (
+    expr.kind === "UnaryExpression" &&
+    expr.operator === "-" &&
+    expr.operand.kind === "IntegerLiteral"
+  ) {
+    return String(-expr.operand.value);
+  }
+  if (expr.kind === "MemberExpression" && expr.object.kind === "Identifier") {
+    return `${expr.object.name}.${expr.property.name}`;
+  }
+  if (expr.kind === "Identifier") {
+    return expr.name;
+  }
+  return "?";
 }
 
 function checkDestructuringDeclaration(
@@ -3848,15 +3963,36 @@ function checkStatements(
   returnType: ReturnType,
   diagnostics: DiagnosticCollector,
   loopDepth: number,
+  switchDepth: number,
 ): boolean {
   let exits = false;
   for (const s of stmts) {
     if (exits) {
       // Still typecheck unreachable code for errors, but don't apply further CFA
-      checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+      checkStatement(
+        s,
+        scope,
+        functions,
+        structs,
+        enums,
+        returnType,
+        diagnostics,
+        loopDepth,
+        switchDepth,
+      );
       continue;
     }
-    exits = checkStatement(s, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+    exits = checkStatement(
+      s,
+      scope,
+      functions,
+      structs,
+      enums,
+      returnType,
+      diagnostics,
+      loopDepth,
+      switchDepth,
+    );
   }
   return exits;
 }
@@ -3874,6 +4010,7 @@ function checkStatement(
   returnType: ReturnType,
   diagnostics: DiagnosticCollector,
   loopDepth: number,
+  switchDepth: number,
 ): boolean {
   switch (stmt.kind) {
     case "VariableDeclaration": {
@@ -3949,10 +4086,20 @@ function checkStatement(
         bindingType = annotated;
       }
 
-      scope.set(name.name, {
+      const binding: Binding = {
         type: bindingType,
         mutable: stmt.mutability === "let",
-      });
+      };
+      if (stmt.mutability === "const" && stmt.initializer) {
+        const constantExpr = constantInitializerExpr(stmt.initializer);
+        if (constantExpr) {
+          scope.set(name.name, { ...binding, constantExpr });
+        } else {
+          scope.set(name.name, binding);
+        }
+      } else {
+        scope.set(name.name, binding);
+      }
       return false;
     }
     case "AssignmentStatement": {
@@ -4053,6 +4200,7 @@ function checkStatement(
         returnType,
         diagnostics,
         loopDepth,
+        switchDepth,
       );
 
       let elseExits = false;
@@ -4068,6 +4216,7 @@ function checkStatement(
           returnType,
           diagnostics,
           loopDepth,
+          switchDepth,
         );
       } else {
         elseExits = checkStatement(
@@ -4079,6 +4228,7 @@ function checkStatement(
           returnType,
           diagnostics,
           loopDepth,
+          switchDepth,
         );
       }
 
@@ -4112,12 +4262,23 @@ function checkStatement(
         returnType,
         diagnostics,
         loopDepth + 1,
+        switchDepth,
       );
       return false;
     }
     case "ForStatement": {
       if (stmt.initializer) {
-        checkStatement(stmt.initializer, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+        checkStatement(
+          stmt.initializer,
+          scope,
+          functions,
+          structs,
+          enums,
+          returnType,
+          diagnostics,
+          loopDepth,
+          switchDepth,
+        );
       }
       if (stmt.condition) {
         const condType = checkExpression(stmt.condition, scope, functions, structs, enums, diagnostics);
@@ -4130,7 +4291,17 @@ function checkStatement(
         }
       }
       if (stmt.update) {
-        checkStatement(stmt.update, scope, functions, structs, enums, returnType, diagnostics, loopDepth);
+        checkStatement(
+          stmt.update,
+          scope,
+          functions,
+          structs,
+          enums,
+          returnType,
+          diagnostics,
+          loopDepth,
+          switchDepth,
+        );
       }
       checkStatements(
         stmt.body,
@@ -4141,6 +4312,7 @@ function checkStatement(
         returnType,
         diagnostics,
         loopDepth + 1,
+        switchDepth,
       );
       return false;
     }
@@ -4182,14 +4354,111 @@ function checkStatement(
         returnType,
         diagnostics,
         loopDepth + 1,
+        switchDepth,
       );
 
       scope.delete(stmt.name.name);
       return false;
     }
+    case "SwitchStatement": {
+      const discriminantType = checkExpression(
+        stmt.discriminant,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+      );
+      if (!discriminantType) {
+        return false;
+      }
+      if (!supportsEquality(discriminantType)) {
+        diagnostics.error(
+          `Switch expression type '${typeToString(discriminantType)}' does not support switch`,
+          stmt.discriminant.span,
+          "E0335",
+        );
+        return false;
+      }
+
+      const seenCases = new Set<string>();
+      let hasDefault = false;
+
+      for (const switchCase of stmt.cases) {
+        if (switchCase.isDefault) {
+          if (hasDefault) {
+            diagnostics.error("Duplicate default case", switchCase.span, "E0337");
+            continue;
+          }
+          hasDefault = true;
+          checkStatements(
+            switchCase.body,
+            scope,
+            functions,
+            structs,
+            enums,
+            returnType,
+            diagnostics,
+            loopDepth,
+            switchDepth + 1,
+          );
+          continue;
+        }
+
+        const test = switchCase.test;
+        if (!test) {
+          continue;
+        }
+
+        if (!resolveSwitchCaseConstantExpr(test, scope)) {
+          diagnostics.error(
+            "Switch case label must be a compile-time constant",
+            test.span,
+            "E0322",
+          );
+        }
+
+        const caseType = checkExpression(test, scope, functions, structs, enums, diagnostics);
+        if (caseType) {
+          if (!isAssignable(caseType, discriminantType)) {
+            diagnostics.error(
+              `Switch case type ${typeToString(caseType)} is not compatible with switch expression type ${typeToString(discriminantType)}`,
+              test.span,
+              "E0335",
+            );
+          }
+        }
+
+        const key = switchCaseKey(test, scope, enums);
+        if (key) {
+          if (seenCases.has(key)) {
+            diagnostics.error(
+              `Duplicate switch case: ${switchCaseDisplay(test)}`,
+              test.span,
+              "E0336",
+            );
+          } else {
+            seenCases.add(key);
+          }
+        }
+
+        checkStatements(
+          switchCase.body,
+          scope,
+          functions,
+          structs,
+          enums,
+          returnType,
+          diagnostics,
+          loopDepth,
+          switchDepth + 1,
+        );
+      }
+      return false;
+    }
     case "BreakStatement": {
-      if (loopDepth === 0) {
-        diagnostics.error("'break' used outside of a loop", stmt.span, "E0317");
+      if (loopDepth === 0 && switchDepth === 0) {
+        diagnostics.error("'break' used outside of a loop or switch", stmt.span, "E0317");
       }
       return true;
     }
@@ -5178,7 +5447,19 @@ function checkExpression(
       if (!objectType || !indexType) {
         return null;
       }
-      if (isMapType(objectType) || (isObjectType(objectType) && objectType.indexType)) {
+      let resolvedObjectType: ValueType = objectType;
+      if (expr.optional) {
+        if (objectType === "null") {
+          return "null";
+        }
+        if (isUnionType(objectType) && includesNull(objectType)) {
+          resolvedObjectType = stripNull(objectType) as ValueType;
+        }
+      }
+      const wrapOptional = (result: ValueType): ValueType =>
+        expr.optional ? (makeUnion([result, "null"]) as ValueType) : result;
+
+      if (isMapType(resolvedObjectType) || (isObjectType(resolvedObjectType) && resolvedObjectType.indexType)) {
         if (indexType !== "string" && !(isLiteralType(indexType) && indexType.literalKind === "string")) {
           diagnostics.error(
             `Map index must be a string, got '${typeToString(indexType)}'`,
@@ -5187,9 +5468,13 @@ function checkExpression(
           );
           return null;
         }
-        return (isMapType(objectType) ? objectType.valueType : objectType.indexType) as ValueType;
+        return wrapOptional(
+          (isMapType(resolvedObjectType)
+            ? resolvedObjectType.valueType
+            : resolvedObjectType.indexType) as ValueType,
+        );
       }
-      if (isTupleType(objectType)) {
+      if (isTupleType(resolvedObjectType)) {
         if (!isIntegerType(indexType)) {
           diagnostics.error(
             `Tuple index must be an integer, got '${typeToString(indexType)}'`,
@@ -5200,21 +5485,21 @@ function checkExpression(
         }
         const constIndex = constantIndexValue(expr.index);
         if (constIndex !== null) {
-          if (constIndex < 0 || constIndex >= objectType.elements.length) {
+          if (constIndex < 0 || constIndex >= resolvedObjectType.elements.length) {
             diagnostics.error(
-              `Tuple index ${constIndex} is out of bounds.\nTuple contains ${objectType.elements.length} elements.`,
+              `Tuple index ${constIndex} is out of bounds.\nTuple contains ${resolvedObjectType.elements.length} elements.`,
               expr.index.span,
               "E0332",
             );
             return null;
           }
-          return objectType.elements[constIndex]!;
+          return wrapOptional(resolvedObjectType.elements[constIndex]!);
         }
-        return makeUnion(objectType.elements) as ValueType;
+        return wrapOptional(makeUnion(resolvedObjectType.elements) as ValueType);
       }
-      if (!isArrayType(objectType)) {
+      if (!isArrayType(resolvedObjectType)) {
         diagnostics.error(
-          `Cannot index into type '${typeToString(objectType)}'`,
+          `Cannot index into type '${typeToString(resolvedObjectType)}'`,
           expr.object.span,
           "E0319",
         );
@@ -5228,7 +5513,7 @@ function checkExpression(
         );
         return null;
       }
-      return objectType.element;
+      return wrapOptional(resolvedObjectType.element);
     }
     case "MemberExpression": {
       // ns.Enum.Variant
@@ -5325,20 +5610,30 @@ function checkExpression(
       if (!objectType) {
         return null;
       }
+      let resolvedObjectType: ValueType = objectType;
       if (isUnionType(objectType) || objectType === "null") {
-        const typeStr = typeToString(objectType);
-        const mayBeNull = includesNull(objectType) || objectType === "null";
-        let message = `Cannot access property '${expr.property.name}' on type '${typeStr}'.`;
-        if (mayBeNull && expr.object.kind === "Identifier") {
-          message += `\n'${expr.object.name}' may be null.`;
-        } else if (mayBeNull) {
-          message += `\nValue may be null.`;
+        if (expr.optional) {
+          if (objectType === "null") {
+            return "null";
+          }
+          resolvedObjectType = stripNull(objectType) as ValueType;
+        } else {
+          const typeStr = typeToString(objectType);
+          const mayBeNull = includesNull(objectType) || objectType === "null";
+          let message = `Cannot access property '${expr.property.name}' on type '${typeStr}'.`;
+          if (mayBeNull && expr.object.kind === "Identifier") {
+            message += `\n'${expr.object.name}' may be null.`;
+          } else if (mayBeNull) {
+            message += `\nValue may be null.`;
+          }
+          diagnostics.error(message, expr.span, "E0397");
+          return null;
         }
-        diagnostics.error(message, expr.span, "E0397");
-        return null;
       }
-      if (isObjectType(objectType)) {
-        const field = objectType.fields.find((f) => f.name === expr.property.name);
+      const wrapOptionalMember = (result: ValueType): ValueType =>
+        expr.optional ? (makeUnion([result, "null"]) as ValueType) : result;
+      if (isObjectType(resolvedObjectType)) {
+        const field = resolvedObjectType.fields.find((f) => f.name === expr.property.name);
         if (!field) {
           diagnostics.error(
             `Unknown field '${expr.property.name}' on object type`,
@@ -5347,14 +5642,14 @@ function checkExpression(
           );
           return null;
         }
-        return field.type as ValueType;
+        return wrapOptionalMember(field.type as ValueType);
       }
-      if (isStructType(objectType)) {
+      if (isStructType(resolvedObjectType)) {
         const def =
-          findStructByTypeName(structs, objectType.name) ??
-          findStructInNamespaces(objectType.name);
+          findStructByTypeName(structs, resolvedObjectType.name) ??
+          findStructInNamespaces(resolvedObjectType.name);
         if (!def) {
-          diagnostics.error(`Unknown struct '${objectType.name}'`, expr.object.span, "E0104");
+          diagnostics.error(`Unknown struct '${resolvedObjectType.name}'`, expr.object.span, "E0104");
           return null;
         }
         const field = def.fields.find((f) => f.name === expr.property.name);
@@ -5366,12 +5661,12 @@ function checkExpression(
           );
           return null;
         }
-        return field.type;
+        return wrapOptionalMember(field.type);
       }
-      if (isClassType(objectType)) {
-        const def = findClassByMangled(objectType.name);
+      if (isClassType(resolvedObjectType)) {
+        const def = findClassByMangled(resolvedObjectType.name);
         if (!def) {
-          diagnostics.error(`Unknown class '${objectType.name}'`, expr.object.span, "E0104");
+          diagnostics.error(`Unknown class '${resolvedObjectType.name}'`, expr.object.span, "E0104");
           return null;
         }
         const field = def.instanceFields.find((f) => f.name === expr.property.name);
@@ -5388,9 +5683,9 @@ function checkExpression(
         ) {
           return null;
         }
-        return field.type;
+        return wrapOptionalMember(field.type);
       }
-      if (isInterfaceType(objectType)) {
+      if (isInterfaceType(resolvedObjectType)) {
         diagnostics.error(
           `Interfaces have no fields; use a method call`,
           expr.property.span,
@@ -5399,14 +5694,14 @@ function checkExpression(
         return null;
       }
       if (expr.property.name === "length") {
-        if (objectType === "string") {
-          return "i32";
+        if (resolvedObjectType === "string") {
+          return wrapOptionalMember("i32");
         }
-        if (isArrayType(objectType) || isTupleType(objectType)) {
-          return "i32";
+        if (isArrayType(resolvedObjectType) || isTupleType(resolvedObjectType)) {
+          return wrapOptionalMember("i32");
         }
         diagnostics.error(
-          `Property 'length' is only available on arrays, tuples, and strings, got '${typeToString(objectType)}'`,
+          `Property 'length' is only available on arrays, tuples, and strings, got '${typeToString(resolvedObjectType)}'`,
           expr.span,
           "E0323",
         );
@@ -5651,6 +5946,40 @@ function checkExpression(
       // Namespace-imported functions are only available as ns.fn member access.
       diagnostics.error(`Undefined variable '${expr.name}'`, expr.span, "E0304");
       return null;
+    }
+    case "NonNullExpression": {
+      const operandType = checkExpression(
+        expr.expression,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+      );
+      if (!operandType) {
+        return null;
+      }
+      if (!includesNull(operandType) && operandType !== "null") {
+        diagnostics.error(
+          `Non-null assertion '!' has no effect on non-nullable type '${typeToString(operandType)}'`,
+          expr.span,
+          "E0399",
+        );
+      }
+      return stripNull(operandType) as ValueType;
+    }
+    case "NullCoalescingExpression": {
+      const leftType = checkExpression(expr.left, scope, functions, structs, enums, diagnostics);
+      const rightType = checkExpression(expr.right, scope, functions, structs, enums, diagnostics);
+      if (!leftType || !rightType) {
+        return null;
+      }
+      const inner = stripNull(leftType) as ValueType;
+      if (!isAssignable(rightType, inner)) {
+        diagnostics.error(typeMismatchMessage(inner, rightType), expr.span, "E0303");
+        return null;
+      }
+      return inner as ValueType;
     }
     case "UnaryExpression": {
       const operand = checkExpression(expr.operand, scope, functions, structs, enums, diagnostics);
@@ -6252,6 +6581,7 @@ function checkLambdaExpression(
       declaredReturn,
       diagnostics,
       0,
+      0,
     );
     for (const name of blockScope.keys()) {
       if (!scope.has(name) && !expr.params.some((p) => p.name.name === name)) {
@@ -6326,6 +6656,13 @@ function collectLambdaCaptures(
         }
         break;
       case "BinaryExpression":
+        walkExpr(e.left);
+        walkExpr(e.right);
+        break;
+      case "NonNullExpression":
+        walkExpr(e.expression);
+        break;
+      case "NullCoalescingExpression":
         walkExpr(e.left);
         walkExpr(e.right);
         break;
@@ -6411,6 +6748,15 @@ function collectLambdaCaptures(
         walkExpr(s.iterable);
         localBound.add(s.name.name);
         for (const st of s.body) walkStmt(st, localBound);
+        break;
+      case "SwitchStatement":
+        walkExpr(s.discriminant);
+        for (const switchCase of s.cases) {
+          if (switchCase.test) {
+            walkExpr(switchCase.test);
+          }
+          for (const st of switchCase.body) walkStmt(st, localBound);
+        }
         break;
       default:
         break;
@@ -6502,11 +6848,28 @@ function checkMethodCall(
     return null;
   }
 
-  if (isStructType(objectType)) {
+  let resolvedObjectType: ValueType = objectType;
+  if (expr.optional) {
+    if (objectType === "null") {
+      return "null";
+    }
+    if (isUnionType(objectType) && includesNull(objectType)) {
+      resolvedObjectType = stripNull(objectType) as ValueType;
+    }
+  }
+
+  const wrapOptionalCall = (result: ValueType | null): ValueType | null => {
+    if (!result || !expr.optional) {
+      return result;
+    }
+    return makeUnion([result, "null"]) as ValueType;
+  };
+
+  if (isStructType(resolvedObjectType)) {
     const def =
-      findStructByTypeName(structs, objectType.name) ?? findStructInNamespaces(objectType.name);
+      findStructByTypeName(structs, resolvedObjectType.name) ?? findStructInNamespaces(resolvedObjectType.name);
     if (!def) {
-      diagnostics.error(`Unknown struct '${objectType.name}'`, callee.object.span, "E0104");
+      diagnostics.error(`Unknown struct '${resolvedObjectType.name}'`, callee.object.span, "E0104");
       return null;
     }
     const method = def.methods.find((m) => m.name === callee.property.name);
@@ -6518,25 +6881,27 @@ function checkMethodCall(
       );
       return null;
     }
-    return checkMethodArgs(
-      method.name,
-      method.params,
-      method.decl.params,
-      method.returnType,
-      expr,
-      scope,
-      functions,
-      structs,
-      enums,
-      diagnostics,
-      allowVoidCall,
+    return wrapOptionalCall(
+      checkMethodArgs(
+        method.name,
+        method.params,
+        method.decl.params,
+        method.returnType,
+        expr,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+        allowVoidCall,
+      ),
     );
   }
 
-  if (isClassType(objectType)) {
-    const def = findClassByMangled(objectType.name);
+  if (isClassType(resolvedObjectType)) {
+    const def = findClassByMangled(resolvedObjectType.name);
     if (!def) {
-      diagnostics.error(`Unknown class '${objectType.name}'`, callee.object.span, "E0104");
+      diagnostics.error(`Unknown class '${resolvedObjectType.name}'`, callee.object.span, "E0104");
       return null;
     }
     let method = def.instanceMethods.find((m) => m.name === callee.property.name);
@@ -6550,16 +6915,18 @@ function checkMethodCall(
           m.typeParams.length > 0,
       );
       if (genericMethod) {
-        return checkGenericMethodCall(
-          expr,
-          def,
-          genericMethod,
-          scope,
-          functions,
-          structs,
-          enums,
-          diagnostics,
-          allowVoidCall,
+        return wrapOptionalCall(
+          checkGenericMethodCall(
+            expr,
+            def,
+            genericMethod,
+            scope,
+            functions,
+            structs,
+            enums,
+            diagnostics,
+            allowVoidCall,
+          ),
         );
       }
     }
@@ -6576,25 +6943,27 @@ function checkMethodCall(
     ) {
       return null;
     }
-    return checkMethodArgs(
-      method.name,
-      method.params,
-      method.decl?.params ?? null,
-      method.returnType,
-      expr,
-      scope,
-      functions,
-      structs,
-      enums,
-      diagnostics,
-      allowVoidCall,
+    return wrapOptionalCall(
+      checkMethodArgs(
+        method.name,
+        method.params,
+        method.decl?.params ?? null,
+        method.returnType,
+        expr,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+        allowVoidCall,
+      ),
     );
   }
 
-  if (isInterfaceType(objectType)) {
-    const def = findInterfaceByMangled(objectType.name);
+  if (isInterfaceType(resolvedObjectType)) {
+    const def = findInterfaceByMangled(resolvedObjectType.name);
     if (!def) {
-      diagnostics.error(`Unknown interface '${objectType.name}'`, callee.object.span, "E0104");
+      diagnostics.error(`Unknown interface '${resolvedObjectType.name}'`, callee.object.span, "E0104");
       return null;
     }
     const method = def.methods.find((m) => m.name === callee.property.name);
@@ -6606,27 +6975,29 @@ function checkMethodCall(
       );
       return null;
     }
-    return checkMethodArgs(
-      method.name,
-      method.params,
-      findInterfaceMethodParams(def, method.name),
-      method.returnType,
-      expr,
-      scope,
-      functions,
-      structs,
-      enums,
-      diagnostics,
-      allowVoidCall,
+    return wrapOptionalCall(
+      checkMethodArgs(
+        method.name,
+        method.params,
+        findInterfaceMethodParams(def, method.name),
+        method.returnType,
+        expr,
+        scope,
+        functions,
+        structs,
+        enums,
+        diagnostics,
+        allowVoidCall,
+      ),
     );
   }
 
-  if (typeof objectType === "object" && objectType.kind === "typeParam") {
+  if (typeof resolvedObjectType === "object" && resolvedObjectType.kind === "typeParam") {
     const arms =
-      objectType.constraintArms.length > 0
-        ? objectType.constraintArms
-        : objectType.constraintName && objectType.constraintKind
-          ? [{ kind: objectType.constraintKind, name: objectType.constraintName }]
+      resolvedObjectType.constraintArms.length > 0
+        ? resolvedObjectType.constraintArms
+        : resolvedObjectType.constraintName && resolvedObjectType.constraintKind
+          ? [{ kind: resolvedObjectType.constraintKind, name: resolvedObjectType.constraintName }]
           : [];
     if (arms.length > 0) {
       for (const arm of arms) {
@@ -6641,22 +7012,24 @@ function checkMethodCall(
         if (!method) {
           continue;
         }
-        return checkMethodArgs(
-          method.name,
-          method.params,
-          findInterfaceMethodParams(def, method.name),
-          method.returnType,
-          expr,
-          scope,
-          functions,
-          structs,
-          enums,
-          diagnostics,
-          allowVoidCall,
+        return wrapOptionalCall(
+          checkMethodArgs(
+            method.name,
+            method.params,
+            findInterfaceMethodParams(def, method.name),
+            method.returnType,
+            expr,
+            scope,
+            functions,
+            structs,
+            enums,
+            diagnostics,
+            allowVoidCall,
+          ),
         );
       }
       diagnostics.error(
-        `Unknown method '${callee.property.name}' on constraint '${typeToString(objectType)}'`,
+        `Unknown method '${callee.property.name}' on constraint '${typeToString(resolvedObjectType)}'`,
         callee.property.span,
         "E0324",
       );
@@ -6664,9 +7037,9 @@ function checkMethodCall(
     }
   }
 
-  if (!isArrayType(objectType)) {
+  if (!isArrayType(resolvedObjectType)) {
     diagnostics.error(
-      `Methods are not available on type '${typeToString(objectType)}'`,
+      `Methods are not available on type '${typeToString(resolvedObjectType)}'`,
       callee.object.span,
       "E0326",
     );
@@ -6674,7 +7047,7 @@ function checkMethodCall(
   }
 
   const method = callee.property.name;
-  const elementType = objectType.element;
+  const elementType = resolvedObjectType.element;
 
   switch (method) {
     case "push": {
@@ -6712,7 +7085,7 @@ function checkMethodCall(
         );
         return null;
       }
-      return elementType;
+      return wrapOptionalCall(elementType);
     }
     case "includes": {
       if (!rejectNamedArgsOnFunctionValue(expr.args, diagnostics)) {

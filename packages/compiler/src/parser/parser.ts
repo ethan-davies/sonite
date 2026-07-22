@@ -48,6 +48,8 @@ import type {
   NamedArgument,
   NamedType,
   NewExpression,
+  NonNullExpression,
+  NullCoalescingExpression,
   NullLiteral,
   ObjectIndexSignature,
   ObjectType,
@@ -63,6 +65,8 @@ import type {
   StructFieldInit,
   StructLiteral,
   StructMethod,
+  SwitchCase,
+  SwitchStatement,
   SuperExpression,
   ThisExpression,
   TopLevelDeclaration,
@@ -1320,6 +1324,10 @@ export class Parser {
       return this.parseForStatement();
     }
 
+    if (this.check(TokenKind.Switch)) {
+      return this.parseSwitchStatement();
+    }
+
     if (this.check(TokenKind.Break)) {
       return this.parseBreakStatement();
     }
@@ -1645,6 +1653,111 @@ export class Parser {
     };
   }
 
+  private parseSwitchStatement(): SwitchStatement | null {
+    const start = this.peek().span.start;
+    this.advance(); // switch
+
+    if (!this.expect(TokenKind.LParen, "Expected '(' after 'switch'")) {
+      return null;
+    }
+
+    const discriminant = this.parseExpression();
+    if (!discriminant) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.RParen, "Expected ')' after switch expression")) {
+      return null;
+    }
+
+    if (!this.expect(TokenKind.LBrace, "Expected '{' after switch")) {
+      return null;
+    }
+
+    const cases: SwitchCase[] = [];
+    let hasDefault = false;
+
+    while (!this.check(TokenKind.RBrace) && !this.isAtEnd()) {
+      if (this.check(TokenKind.Case)) {
+        const caseStart = this.peek().span.start;
+        this.advance(); // case
+        const test = this.parseExpression();
+        if (!test) {
+          return null;
+        }
+        if (!this.expect(TokenKind.Colon, "Expected ':' after case expression")) {
+          return null;
+        }
+        const body = this.parseSwitchCaseBody();
+        const caseEnd =
+          body.length > 0 ? body[body.length - 1]!.span.end : this.peek().span.start;
+        cases.push({
+          kind: "SwitchCase",
+          isDefault: false,
+          test,
+          body,
+          span: { start: caseStart, end: caseEnd },
+        });
+      } else if (this.check(TokenKind.Default)) {
+        const defaultStart = this.peek().span.start;
+        if (hasDefault) {
+          this.diagnostics.error("Duplicate default case", this.peek().span, "E0337");
+          return null;
+        }
+        hasDefault = true;
+        this.advance(); // default
+        if (!this.expect(TokenKind.Colon, "Expected ':' after 'default'")) {
+          return null;
+        }
+        const body = this.parseSwitchCaseBody();
+        const caseEnd =
+          body.length > 0 ? body[body.length - 1]!.span.end : this.peek().span.start;
+        cases.push({
+          kind: "SwitchCase",
+          isDefault: true,
+          test: null,
+          body,
+          span: { start: defaultStart, end: caseEnd },
+        });
+      } else {
+        this.diagnostics.error(
+          "Expected 'case' or 'default' in switch body",
+          this.peek().span,
+          "E0102",
+        );
+        this.synchronizeStatement();
+      }
+    }
+
+    const rbrace = this.expect(TokenKind.RBrace, "Expected '}' after switch body");
+    const end = rbrace?.span.end ?? this.peek().span.end;
+
+    return {
+      kind: "SwitchStatement",
+      discriminant,
+      cases,
+      span: { start, end },
+    };
+  }
+
+  private parseSwitchCaseBody(): Statement[] {
+    const statements: Statement[] = [];
+    while (
+      !this.check(TokenKind.Case) &&
+      !this.check(TokenKind.Default) &&
+      !this.check(TokenKind.RBrace) &&
+      !this.isAtEnd()
+    ) {
+      const stmt = this.parseStatement();
+      if (stmt) {
+        statements.push(stmt);
+      } else {
+        this.synchronizeStatement();
+      }
+    }
+    return statements;
+  }
+
   /** Parse `elseif (cond) { ... }` as an IfStatement, chaining further elseif/else. */
   private parseElseIfChain(): IfStatement | null {
     const start = this.peek().span.start;
@@ -1873,6 +1986,7 @@ export class Parser {
       kind: "IndexExpression",
       object,
       index,
+      optional: false,
       span: { start: object.span.start, end: rbracket.span.end },
     };
 
@@ -1930,6 +2044,7 @@ export class Parser {
         kind: "MemberExpression",
         object,
         property,
+        optional: false,
         span: { start: object.span.start, end: property.span.end },
       };
       object = target;
@@ -2089,14 +2204,14 @@ export class Parser {
   }
 
   private parseOr(): Expression | null {
-    let left = this.parseAnd();
+    let left = this.parseNullishCoalesce();
     if (!left) {
       return null;
     }
 
     while (this.check(TokenKind.PipePipe)) {
       const opToken = this.advance();
-      const right = this.parseAnd();
+      const right = this.parseNullishCoalesce();
       if (!right) {
         return null;
       }
@@ -2108,6 +2223,30 @@ export class Parser {
         span: { start: left.span.start, end: right.span.end },
       };
       left = binary;
+    }
+
+    return left;
+  }
+
+  private parseNullishCoalesce(): Expression | null {
+    let left = this.parseAnd();
+    if (!left) {
+      return null;
+    }
+
+    while (this.check(TokenKind.QuestionQuestion)) {
+      this.advance();
+      const right = this.parseAnd();
+      if (!right) {
+        return null;
+      }
+      const coalesce: NullCoalescingExpression = {
+        kind: "NullCoalescingExpression",
+        left,
+        right,
+        span: { start: left.span.start, end: right.span.end },
+      };
+      left = coalesce;
     }
 
     return left;
@@ -2489,6 +2628,78 @@ export class Parser {
     let current = expr;
 
     for (;;) {
+      if (this.check(TokenKind.QuestionDot)) {
+        this.advance();
+        if (this.check(TokenKind.LBracket)) {
+          this.advance();
+          const index = this.parseExpression();
+          if (!index) {
+            return null;
+          }
+          const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after optional index");
+          if (!rbracket) {
+            return null;
+          }
+          current = {
+            kind: "IndexExpression",
+            object: current,
+            index,
+            optional: true,
+            span: { start: current.span.start, end: rbracket.span.end },
+          };
+          continue;
+        }
+
+        const propToken = this.expect(TokenKind.Identifier, "Expected property name after '?.'");
+        if (!propToken) {
+          return null;
+        }
+        const property: Identifier = {
+          kind: "Identifier",
+          name: propToken.lexeme,
+          span: propToken.span,
+        };
+        const member: MemberExpression = {
+          kind: "MemberExpression",
+          object: current,
+          property,
+          optional: true,
+          span: { start: current.span.start, end: property.span.end },
+        };
+
+        if (this.check(TokenKind.LParen) || this.looksLikeTypeArgsThen(TokenKind.LParen)) {
+          const call = this.parseCallArgs(member, member.span.start, true);
+          if (!call) {
+            return null;
+          }
+          current = call;
+        } else {
+          current = member;
+        }
+        continue;
+      }
+
+      if (this.check(TokenKind.Question) && this.checkNext(TokenKind.LBracket)) {
+        this.advance(); // ?
+        this.advance(); // [
+        const index = this.parseExpression();
+        if (!index) {
+          return null;
+        }
+        const rbracket = this.expect(TokenKind.RBracket, "Expected ']' after optional index");
+        if (!rbracket) {
+          return null;
+        }
+        current = {
+          kind: "IndexExpression",
+          object: current,
+          index,
+          optional: true,
+          span: { start: current.span.start, end: rbracket.span.end },
+        };
+        continue;
+      }
+
       if (this.check(TokenKind.LBracket)) {
         this.advance();
         const index = this.parseExpression();
@@ -2503,6 +2714,7 @@ export class Parser {
           kind: "IndexExpression",
           object: current,
           index,
+          optional: false,
           span: { start: current.span.start, end: rbracket.span.end },
         };
         continue;
@@ -2523,6 +2735,7 @@ export class Parser {
           kind: "MemberExpression",
           object: current,
           property,
+          optional: false,
           span: { start: current.span.start, end: property.span.end },
         };
 
@@ -2544,6 +2757,17 @@ export class Parser {
           return null;
         }
         current = call;
+        continue;
+      }
+
+      if (this.check(TokenKind.Bang)) {
+        this.advance();
+        const nonNull: NonNullExpression = {
+          kind: "NonNullExpression",
+          expression: current,
+          span: { start: current.span.start, end: this.previous().span.end },
+        };
+        current = nonNull;
         continue;
       }
 
@@ -2710,6 +2934,7 @@ export class Parser {
   private parseCallArgs(
     callee: Expression,
     start = callee.span.start,
+    optional = false,
   ): CallExpression | null {
     const typeArgs = this.parseTypeArgumentListOptional(TokenKind.LParen);
     if (typeArgs === null) {
@@ -2730,6 +2955,7 @@ export class Parser {
       callee,
       typeArgs,
       args: parsed.args,
+      optional,
       span: { start, end: parsed.end },
     };
   }
@@ -3135,6 +3361,7 @@ export class Parser {
         callee: expr as Identifier,
         typeArgs: [],
         args: parsed.args,
+        optional: false,
         span: { start: nameToken.span.start, end: parsed.end },
       };
     }

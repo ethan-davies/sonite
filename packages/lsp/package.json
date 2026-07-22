@@ -1,0 +1,40 @@
+{
+  "name": "@typescript-native/lsp",
+  "version": "0.0.0",
+  "description": "Language server for TypeScript Native (.tsn)",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "tsn-lsp": "./dist/server.js"
+  },
+  "main": "./dist/server.js",
+  "exports": {
+    ".": "./dist/server.js",
+    "./dist/server.js": "./dist/server.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "tsx src/server.ts --stdio"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@typescript-native/compiler": "workspace:*",
+    "@typescript-native/std": "workspace:*",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

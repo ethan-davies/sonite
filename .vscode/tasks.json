@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build-vscode-extension",
+      "type": "shell",
+      "command": "pnpm --filter @typescript-native/compiler build && pnpm --filter @typescript-native/lsp build && pnpm --filter typescript-native-vscode build",
+      "group": "build",
+      "problemMatcher": "$tsc",
+      "presentation": {
+        "reveal": "silent"
+      }
+    }
+  ]
+}

@@ -11,7 +11,7 @@
     "clean": "pnpm -r run clean",
     "dev": "pnpm --filter @typescript-native/compiler build && pnpm --filter @typescript-native/runtime build && pnpm --filter @typescript-native/std build && tsx packages/cli/src/cli.ts",
     "typecheck": "pnpm --filter @typescript-native/compiler build && pnpm -r run typecheck",
-    "test": "pnpm --filter @typescript-native/compiler test && pnpm --filter @typescript-native/runtime test && pnpm --filter typescript-native-vscode test",
+    "test": "pnpm --filter @typescript-native/compiler test && pnpm --filter @typescript-native/runtime test && pnpm --filter @typescript-native/lsp test && pnpm --filter typescript-native-vscode test",
     "test:watch": "pnpm --filter @typescript-native/compiler test:watch",
     "test:coverage": "pnpm --filter @typescript-native/compiler test:coverage"
   },

@@ -7,7 +7,7 @@ import type { ResolvedModule } from "./modules/resolve.js";
  * For multi-module units, only the entry module may define `main`.
  */
 export function validate(program: Program, diagnostics: DiagnosticCollector): void {
-  validateModule(program, diagnostics, true);
+  validateModule(program, diagnostics, "entry");
 }
 
 export function validateModules(
@@ -15,14 +15,30 @@ export function validateModules(
   diagnostics: DiagnosticCollector,
 ): void {
   for (const mod of modules) {
-    validateModule(mod.ast, diagnostics, mod.isEntry);
+    diagnostics.setFile(mod.path);
+    validateModule(mod.ast, diagnostics, mod.isEntry ? "entry" : "dependency");
   }
+  diagnostics.clearFile();
 }
+
+/** Like validateModules, but the graph root need not define `main` (IDE analyze). */
+export function validateModulesLoose(
+  modules: readonly ResolvedModule[],
+  diagnostics: DiagnosticCollector,
+): void {
+  for (const mod of modules) {
+    diagnostics.setFile(mod.path);
+    validateModule(mod.ast, diagnostics, mod.isEntry ? "loose" : "dependency");
+  }
+  diagnostics.clearFile();
+}
+
+type ValidateMode = "entry" | "dependency" | "loose";
 
 function validateModule(
   program: Program,
   diagnostics: DiagnosticCollector,
-  isEntry: boolean,
+  mode: ValidateMode,
 ): void {
   const functions = program.body.filter(
     (decl): decl is FunctionDeclaration => decl.kind === "FunctionDeclaration",
@@ -30,7 +46,36 @@ function validateModule(
 
   const mains = functions.filter((fn) => fn.name.name === "main");
 
-  if (isEntry) {
+  if (mode === "loose") {
+    if (mains.length > 1) {
+      const extra = mains[1];
+      diagnostics.error(
+        "Only one 'main' function is allowed",
+        extra?.name.span ?? program.span,
+        "E0201",
+      );
+    }
+    const main = mains[0];
+    if (main) {
+      if (main.params.length > 0) {
+        diagnostics.error(
+          "Entry function 'main' must not take parameters",
+          main.params[0]?.span ?? main.name.span,
+          "E0206",
+        );
+      }
+      if (main.returnType.kind !== "PrimitiveType" || main.returnType.name !== "void") {
+        diagnostics.error(
+          "Entry function 'main' must return 'void'",
+          main.returnType.span,
+          "E0205",
+        );
+      }
+    }
+    return;
+  }
+
+  if (mode === "entry") {
     if (functions.length === 0) {
       diagnostics.error("Program must define a main() function", program.span, "E0200");
       return;

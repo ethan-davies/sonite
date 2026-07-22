@@ -189,6 +189,7 @@ export function resolveModules(
       return true;
     }
     if (visiting.has(absolutePath)) {
+      diagnostics.setFile(absolutePath);
       diagnostics.error(
         `Circular import detected involving '${absolutePath}'`,
         { start: { line: 1, column: 1, offset: 0 }, end: { line: 1, column: 1, offset: 0 } },
@@ -198,6 +199,7 @@ export function resolveModules(
     }
 
     visiting.add(absolutePath);
+    diagnostics.setFile(absolutePath);
 
     const isStdModule = moduleIdForStdPath(absolutePath) !== null;
     let source: string;
@@ -214,13 +216,10 @@ export function resolveModules(
       return false;
     }
 
-    const fileName = absolutePath.replace(/\\/g, "/").split("/").pop() ?? absolutePath;
     const lexer = new Lexer(source, diagnostics);
     const tokens = lexer.tokenize();
     const parser = new Parser(tokens, diagnostics);
     const ast = parser.parse();
-
-    void fileName;
 
     const importDecls = ast.body.filter(
       (d): d is ImportDeclaration => d.kind === "ImportDeclaration",
@@ -315,6 +314,7 @@ export function resolveModules(
   }
 
   const success = visit(absoluteEntry, true) && !diagnostics.hasErrors;
+  diagnostics.clearFile();
 
   const modules = order
     .map((p) => parsed.get(p)!)

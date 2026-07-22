@@ -18,7 +18,14 @@ import type {
   TypeParameter,
   Visibility,
 } from "./ast/nodes.js";
-import type { DiagnosticCollector, SourceSpan } from "./diagnostics/diagnostic.js";
+import type { SourceSpan } from "./diagnostics/diagnostic.js";
+import { DiagnosticCollector } from "./diagnostics/diagnostic.js";
+import {
+  SemanticCollector,
+  emptySemanticModel,
+  type SemanticModel,
+  type ScopeBindingInfo,
+} from "./analysis/semantic.js";
 import {
   InstantiationCollector,
   checkTypeArgArity,
@@ -34,7 +41,7 @@ import {
 import { buildSubst, specializeStructDecl, substituteAnnotation, substituteExpression } from "./generics/substitute.js";
 import type { TypecheckInstantiations } from "./generics/monomorphize.js";
 import { mangleSymbol } from "./modules/mangle.js";
-import type { ResolvedModule } from "./modules/resolve.js";
+import type { ModuleImportBinding, ResolvedModule } from "./modules/resolve.js";
 import {
   BUILTIN_ERROR_LOCAL_NAME,
   BUILTIN_ERROR_MANGLED,
@@ -257,6 +264,10 @@ interface Binding {
   readonly mutable: boolean;
   /** For const bindings initialized with a compile-time constant expression */
   readonly constantExpr?: Expression;
+  readonly defSpan?: SourceSpan;
+  readonly defFile?: string;
+  /** How this binding was introduced (for completion icons). */
+  readonly bindingKind?: "parameter" | "let" | "const";
 }
 
 interface FunctionSig {
@@ -268,6 +279,7 @@ interface FunctionSig {
   readonly exported: boolean;
   readonly isExtern: boolean;
   readonly isExtension: boolean;
+  readonly modulePath: string;
 }
 
 export interface ModuleNamespace {
@@ -356,6 +368,8 @@ let instantiationCollector: InstantiationCollector = new InstantiationCollector(
 /** Module currently being checked (for instantiation records). */
 let activeModulePath = "";
 let activeModuleId = "";
+/** Optional semantic collector for IDE queries (LSP). */
+let activeSemantic: SemanticCollector | null = null;
 /** Templates for the active module. */
 let activeGenericStructs: Map<string, GenericStructTemplate> = new Map();
 let activeGenericClasses: Map<string, GenericClassTemplate> = new Map();
@@ -375,7 +389,7 @@ let specializedFunctions: Map<string, FunctionSig> = new Map();
 export function typecheck(
   program: Program,
   diagnostics: DiagnosticCollector,
-): TypecheckInstantiations {
+): TypecheckResult {
   for (const decl of program.body) {
     if (decl.kind === "ImportDeclaration") {
       diagnostics.error(
@@ -383,7 +397,10 @@ export function typecheck(
         decl.span,
         "E0400",
       );
-      return new InstantiationCollector().snapshot();
+      return {
+        instantiations: new InstantiationCollector().snapshot(),
+        semantic: emptySemanticModel(),
+      };
     }
   }
 
@@ -402,21 +419,46 @@ export function typecheck(
   );
 }
 
+export interface TypecheckResult {
+  readonly instantiations: TypecheckInstantiations;
+  readonly semantic: SemanticModel;
+}
+
 /**
  * Type-check a multi-module compilation unit.
  */
 export function typecheckModules(
   modules: readonly ResolvedModule[],
   diagnostics: DiagnosticCollector,
-): TypecheckInstantiations {
+): TypecheckResult {
   instantiationCollector = new InstantiationCollector();
   allModuleSymbols = new Map();
   const byPath = new Map<string, ModuleSymbols>();
+  const semantic = new SemanticCollector();
+  activeSemantic = semantic;
 
   for (const mod of modules) {
+    diagnostics.setFile(mod.path);
     const symbols = collectModuleSymbols(mod, diagnostics);
     byPath.set(mod.path, symbols);
     allModuleSymbols.set(mod.path, symbols);
+  }
+
+  // Index IDE symbols only after every module is in allModuleSymbols so named
+  // imports can resolve to the correct CompletionItemKind (not "variable").
+  if (activeSemantic) {
+    for (const mod of modules) {
+      const local = byPath.get(mod.path)!;
+      indexModuleSymbols(
+        mod,
+        local.functions,
+        local.structs,
+        local.enums,
+        local.classes,
+        local.interfaces,
+        local.typeAliases,
+      );
+    }
   }
 
   classesByMangled = new Map();
@@ -430,11 +472,11 @@ export function typecheckModules(
     }
   }
 
-  if (diagnostics.hasErrors) {
-    return instantiationCollector.snapshot();
-  }
+  // Keep going for IDE analysis even when the parser already reported errors.
+  // Symbol tables from collectModuleSymbols are still useful for completions.
 
   for (const mod of modules) {
+    diagnostics.setFile(mod.path);
     const local = byPath.get(mod.path)!;
     const namespaces = new Map<string, ModuleNamespace>();
 
@@ -465,6 +507,7 @@ export function typecheckModules(
       ...local.genericTypeAliases.keys(),
     ]);
 
+    const errorsBeforeImports = diagnostics.diagnostics.length;
     for (const binding of mod.imports) {
       const imported = byPath.get(binding.modulePath);
       if (!imported) {
@@ -532,7 +575,8 @@ export function typecheckModules(
       localNames.add(binding.localName);
     }
 
-    if (diagnostics.hasErrors) {
+    // Only skip body checking when imports for this module failed (not prior parse errors).
+    if (diagnostics.diagnostics.length > errorsBeforeImports) {
       continue;
     }
 
@@ -555,6 +599,7 @@ export function typecheckModules(
     aliasExpandStack = [];
     activeFunctions = functions;
     activeExtensions = collectExtensionsFromMaps(functions, genericFunctions);
+    indexMembersByType(structs, classes, enums, functions, genericFunctions);
 
     for (const decl of mod.ast.body) {
       if (decl.kind === "FunctionDeclaration") {
@@ -606,8 +651,13 @@ export function typecheckModules(
   activeGenericFunctions = new Map();
   activeExtensions = [];
   allModuleSymbols = new Map();
+  diagnostics.clearFile();
+  activeSemantic = null;
 
-  return instantiationCollector.snapshot();
+  return {
+    instantiations: instantiationCollector.snapshot(),
+    semantic: semantic.freeze(modules),
+  };
 }
 
 function collectExtensionsFromMaps(
@@ -626,6 +676,139 @@ function collectExtensionsFromMaps(
     }
   }
   return out;
+}
+
+function indexMembersByType(
+  structs: Map<string, StructDef>,
+  classes: Map<string, ClassDef>,
+  enums: Map<string, EnumDef>,
+  functions: Map<string, FunctionSig>,
+  genericFunctions: Map<string, GenericFunctionTemplate>,
+): void {
+  if (!activeSemantic) {
+    return;
+  }
+
+  const add = (typeString: string, item: ScopeBindingInfo) => {
+    activeSemantic!.recordMembersForType(typeString, [item]);
+  };
+
+  for (const def of structs.values()) {
+    const typeName = typeToString({ kind: "struct", name: def.name });
+    const localName = def.decl.name.name;
+    for (const f of def.fields) {
+      const item = { name: f.name, detail: typeToString(f.type), kind: "field" as const };
+      add(typeName, item);
+      add(localName, item);
+    }
+    for (const m of def.methods) {
+      const item = {
+        name: m.name,
+        detail: typeToString({ kind: "function", params: m.params, returnType: m.returnType }),
+        kind: "method" as const,
+      };
+      add(typeName, item);
+      add(localName, item);
+    }
+  }
+
+  for (const def of classes.values()) {
+    const typeName = typeToString({ kind: "class", name: def.name });
+    const localName = def.localName;
+    for (const f of def.instanceFields) {
+      const item = { name: f.name, detail: typeToString(f.type), kind: "field" as const };
+      add(typeName, item);
+      add(localName, item);
+    }
+    for (const m of def.instanceMethods) {
+      const item = {
+        name: m.name,
+        detail: typeToString({ kind: "function", params: m.params, returnType: m.returnType }),
+        kind: "method" as const,
+      };
+      add(typeName, item);
+      add(localName, item);
+    }
+    // Static members complete on the class name itself (Foo.bar).
+    for (const f of def.staticFields) {
+      const item = { name: f.name, detail: typeToString(f.type), kind: "field" as const };
+      add(localName, item);
+      add(typeName, item);
+    }
+    for (const m of def.staticMethods) {
+      const item = {
+        name: m.name,
+        detail: typeToString({ kind: "function", params: m.params, returnType: m.returnType }),
+        kind: "method" as const,
+      };
+      add(localName, item);
+      add(typeName, item);
+    }
+    if (def.constructorDecl) {
+      add(localName, {
+        name: "constructor",
+        detail: "constructor",
+        kind: "constructor",
+      });
+    }
+  }
+
+  for (const def of enums.values()) {
+    const typeName = typeToString({ kind: "enum", name: def.name });
+    const localName = def.decl.name.name;
+    for (const variant of def.variants.keys()) {
+      const item = { name: variant, detail: typeName, kind: "enumMember" as const };
+      add(typeName, item);
+      add(localName, item);
+    }
+  }
+
+  add("string", { name: "length", detail: "i32", kind: "property" });
+
+  const sink = new DiagnosticCollector();
+  for (const sig of functions.values()) {
+    if (!sig.isExtension || !sig.decl.params[0]) {
+      continue;
+    }
+    const receiver = resolveAnnotation(sig.decl.params[0].typeAnnotation, structs, enums, sink);
+    if (!receiver) {
+      continue;
+    }
+    const typeName = typeToString(receiver);
+    if (isArrayType(receiver)) {
+      add(typeName, { name: "length", detail: "i32", kind: "property" });
+    }
+    add(typeName, {
+      name: sig.name,
+      detail: typeToString({
+        kind: "function",
+        params: sig.params.slice(1),
+        returnType: sig.returnType,
+      }),
+      kind: "method",
+    });
+  }
+
+  for (const tpl of genericFunctions.values()) {
+    if (!tpl.decl.params[0]?.isReceiver) {
+      continue;
+    }
+    const recv = tpl.decl.params[0].typeAnnotation;
+    let typeName: string | null = null;
+    if (recv.kind === "PrimitiveType") {
+      typeName = recv.name;
+    } else if (recv.kind === "NamedType" && recv.namespace === null) {
+      typeName = recv.name;
+    }
+    if (!typeName) {
+      continue;
+    }
+    add(typeName, {
+      name: tpl.decl.name.name,
+      detail: "extension method",
+      kind: "method",
+    });
+  }
 }
 
 type NamedExportKind =
@@ -805,6 +988,284 @@ function exportedTypeAliases(aliases: Map<string, TypeAliasDef>): Map<string, Ty
   return out;
 }
 
+function isHiddenPreludeImport(binding: ModuleImportBinding): boolean {
+  if (binding.kind !== "named") {
+    return false;
+  }
+  return (
+    binding.localName.startsWith("__prelude_ext_") ||
+    binding.specifier.startsWith("std/prelude/")
+  );
+}
+
+function exportLocation(
+  imported: ModuleSymbols,
+  exportName: string,
+): { file: string; span: SourceSpan } | null {
+  const fn = imported.functions.get(exportName);
+  if (fn && !fn.isExtension) {
+    return { file: imported.modulePath, span: fn.decl.name.span };
+  }
+  const st = imported.structs.get(exportName);
+  if (st) {
+    return { file: imported.modulePath, span: st.decl.name.span };
+  }
+  const en = imported.enums.get(exportName);
+  if (en) {
+    return { file: imported.modulePath, span: en.decl.name.span };
+  }
+  const cl = imported.classes.get(exportName);
+  if (cl) {
+    return { file: imported.modulePath, span: cl.decl.name.span };
+  }
+  const iface = imported.interfaces.get(exportName);
+  if (iface) {
+    return { file: imported.modulePath, span: iface.decl.name.span };
+  }
+  const alias = imported.typeAliases.get(exportName);
+  if (alias) {
+    return { file: imported.modulePath, span: alias.decl.name.span };
+  }
+  return null;
+}
+
+function firstModuleLocation(imported: ModuleSymbols): { file: string; span: SourceSpan } | null {
+  for (const sig of imported.functions.values()) {
+    if (!sig.isExtension) {
+      return { file: imported.modulePath, span: sig.decl.name.span };
+    }
+  }
+  for (const def of imported.structs.values()) {
+    return { file: imported.modulePath, span: def.decl.name.span };
+  }
+  for (const def of imported.enums.values()) {
+    return { file: imported.modulePath, span: def.decl.name.span };
+  }
+  for (const def of imported.classes.values()) {
+    return { file: imported.modulePath, span: def.decl.name.span };
+  }
+  for (const def of imported.interfaces.values()) {
+    return { file: imported.modulePath, span: def.decl.name.span };
+  }
+  for (const def of imported.typeAliases.values()) {
+    return { file: imported.modulePath, span: def.decl.name.span };
+  }
+  return null;
+}
+
+function namespaceMemberCompletions(imported: ModuleSymbols): ScopeBindingInfo[] {
+  const members: ScopeBindingInfo[] = [];
+  for (const sig of imported.functions.values()) {
+    if (sig.isExtension || !sig.exported) {
+      continue;
+    }
+    members.push({
+      name: sig.name,
+      kind: "function",
+      detail: typeToString({
+        kind: "function",
+        params: sig.params,
+        returnType: sig.returnType,
+      }),
+    });
+  }
+  for (const def of imported.structs.values()) {
+    if (!def.exported) {
+      continue;
+    }
+    members.push({ name: def.decl.name.name, kind: "struct", detail: "struct" });
+  }
+  for (const def of imported.enums.values()) {
+    if (!def.exported) {
+      continue;
+    }
+    members.push({ name: def.decl.name.name, kind: "enum", detail: "enum" });
+  }
+  for (const def of imported.classes.values()) {
+    if (!def.exported) {
+      continue;
+    }
+    members.push({ name: def.decl.name.name, kind: "class", detail: "class" });
+  }
+  for (const def of imported.interfaces.values()) {
+    if (!def.exported) {
+      continue;
+    }
+    members.push({ name: def.decl.name.name, kind: "interface", detail: "interface" });
+  }
+  for (const def of imported.typeAliases.values()) {
+    if (!def.exported) {
+      continue;
+    }
+    members.push({ name: def.decl.name.name, kind: "type", detail: "type" });
+  }
+  return members;
+}
+
+function modulePathOwningMangled(
+  kind: "struct" | "class",
+  mangledName: string,
+): string | null {
+  for (const symbols of allModuleSymbols.values()) {
+    if (kind === "struct") {
+      for (const def of symbols.structs.values()) {
+        if (def.name === mangledName) {
+          return symbols.modulePath;
+        }
+      }
+    } else {
+      for (const def of symbols.classes.values()) {
+        if (def.name === mangledName) {
+          return symbols.modulePath;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function indexModuleSymbols(
+  mod: ResolvedModule,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  classes: Map<string, ClassDef>,
+  interfaces: Map<string, InterfaceDef>,
+  typeAliases: Map<string, TypeAliasDef>,
+): void {
+  if (!activeSemantic) {
+    return;
+  }
+  const file = mod.path;
+  for (const binding of mod.imports) {
+    if (isHiddenPreludeImport(binding)) {
+      continue;
+    }
+    if (binding.kind === "namespace") {
+      activeSemantic.addModuleSymbol(file, {
+        name: binding.alias,
+        kind: "module",
+        detail: "namespace",
+        location: { file, span: binding.span },
+      });
+      activeSemantic.recordDeclaration(file, binding.span);
+      const imported = allModuleSymbols.get(binding.modulePath);
+      if (imported) {
+        const members = namespaceMemberCompletions(imported);
+        if (members.length > 0) {
+          activeSemantic.recordMembersForType(binding.alias, members);
+        }
+        const modLoc = firstModuleLocation(imported);
+        if (modLoc) {
+          activeSemantic.recordDefinition(file, binding.span, modLoc);
+        }
+      }
+    } else {
+      const imported = allModuleSymbols.get(binding.modulePath);
+      let kind: ScopeBindingInfo["kind"] = "variable";
+      let detail = `import ${binding.exportName}`;
+      if (imported) {
+        if (imported.functions.has(binding.exportName)) {
+          kind = "function";
+          const sig = imported.functions.get(binding.exportName)!;
+          detail = typeToString({
+            kind: "function",
+            params: sig.params,
+            returnType: sig.returnType,
+          });
+        } else if (imported.structs.has(binding.exportName)) {
+          kind = "struct";
+          detail = "struct";
+        } else if (imported.classes.has(binding.exportName)) {
+          kind = "class";
+          detail = "class";
+        } else if (imported.enums.has(binding.exportName)) {
+          kind = "enum";
+          detail = "enum";
+        } else if (imported.interfaces.has(binding.exportName)) {
+          kind = "interface";
+          detail = "interface";
+        } else if (imported.typeAliases.has(binding.exportName)) {
+          kind = "type";
+          detail = "type";
+        }
+        const defLoc = exportLocation(imported, binding.exportName);
+        if (defLoc) {
+          activeSemantic.recordDefinition(file, binding.span, defLoc);
+        }
+      }
+      activeSemantic.addModuleSymbol(file, {
+        name: binding.localName,
+        kind,
+        detail,
+        location: { file, span: binding.span },
+      });
+      activeSemantic.recordDeclaration(file, binding.span);
+    }
+  }
+  for (const sig of functions.values()) {
+    if (sig.isExtension) {
+      continue;
+    }
+    activeSemantic.addModuleSymbol(file, {
+      name: sig.name,
+      kind: "function",
+      detail: typeToString({
+        kind: "function",
+        params: sig.params,
+        returnType: sig.returnType,
+      }),
+      location: { file, span: sig.decl.name.span },
+    });
+    activeSemantic.recordDeclaration(file, sig.decl.name.span);
+  }
+  for (const def of structs.values()) {
+    activeSemantic.addModuleSymbol(file, {
+      name: def.decl.name.name,
+      kind: "struct",
+      detail: "struct",
+      location: { file, span: def.decl.name.span },
+    });
+    activeSemantic.recordDeclaration(file, def.decl.name.span);
+  }
+  for (const def of enums.values()) {
+    activeSemantic.addModuleSymbol(file, {
+      name: def.decl.name.name,
+      kind: "enum",
+      detail: "enum",
+      location: { file, span: def.decl.name.span },
+    });
+    activeSemantic.recordDeclaration(file, def.decl.name.span);
+  }
+  for (const def of classes.values()) {
+    activeSemantic.addModuleSymbol(file, {
+      name: def.decl.name.name,
+      kind: "class",
+      detail: "class",
+      location: { file, span: def.decl.name.span },
+    });
+    activeSemantic.recordDeclaration(file, def.decl.name.span);
+  }
+  for (const def of interfaces.values()) {
+    activeSemantic.addModuleSymbol(file, {
+      name: def.decl.name.name,
+      kind: "interface",
+      detail: "interface",
+      location: { file, span: def.decl.name.span },
+    });
+    activeSemantic.recordDeclaration(file, def.decl.name.span);
+  }
+  for (const def of typeAliases.values()) {
+    activeSemantic.addModuleSymbol(file, {
+      name: def.decl.name.name,
+      kind: "type",
+      detail: "type",
+      location: { file, span: def.decl.name.span },
+    });
+    activeSemantic.recordDeclaration(file, def.decl.name.span);
+  }
+}
+
 function collectModuleSymbols(
   mod: ResolvedModule,
   diagnostics: DiagnosticCollector,
@@ -977,6 +1438,7 @@ function collectModuleSymbols(
       exported: fn.exported,
       isExtern: fn.isExtern,
       isExtension: fn.params[0]?.isReceiver === true,
+      modulePath: mod.path,
     });
   }
 
@@ -3807,6 +4269,9 @@ function checkFunction(
     scope.set(param.name.name, {
       type: paramType,
       mutable: false,
+      defSpan: param.name.span,
+      defFile: activeModulePath,
+      bindingKind: "parameter",
     });
   }
 
@@ -3831,6 +4296,29 @@ function checkFunction(
 
   for (const stmt of fn.body) {
     checkStatement(stmt, scope, functions, structs, enums, returnType, diagnostics, 0, 0);
+  }
+
+  if (activeSemantic && activeModulePath) {
+    const bindings: ScopeBindingInfo[] = [];
+    for (const [name, binding] of scope) {
+      const kind =
+        binding.bindingKind === "parameter"
+          ? "parameter"
+          : binding.bindingKind === "const"
+            ? "constant"
+            : "variable";
+      bindings.push({
+        name,
+        detail: typeToString(binding.type),
+        kind,
+      });
+    }
+    activeSemantic.recordScope({
+      file: activeModulePath,
+      startOffset: fn.span.start.offset,
+      endOffset: fn.span.end.offset,
+      bindings,
+    });
   }
 
   if (returnType !== "void") {
@@ -4516,7 +5004,14 @@ function checkStatement(
         scope.set(name.name, {
           type: annotated,
           mutable: stmt.mutability === "let",
+          defSpan: name.span,
+          defFile: activeModulePath,
+          bindingKind: stmt.mutability === "const" ? "const" : "let",
         });
+        if (activeSemantic && activeModulePath) {
+          activeSemantic.recordType(activeModulePath, name.span, typeToString(annotated));
+          activeSemantic.recordDeclaration(activeModulePath, name.span);
+        }
         return false;
       }
 
@@ -4550,6 +5045,9 @@ function checkStatement(
       const binding: Binding = {
         type: bindingType,
         mutable: stmt.mutability === "let",
+        defSpan: name.span,
+        defFile: activeModulePath,
+        bindingKind: stmt.mutability === "const" ? "const" : "let",
       };
       if (stmt.mutability === "const" && stmt.initializer) {
         const constantExpr = constantInitializerExpr(stmt.initializer);
@@ -4560,6 +5058,10 @@ function checkStatement(
         }
       } else {
         scope.set(name.name, binding);
+      }
+      if (activeSemantic && activeModulePath) {
+        activeSemantic.recordType(activeModulePath, name.span, typeToString(bindingType));
+        activeSemantic.recordDeclaration(activeModulePath, name.span);
       }
       return false;
     }
@@ -5401,6 +5903,13 @@ function checkNamespaceCall(
     return null;
   }
 
+  if (activeSemantic && activeModulePath) {
+    activeSemantic.recordMemberDefinition(activeModulePath, expr.callee.property.span, {
+      file: sig.modulePath,
+      span: sig.decl.name.span,
+    });
+  }
+
   if (sig.returnType === "void") {
     if (!allowVoidCall) {
       diagnostics.error(
@@ -5696,7 +6205,80 @@ function rejectNamedArgsOnFunctionValue(
   return true;
 }
 
+
+function recordStructMemberCompletions(def: StructDef, objectSpan: SourceSpan): void {
+  if (!activeSemantic || !activeModulePath) {
+    return;
+  }
+  const items: ScopeBindingInfo[] = [
+    ...def.fields.map((f) => ({
+      name: f.name,
+      detail: typeToString(f.type),
+      kind: "field" as const,
+    })),
+    ...def.methods.map((m) => ({
+      name: m.name,
+      detail: typeToString({
+        kind: "function",
+        params: m.params,
+        returnType: m.returnType,
+      }),
+      kind: "method" as const,
+    })),
+  ];
+  activeSemantic.recordMemberCompletions(activeModulePath, objectSpan, items);
+}
+
+function recordClassMemberCompletions(def: ClassDef, objectSpan: SourceSpan): void {
+  if (!activeSemantic || !activeModulePath) {
+    return;
+  }
+  const items: ScopeBindingInfo[] = [
+    ...def.instanceFields.map((f) => ({
+      name: f.name,
+      detail: typeToString(f.type),
+      kind: "field" as const,
+    })),
+    ...def.instanceMethods.map((m) => ({
+      name: m.name,
+      detail: typeToString({
+        kind: "function",
+        params: m.params,
+        returnType: m.returnType,
+      }),
+      kind: "method" as const,
+    })),
+  ];
+  activeSemantic.recordMemberCompletions(activeModulePath, objectSpan, items);
+}
+
 function checkExpression(
+  expr: Expression,
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+  diagnostics: DiagnosticCollector,
+  allowVoidCall = false,
+  expectedType: ValueType | null = null,
+): ValueType | null {
+  const result = checkExpressionInner(
+    expr,
+    scope,
+    functions,
+    structs,
+    enums,
+    diagnostics,
+    allowVoidCall,
+    expectedType,
+  );
+  if (result !== null && activeSemantic && activeModulePath) {
+    activeSemantic.recordType(activeModulePath, expr.span, typeToString(result));
+  }
+  return result;
+}
+
+function checkExpressionInner(
   expr: Expression,
   scope: Map<string, Binding>,
   functions: Map<string, FunctionSig>,
@@ -6190,6 +6772,7 @@ function checkExpression(
           diagnostics.error(`Unknown struct '${resolvedObjectType.name}'`, expr.object.span, "E0104");
           return null;
         }
+        recordStructMemberCompletions(def, expr.object.span);
         const field = def.fields.find((f) => f.name === expr.property.name);
         if (!field) {
           diagnostics.error(
@@ -6199,6 +6782,15 @@ function checkExpression(
           );
           return null;
         }
+        const fieldDecl = def.decl.fields.find((f) => f.name.name === field.name);
+        if (activeSemantic && activeModulePath && fieldDecl) {
+          const defFile =
+            modulePathOwningMangled("struct", def.name) ?? activeModulePath;
+          activeSemantic.recordMemberDefinition(activeModulePath, expr.property.span, {
+            file: defFile,
+            span: fieldDecl.name.span,
+          });
+        }
         return wrapOptionalMember(field.type);
       }
       if (isClassType(resolvedObjectType)) {
@@ -6207,6 +6799,7 @@ function checkExpression(
           diagnostics.error(`Unknown class '${resolvedObjectType.name}'`, expr.object.span, "E0104");
           return null;
         }
+        recordClassMemberCompletions(def, expr.object.span);
         const field = def.instanceFields.find((f) => f.name === expr.property.name);
         if (!field) {
           diagnostics.error(
@@ -6220,6 +6813,17 @@ function checkExpression(
           !canAccessMember(field.visibility, field.declaringClass, diagnostics, expr.property.span)
         ) {
           return null;
+        }
+        const fieldDecl = def.decl.members.find(
+          (m) => m.kind === "ClassField" && m.name.name === field.name,
+        );
+        if (activeSemantic && activeModulePath && fieldDecl && fieldDecl.kind === "ClassField") {
+          const defFile =
+            modulePathOwningMangled("class", def.name) ?? activeModulePath;
+          activeSemantic.recordMemberDefinition(activeModulePath, expr.property.span, {
+            file: defFile,
+            span: fieldDecl.name.span,
+          });
         }
         return wrapOptionalMember(field.type);
       }
@@ -6471,10 +7075,22 @@ function checkExpression(
     case "Identifier": {
       const binding = scope.get(expr.name);
       if (binding) {
+        if (activeSemantic && activeModulePath && binding.defSpan && binding.defFile) {
+          activeSemantic.recordDefinition(activeModulePath, expr.span, {
+            file: binding.defFile,
+            span: binding.defSpan,
+          });
+        }
         return binding.type;
       }
       const sig = functions.get(expr.name);
       if (sig) {
+        if (activeSemantic && activeModulePath) {
+          activeSemantic.recordDefinition(activeModulePath, expr.span, {
+            file: sig.modulePath,
+            span: sig.decl.name.span,
+          });
+        }
         return {
           kind: "function",
           params: sig.params,
@@ -6842,6 +7458,12 @@ function checkExpression(
             );
             return null;
           }
+          if (activeSemantic && activeModulePath && binding.defSpan && binding.defFile) {
+            activeSemantic.recordDefinition(activeModulePath, expr.callee.span, {
+              file: binding.defFile,
+              span: binding.defSpan,
+            });
+          }
           return checkFunctionValueCall(
             expr,
             binding.type,
@@ -6851,6 +7473,22 @@ function checkExpression(
             enums,
             diagnostics,
             allowVoidCall,
+          );
+        }
+
+        if (activeSemantic && activeModulePath) {
+          activeSemantic.recordDefinition(activeModulePath, expr.callee.span, {
+            file: sig.modulePath,
+            span: sig.decl.name.span,
+          });
+          activeSemantic.recordType(
+            activeModulePath,
+            expr.callee.span,
+            typeToString({
+              kind: "function",
+              params: sig.params,
+              returnType: sig.returnType,
+            }),
           );
         }
 

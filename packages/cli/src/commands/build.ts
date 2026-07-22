@@ -1,0 +1,61 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { compileSourceFile, linkNative } from "../native.js";
+import { loadProject, ProjectError } from "../project.js";
+
+export interface BuildOptions {
+  readonly output?: string;
+  readonly emitIr?: boolean;
+  /** When true, only emit IR and skip native linking. */
+  readonly irOnly?: boolean;
+}
+
+export async function runBuild(options: BuildOptions = {}): Promise<number> {
+  let project;
+  try {
+    project = loadProject();
+  } catch (error) {
+    if (error instanceof ProjectError) {
+      console.error(`error: ${error.message}`);
+      return 1;
+    }
+    throw error;
+  }
+
+  const compiled = compileSourceFile(project.entryPath);
+  if (!compiled) {
+    return 1;
+  }
+
+  const binaryPath = options.output
+    ? resolve(options.output)
+    : join(project.outdirPath, project.binaryName);
+
+  const irPath = options.emitIr || options.irOnly
+    ? join(project.outdirPath, `${project.binaryName}.ll`)
+    : undefined;
+
+  if (options.irOnly) {
+    mkdirSync(project.outdirPath, { recursive: true });
+    const out = irPath ?? join(project.outdirPath, `${project.binaryName}.ll`);
+    writeFileSync(out, compiled.ir, "utf8");
+    console.log(`wrote ${out}`);
+    return 0;
+  }
+
+  const status = await linkNative({
+    ir: compiled.ir,
+    outputPath: binaryPath,
+    ...(irPath !== undefined ? { emitIrPath: irPath } : {}),
+  });
+
+  if (status !== 0) {
+    return status;
+  }
+
+  if (irPath) {
+    console.log(`wrote ${irPath}`);
+  }
+  console.log(`wrote ${binaryPath}`);
+  return 0;
+}

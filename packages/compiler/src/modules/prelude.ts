@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import type { DiagnosticCollector } from "../diagnostics/diagnostic.js";
+import { DiagnosticCollector } from "../diagnostics/diagnostic.js";
 import type { ModuleImportBinding, ReadFileFn, ResolvedModule } from "./resolve.js";
 import { resolveModules } from "./resolve.js";
 
@@ -43,8 +43,14 @@ export function loadPreludeModules(
   const readPrelude: ReadFileFn = (p) => readFileSync(p, "utf8");
   const loaded: ResolvedModule[] = [];
   for (const preludePath of paths) {
-    const result = resolveModules(preludePath, readPrelude, diagnostics);
+    // Isolate from user-program diagnostics so a parse error in the open buffer
+    // does not make prelude resolution look like a failure.
+    const preludeDiagnostics = new DiagnosticCollector();
+    const result = resolveModules(preludePath, readPrelude, preludeDiagnostics);
     if (!result.success) {
+      for (const d of preludeDiagnostics.diagnostics) {
+        diagnostics.error(d.message, d.span, d.code);
+      }
       continue;
     }
     for (const mod of result.modules) {

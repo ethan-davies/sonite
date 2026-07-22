@@ -18,21 +18,52 @@ export interface Diagnostic {
   readonly message: string;
   readonly span?: SourceSpan;
   readonly code?: string;
+  /** Absolute or logical path of the file this diagnostic belongs to. */
+  readonly file?: string;
 }
 
 export class DiagnosticCollector {
   private readonly items: Diagnostic[] = [];
+  private activeFile: string | undefined;
+
+  /** Stamp subsequent diagnostics with this file path (cleared by `clearFile`). */
+  setFile(file: string | undefined): void {
+    this.activeFile = file;
+  }
+
+  clearFile(): void {
+    this.activeFile = undefined;
+  }
+
+  get file(): string | undefined {
+    return this.activeFile;
+  }
 
   error(message: string, span?: SourceSpan, code?: string): void {
-    this.items.push({ severity: "error", message, ...(span ? { span } : {}), ...(code ? { code } : {}) });
+    this.push("error", message, span, code);
   }
 
   warning(message: string, span?: SourceSpan, code?: string): void {
-    this.items.push({ severity: "warning", message, ...(span ? { span } : {}), ...(code ? { code } : {}) });
+    this.push("warning", message, span, code);
   }
 
   info(message: string, span?: SourceSpan, code?: string): void {
-    this.items.push({ severity: "info", message, ...(span ? { span } : {}), ...(code ? { code } : {}) });
+    this.push("info", message, span, code);
+  }
+
+  private push(
+    severity: DiagnosticSeverity,
+    message: string,
+    span?: SourceSpan,
+    code?: string,
+  ): void {
+    this.items.push({
+      severity,
+      message,
+      ...(span ? { span } : {}),
+      ...(code ? { code } : {}),
+      ...(this.activeFile !== undefined ? { file: this.activeFile } : {}),
+    });
   }
 
   get diagnostics(): readonly Diagnostic[] {
@@ -53,9 +84,10 @@ export class DiagnosticCollector {
   format(fileName = "<source>"): string {
     return this.items
       .map((d) => {
+        const path = d.file ?? fileName;
         const loc = d.span
-          ? `${fileName}:${d.span.start.line}:${d.span.start.column}`
-          : fileName;
+          ? `${path}:${d.span.start.line}:${d.span.start.column}`
+          : path;
         const code = d.code ? ` [${d.code}]` : "";
         return `${loc}: ${d.severity}${code}: ${d.message}`;
       })

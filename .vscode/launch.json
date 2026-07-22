@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch TSN Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/packages/vscode",
+        "${workspaceFolder}/examples"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/packages/vscode/dist/**/*.js",
+        "${workspaceFolder}/packages/lsp/dist/**/*.js"
+      ],
+      "preLaunchTask": "build-vscode-extension"
+    }
+  ]
+}

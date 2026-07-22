@@ -15,7 +15,11 @@ import {
 } from "./modules/resolve.js";
 import { Parser } from "./parser/parser.js";
 import { typecheckModules } from "./typecheck.js";
-import { validateModules } from "./validate.js";
+import { validateModules, validateModulesLoose } from "./validate.js";
+import {
+  emptySemanticModel,
+  type SemanticModel,
+} from "./analysis/semantic.js";
 
 function discoverStdRoot(): string | null {
   try {
@@ -72,8 +76,10 @@ export interface CompileResult {
  * Imports are not supported here; use {@link compileFile} for multi-file programs.
  * The standard-library prelude is still auto-attached.
  */
-export function compile(source: string, _options: CompileOptions = {}): CompileResult {
+export function compile(source: string, options: CompileOptions = {}): CompileResult {
   const diagnostics = new DiagnosticCollector();
+  const fileName = options.fileName ?? "<source>";
+  diagnostics.setFile(fileName);
   const lexer = new Lexer(source, diagnostics);
   const tokens = lexer.tokenize();
   const parser = new Parser(tokens, diagnostics);
@@ -90,7 +96,7 @@ export function compile(source: string, _options: CompileOptions = {}): CompileR
   }
 
   const synthetic: ResolvedModule = {
-    path: "<source>",
+    path: fileName,
     source,
     ast,
     moduleId: "",
@@ -109,8 +115,8 @@ export function compile(source: string, _options: CompileOptions = {}): CompileR
   if (!diagnostics.hasErrors) {
     const inst = typecheckModules(modules, diagnostics);
     if (!diagnostics.hasErrors) {
-      monoModules = monomorphizeModules(modules, inst);
-      const ir = new LlvmCodegen().emitModules(monoModules, inst);
+      monoModules = monomorphizeModules(modules, inst.instantiations);
+      const ir = new LlvmCodegen().emitModules(monoModules, inst.instantiations);
       return {
         ast: monoModules.find((m) => m.isEntry)?.ast ?? ast,
         modules: monoModules,
@@ -184,7 +190,8 @@ export function compileFile(
   let monoModules = modules;
   let inst: TypecheckInstantiations | undefined;
   if (!diagnostics.hasErrors) {
-    inst = typecheckModules(modules, diagnostics);
+    const checked = typecheckModules(modules, diagnostics);
+    inst = checked.instantiations;
     if (!diagnostics.hasErrors) {
       monoModules = monomorphizeModules(modules, inst);
     }
@@ -207,6 +214,55 @@ export function compileFile(
     ir,
     diagnostics: diagnostics.diagnostics,
     success: true,
+  };
+}
+
+export interface AnalyzeFileOptions {
+  readonly readFile?: (absolutePath: string) => string;
+}
+
+export interface AnalyzeResult {
+  readonly modules: readonly ResolvedModule[];
+  readonly diagnostics: readonly Diagnostic[];
+  readonly semantic: SemanticModel;
+  readonly success: boolean;
+}
+
+/**
+ * Resolve, validate, and typecheck a `.tsn` file without codegen.
+ * Suitable for IDE / LSP use. The open file need not define `main`.
+ * Continues semantic analysis even when the parser already reported errors,
+ * so completions/hover still work on incomplete buffers.
+ */
+export function analyzeFile(
+  entryPath: string,
+  options: AnalyzeFileOptions = {},
+): AnalyzeResult {
+  const diagnostics = new DiagnosticCollector();
+  const readFile =
+    options.readFile ?? ((absolutePath: string) => readFileSync(absolutePath, "utf8"));
+  const absoluteEntry = resolvePath(entryPath);
+
+  const resolved = resolveModules(absoluteEntry, readFile, diagnostics);
+  const modules = attachPrelude(resolved.modules, diagnostics, readFile);
+
+  if (modules.length === 0) {
+    return {
+      modules,
+      diagnostics: diagnostics.diagnostics,
+      semantic: emptySemanticModel(modules),
+      success: false,
+    };
+  }
+
+  validateModulesLoose(modules, diagnostics);
+  const checked = typecheckModules(modules, diagnostics);
+
+  return {
+    modules,
+    diagnostics: diagnostics.diagnostics,
+    semantic: checked.semantic,
+    success: !diagnostics.hasErrors,
   };
 }
 

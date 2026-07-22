@@ -25,13 +25,15 @@ This repository is a pnpm workspace:
 | [`packages/runtime`](./packages/runtime) | `@typescript-native/runtime` | C runtime (`libtsn_runtime.a`) for print, strings, arrays, maps |
 | [`packages/std`](./packages/std) | `@typescript-native/std` | Standard library written in TSN (prelude + modules) |
 | [`packages/cli`](./packages/cli) | `@typescript-native/cli` | `tsn` command-line tool |
-| [`packages/vscode`](./packages/vscode) | `typescript-native-vscode` | TextMate grammar and VS Code / Cursor language support for `.tsn` |
+| [`packages/lsp`](./packages/lsp) | `@typescript-native/lsp` | Language server (diagnostics, hover, definition, completion, symbols) |
+| [`packages/vscode`](./packages/vscode) | `typescript-native-vscode` | TextMate grammar + VS Code / Cursor extension (LSP client) |
 
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 20+
 - [pnpm](https://pnpm.io/) 10+
-- [Clang](https://clang.llvm.org/) on your `PATH` (needed to run programs)
+
+`tsn build` / `tsn run` link native binaries with clang. The CLI uses clang from `TSN_CLANG`, then `PATH`, then a cached LLVM download under `~/.cache/tsn/` (no manual clang install required).
 
 ## Getting started
 
@@ -57,10 +59,39 @@ pnpm dev examples/variables.tsn
 
 | Command | Description |
 | --- | --- |
-| `tsn <file.tsn>` | Compile with Clang and run |
-| `tsn run <file.tsn>` | Same as above |
-| `tsn compile <file.tsn>` | Emit LLVM IR (`<file>.ll` by default) |
-| `tsn compile <file.tsn> -o out.ll` | Emit LLVM IR to a specific path |
+| `tsn init [dir]` | Create a new project (`project.toml`, `src/main.tsn`) |
+| `tsn build` | Build the current project to `dist/<name>` |
+| `tsn run [file]` | Run a file, or build and run the current project |
+| `tsn fmt [paths…]` | Format `.tsn` sources (`--check` for CI) |
+| `tsn compile [file]` | Emit LLVM IR (`<file>.ll` or project entry) |
+| `tsn <file.tsn>` | Shorthand for `tsn run <file.tsn>` |
+
+### `project.toml`
+
+Projects are configured with a Cargo-like manifest at the repo root:
+
+```toml
+[package]
+name = "hello"
+version = "0.1.0"
+description = ""
+license = "MIT"
+authors = []
+entry = "src/main.tsn"
+
+[build]
+outdir = "dist"
+```
+
+### Toolchain
+
+Native linking uses clang in this order:
+
+1. `TSN_CLANG` — explicit path to a clang binary
+2. `clang` on `PATH`
+3. Cached LLVM under `~/.cache/tsn/llvm-<version>/` (downloaded on first need)
+
+Override the cache root with `TSN_CACHE_DIR` if desired.
 
 During development:
 
@@ -68,6 +99,9 @@ During development:
 pnpm dev examples/hello.tsn
 pnpm dev run examples/hello.tsn
 pnpm dev compile examples/hello.tsn -o hello.ll
+pnpm dev init ./my-app
+pnpm --filter @typescript-native/cli exec tsn build   # from a project directory
+pnpm dev fmt --check
 ```
 
 ## Language

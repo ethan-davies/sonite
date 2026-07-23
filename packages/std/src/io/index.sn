@@ -1,2 +1,34 @@
-export { readLine } from "./console";
-export { write, writeError } from "./stream";
+// console.log / console.error / console.warn / console.readLine
+// are compiler builtins (always available, no import required).
+
+extern function sn_read_line(): string;
+extern function sn_print_str(value: string): void;
+extern function sn_eprint_str(value: string): void;
+
+/** Read a line from stdin (without trailing newline). Returns "" on EOF. */
+export function readLine(): string {
+  return sn_read_line();
+}
+
+/** Default chunk size for ByteStream.read() when the runtime chooses. */
+export const STREAM_DEFAULT_CHUNK: i32 = 65536;
+
+/**
+ * Shared asynchronous byte stream shape.
+ * Empty Bytes from read() means EOF. Do not use null for end-of-stream.
+ */
+export interface ByteStream {
+  async read(): Bytes;
+  async write(data: Bytes): void;
+  async close(): void;
+}
+
+/** Write a string to stdout without a trailing newline. */
+export function write(text: string): void {
+  sn_print_str(text);
+}
+
+/** Write a string to stderr without a trailing newline. */
+export function writeError(text: string): void {
+  sn_eprint_str(text);
+}

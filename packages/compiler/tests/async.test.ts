@@ -216,6 +216,33 @@ async function main(): void {
     expect(result.ir).toContain("__itable");
   });
 
+  it("spills interface fat pointers across await", () => {
+    const src = `
+interface S {
+  async read(): i32;
+  async close(): void;
+}
+
+class Mem implements S {
+  async read(): i32 {
+    return 7;
+  }
+  async close(): void {
+  }
+}
+
+async function main(): void {
+  let typed: S = new Mem();
+  let n = await typed.read();
+  print(n);
+  await typed.close();
+}
+`;
+    const result = compile(src);
+    expect(result.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
+    expect(result.ir).toContain("sn_task_await_suspend");
+  });
+
   it("compiles stdlib ByteStream implements via TlsStream module", () => {
     const result = compileFile(path.join(root, "examples/async-tls.sn"));
     expect(result.diagnostics.filter((d) => d.severity === "error")).toEqual([]);

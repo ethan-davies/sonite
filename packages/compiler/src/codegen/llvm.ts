@@ -2481,6 +2481,10 @@ export class LlvmCodegen {
     if (isReferenceCategory(type)) {
       return true;
     }
+    if (typeof type === "object" && type.kind === "interface") {
+      // Fat pointer: data* is a heap object; itable* is a global (not traced).
+      return true;
+    }
     if (typeof type === "object" && type.kind === "struct") {
       const info = this.structs.get(type.name);
       if (!info) {
@@ -2542,6 +2546,18 @@ export class LlvmCodegen {
           sizeExpr: llvmSizeofI32Expr("%__Callable"),
           refClass: SN_REF_AGG,
           typeId: SN_TYPEID_CLOSURE,
+        },
+      ];
+    }
+
+    if (typeof type === "object" && type.kind === "interface") {
+      // `%Iface = { ptr data, ptr itable }` — only `data` is a GC root.
+      return [
+        {
+          offsetExpr: llvmOffsetOfExpr(aggregateLlvm, [...indexPath, 0]),
+          sizeExpr: llvmSizeofI32Expr("ptr"),
+          refClass: SN_REF_PTR,
+          typeId: 0,
         },
       ];
     }
@@ -4039,14 +4055,33 @@ export class LlvmCodegen {
     // Frame layout (all slots pointer-sized / 8 bytes):
     //   slot 0            : result Future*
     //   slot 1            : state (i32 stored in an 8-byte slot)
-    //   slots 2..2+P-1    : params
-    //   slots 2+P..       : spilled locals (one per distinct declared name)
+    //   slots 2..         : params (1 or 2 slots each; interfaces/callables use 2)
+    //   following         : spilled locals (2 slots each so fat pointers fit)
     //   final slot        : scratch for the awaited Future across suspension
-    const paramCount = fn.params.length;
+    //
+    // Two consecutive slots share one base GEP address; a 16-byte store of an
+    // interface/{ptr,ptr} callable covers both slots.
     const localNames = this.collectAsyncLocalNames(fn.body);
-    const localBase = 2 + paramCount;
-    const awaitSlotIndex = localBase + localNames.length;
+    const paramSlotIndex: number[] = [];
+    let nextSlot = 2;
+    const paramTypes: ValueType[] = [];
+    for (let i = 0; i < fn.params.length; i += 1) {
+      const type = this.resolveAnnotation(fn.params[i]!.typeAnnotation);
+      if (!type) {
+        throw new Error("Codegen: invalid parameter type");
+      }
+      paramTypes.push(type);
+      paramSlotIndex.push(nextSlot);
+      const spill = asyncSpillSlotCount(type);
+      // Params always reserve at least one slot (legacy overflow for large structs).
+      nextSlot += spill > 0 ? spill : 1;
+    }
+    const localBase = nextSlot;
+    // Reserve two slots per local so interface fat pointers survive await.
+    const slotsPerLocal = 2;
+    const awaitSlotIndex = localBase + localNames.length * slotsPerLocal;
     const totalSlots = awaitSlotIndex + 1;
+    const paramSlotEnd = localBase;
 
     // --- task body (resume function) ---
     this.locals = new Map();
@@ -4080,12 +4115,14 @@ export class LlvmCodegen {
       `  ${awaitSlot} = getelementptr ptr, ptr %frame, i64 ${awaitSlotIndex}`,
     );
 
-    // Slot pointers for params + locals.
+    // Slot pointers for params + locals (base of each multi-slot reservation).
     const slotPtr = new Map<string, string>();
     for (let i = 0; i < fn.params.length; i += 1) {
       const param = fn.params[i]!;
       const p = this.nextTemp();
-      entryLines.push(`  ${p} = getelementptr ptr, ptr %frame, i64 ${2 + i}`);
+      entryLines.push(
+        `  ${p} = getelementptr ptr, ptr %frame, i64 ${paramSlotIndex[i]!}`,
+      );
       if (!param.isReceiver) {
         slotPtr.set(param.name.name, p);
       } else {
@@ -4095,7 +4132,7 @@ export class LlvmCodegen {
     for (let i = 0; i < localNames.length; i += 1) {
       const p = this.nextTemp();
       entryLines.push(
-        `  ${p} = getelementptr ptr, ptr %frame, i64 ${localBase + i}`,
+        `  ${p} = getelementptr ptr, ptr %frame, i64 ${localBase + i * slotsPerLocal}`,
       );
       slotPtr.set(localNames[i]!, p);
     }
@@ -4115,10 +4152,7 @@ export class LlvmCodegen {
     this.thisType = null;
     for (let i = 0; i < fn.params.length; i += 1) {
       const param = fn.params[i]!;
-      const type = this.resolveAnnotation(param.typeAnnotation);
-      if (!type) {
-        throw new Error("Codegen: invalid parameter type");
-      }
+      const type = paramTypes[i]!;
       if (param.isReceiver) {
         const loaded = this.nextTemp();
         const llvmTy = toLlvmType(type);
@@ -4222,7 +4256,7 @@ export class LlvmCodegen {
     startLines.push(`  store ptr ${fut}, ptr ${futStore}`);
     // Zero state + local + await-scratch slots (params are written below).
     for (let s = 1; s < totalSlots; s += 1) {
-      if (s >= 2 && s < 2 + paramCount) {
+      if (s >= 2 && s < paramSlotEnd) {
         continue;
       }
       const zslot = this.nextTemp();
@@ -4235,7 +4269,7 @@ export class LlvmCodegen {
       const llvmTy = toLlvmType(sig.params[i]!);
       const slot = this.nextTemp();
       startLines.push(
-        `  ${slot} = getelementptr ptr, ptr ${frame}, i64 ${2 + i}`,
+        `  ${slot} = getelementptr ptr, ptr ${frame}, i64 ${paramSlotIndex[i]!}`,
       );
       startLines.push(`  store ${llvmTy} %arg${i}, ptr ${slot}`);
     }
@@ -4256,9 +4290,10 @@ export class LlvmCodegen {
   /**
    * Collect the names of all locals declared anywhere in an async function body
    * (variable declarations, destructuring elements, for-in bindings, C-style for
-   * initializers, and catch parameters). Each distinct name is spilled to one
-   * frame slot so its value survives task suspension. Nested lambda bodies are
-   * skipped — they compile to separate functions with their own frames.
+   * initializers, and catch parameters). Each distinct name is spilled to two
+   * consecutive frame slots so interface fat pointers survive task suspension.
+   * Nested lambda bodies are skipped — they compile to separate functions with
+   * their own frames.
    */
   private collectAsyncLocalNames(stmts: readonly Statement[]): string[] {
     const names: string[] = [];
@@ -5271,9 +5306,9 @@ export class LlvmCodegen {
       return;
     }
 
-    // In an async task body, spill ptr-sized locals into the heap frame so they
-    // survive suspension. Aggregates (>8 bytes) keep an alloca (won't persist
-    // across await — documented limitation).
+    // In an async task body, spill ptr-sized and fat-pointer locals into the
+    // heap frame so they survive suspension. Larger value aggregates keep an
+    // alloca (won't persist across await — documented limitation).
     const frameSlot = this.asyncFrameSlotFor(name, type);
     if (frameSlot) {
       this.locals.set(name, { ptr: frameSlot, type, boxed: false });
@@ -5304,8 +5339,9 @@ export class LlvmCodegen {
 
   /**
    * Return the frame-slot pointer for `name` when emitting an async task body
-   * and the local's type is pointer-sized (fits one 8-byte slot); otherwise
-   * null (caller falls back to an alloca).
+   * and the local's type fits the reserved spill slots (scalar/ptr, or a
+   * 16-byte interface/callable fat pointer); otherwise null (caller falls back
+   * to an alloca that will not survive await).
    */
   private asyncFrameSlotFor(name: string, type: ValueType): string | null {
     if (!this.asyncFrame) {
@@ -5315,17 +5351,7 @@ export class LlvmCodegen {
     if (!slot) {
       return null;
     }
-    const llvmTy = toLlvmType(type);
-    const fits =
-      llvmTy === "ptr" ||
-      llvmTy === "i1" ||
-      llvmTy === "i8" ||
-      llvmTy === "i16" ||
-      llvmTy === "i32" ||
-      llvmTy === "i64" ||
-      llvmTy === "float" ||
-      llvmTy === "double";
-    return fits ? slot : null;
+    return asyncSpillSlotCount(type) > 0 ? slot : null;
   }
 
   private emitDestructuringDeclaration(
@@ -9120,6 +9146,33 @@ interface TypeInfoFieldConst {
   readonly sizeExpr: string;
   readonly refClass: number;
   readonly typeId: number;
+}
+
+/**
+ * How many 8-byte async frame slots are needed to spill `type` across await.
+ * Returns 0 when the type must stay in an alloca (large value aggregates).
+ */
+function asyncSpillSlotCount(type: ValueType): number {
+  const llvmTy = toLlvmType(type);
+  if (
+    llvmTy === "ptr" ||
+    llvmTy === "i1" ||
+    llvmTy === "i8" ||
+    llvmTy === "i16" ||
+    llvmTy === "i32" ||
+    llvmTy === "i64" ||
+    llvmTy === "float" ||
+    llvmTy === "double"
+  ) {
+    return 1;
+  }
+  if (typeof type === "object" && type.kind === "interface") {
+    return 2;
+  }
+  if (llvmTy === "%__Callable") {
+    return 2;
+  }
+  return 0;
 }
 
 /**

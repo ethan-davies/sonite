@@ -1,0 +1,18 @@
+import { ByteStream } from "std/io";
+import { FileStream, writeFile, deleteFile } from "std/fs";
+
+async function main(): void {
+  let path = "/tmp/sn-filestream-test.bin";
+  writeFile(path, "abcdefghij");
+  let file = await FileStream.open(path);
+  let typed: ByteStream = file;
+  let chunk = await typed.read();
+  print(chunk.decode("utf8") == "abcdefghij");
+  let eof = await typed.read();
+  let zero: i64 = 0;
+  print(eof.length() == zero);
+  await typed.close();
+  await typed.close();
+  deleteFile(path);
+  print(true);
+}

@@ -24,19 +24,20 @@ Currently supported features:
   - `std/math` — abs/min/max/clamp/floor/ceil/round/sqrt/pow, trig (sin/cos/tan/asin/acos/atan/atan2), constants `PI`/`E`/`TAU`
   - `std/random` — `random` / `randomInt` / `randomFloat` / `randomBool` / `seed` (pseudo-random, not crypto)
   - `std/collections` — `Stack`, `Queue`, `Set`, `List`, `Map`, `Deque`
-  - `std/io` — `readLine`, stream write helpers (`console.*` builtins need no import)
-  - `std/fs` — file/directory/path helpers
+  - `std/io` — `readLine`, stream write helpers, **`ByteStream`** (`async read`/`write`/`close`; empty `Bytes` = EOF)
+  - `std/fs` — file/directory/path helpers plus async **`FileStream`** (`ByteStream`)
   - `std/process` — `args`, `getEnv`, `setEnv`, `cwd`, `exit`
   - `std/time` — `Instant`, `Duration`, async `sleep`, `sleepSync`, `now`
   - `std/async` — `sleep`, `spawn`, `all`, `race`, `timeout`
   - `std/bytes` — length-prefixed binary buffers (`Bytes`; also available via prelude)
-  - `std/net` — async TCP/UDP, DNS (`TcpStream`, `TcpListener`, `UdpSocket`, `resolve`), address types
-  - `std/tls` — OpenSSL-backed `TlsStream` client/server (certificate verification by default)
-  - `std/http` — HTTP/1.1 `fetch` / `fetchRequest` / `fetchInit` client (connect/read timeouts, keep-alive pool, redirects), `Server` (handlers, onion `use` / `useHeader`, static `getText`/`getJson`, wildcards, HTTPS), `Request`/`Response`/`Headers`/`URL`/`Body` (streaming `read`), parser
+  - `std/net` — async TCP/UDP, DNS (`TcpStream`, `TcpListener`, `UdpSocket`, `resolve`), address types; re-exports `ByteStream`
+  - `std/tls` — OpenSSL-backed `TlsStream` client/server (certificate verification by default); implements `ByteStream`
+  - `std/http` — HTTP/1.1 `fetch` / `fetchRequest` / `fetchInit` client, `Server` (async handlers, `listen` / `listenOn`, `serveTcp` / `serveTls` for one-shot connections, onion `use` / `useHeader`, static `getText`/`getJson`, wildcards, HTTPS), `Request`/`Response`/`Headers`/`URL`/`Body` (**streaming** `Body` implements `ByteStream`; Content-Length, chunked, connection-close), `Response.stream` / `streamWithLength`, `Response.readBytes` / `readText`
   - `std/json` — `Json` values and `stringify` (no parser yet)
   - `std/encoding` — UTF-8 helpers, base64, hex
 - Async I/O uses stackless task suspension (`sn_task_await_suspend`) so concurrent client/server round-trips work without nested `await_run` deadlocks
-- Network stream APIs take/return prelude `Bytes` (`TcpStream`/`UdpSocket`/`TlsStream` read/write)
+- Network and file stream APIs take/return prelude `Bytes` (`TcpStream`/`TlsStream`/`FileStream`/`Body` read/write); cancelling a suspended stream await cancels only that Future — the stream stays open
+- Interface fat-pointer locals survive `await` (two frame slots)
 - Modules / imports:
   - Relative imports require `./` or `../` (e.g. `import { User } from "./models"`)
   - Core std via `std/…`; installed packages via bare name or `pkg/subpath` (versions from `project.lock`)

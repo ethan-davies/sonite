@@ -1,0 +1,48 @@
+import { Server, Request, Response } from "std/http";
+import { FileStream, writeFile, deleteFile } from "std/fs";
+import { TcpListener, TcpStream } from "std/net";
+import { spawn, sleep } from "std/async";
+
+async function handleFile(_req: Request): Response {
+  let path = "/tmp/sn-http-stream-file.txt";
+  writeFile(path, "streamed-file-body");
+  let file = await FileStream.open(path);
+  let len = file.size();
+  let zero: i64 = 0;
+  let one: i64 = 1;
+  let unknown = zero - one;
+  if (len > unknown) {
+    return Response.streamWithLength(file, len);
+  }
+  return Response.stream(file);
+}
+
+async function client(port: i32): void {
+  await sleep(50);
+  let conn = await TcpStream.connect("127.0.0.1", port);
+  await conn.write(
+    Bytes.fromString("GET /file HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+  );
+  let chunk = await conn.read();
+  let text = chunk.decode("utf8");
+  print(text.contains("streamed-file-body"));
+  print(text.contains("content-length") || text.contains("chunked"));
+  await conn.close();
+  deleteFile("/tmp/sn-http-stream-file.txt");
+}
+
+async function serveOnce(port: i32): void {
+  let server = new Server();
+  server.get("/file", handleFile);
+  let listener = await TcpListener.bind("127.0.0.1", port);
+  let conn = await listener.accept();
+  await server.serveTcp(conn.rawHandle());
+  listener.close();
+}
+
+async function main(): void {
+  let port: i32 = 19203;
+  let s = spawn(serveOnce(port));
+  await client(port);
+  await s;
+}

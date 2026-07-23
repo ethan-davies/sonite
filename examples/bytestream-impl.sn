@@ -1,38 +1,50 @@
-import { ByteStream } from "std/net";
+import { ByteStream } from "std/io";
 
 /** User-level implementor of the stdlib ByteStream interface. */
 class MemStream implements ByteStream {
   private data: Bytes;
+  private closed: bool;
+  private eof: bool;
 
   constructor(data: Bytes) {
     this.data = data;
+    this.closed = false;
+    this.eof = false;
   }
 
-  rawHandle(): i64 {
-    return this.data.rawHandle();
-  }
-
-  async read(maxBytes: i32): Bytes {
+  async read(): Bytes {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
+    if (this.eof) {
+      return Bytes.empty();
+    }
+    this.eof = true;
     return this.data;
   }
 
   async write(data: Bytes): void {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
     this.data = data;
-  }
-
-  async flush(): void {
+    this.eof = false;
   }
 
   async close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.eof = true;
   }
 }
 
 async function main(): void {
   let stream = new MemStream(Bytes.fromString("hi"));
   let typed: ByteStream = stream;
-  // Call through the concrete value so the interface fat pointer need not
-  // survive across await (aggregates are not spilled to async frames yet).
-  let chunk = await stream.read(8);
+  let chunk = await typed.read();
   print(chunk.decode("utf8"));
+  await typed.close();
   await typed.close();
 }

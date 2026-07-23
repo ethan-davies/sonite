@@ -1,4 +1,4 @@
-import { ByteStream } from "std/net";
+import { ByteStream, STREAM_DEFAULT_CHUNK } from "std/io";
 
 extern function sn_tls_connect(host: string, port: i32, flags: i32, caFile: string): Future<i64>;
 extern function sn_tls_accept(tcpHandle: i64, flags: i32, certPem: string, keyPem: string): Future<i64>;
@@ -58,9 +58,13 @@ export class TlsConfig {
 
 export class TlsStream implements ByteStream {
   private handle: i64;
+  private eof: bool;
+  private closed: bool;
 
   constructor(handle: i64) {
     this.handle = handle;
+    this.eof = false;
+    this.closed = false;
   }
 
   static connect(host: string, port: i32): Future<TlsStream> {
@@ -88,20 +92,43 @@ export class TlsStream implements ByteStream {
     return this.handle;
   }
 
-  async read(maxBytes: i32): Bytes {
-    return await tlsReadBytes(this.handle, maxBytes);
+  async read(): Bytes {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
+    if (this.eof) {
+      return Bytes.empty();
+    }
+    let chunk = await tlsReadBytes(this.handle, STREAM_DEFAULT_CHUNK);
+    let zero: i64 = 0;
+    if (chunk.length() == zero) {
+      this.eof = true;
+    }
+    return chunk;
   }
 
   async write(data: Bytes): void {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
     await sn_tls_write(this.handle, data.rawHandle());
   }
 
   async flush(): void {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
     await tlsFlush();
   }
 
   async close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.eof = true;
     await tlsClose(this.handle);
+    this.handle = 0;
   }
 }
 

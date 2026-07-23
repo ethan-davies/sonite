@@ -1,3 +1,7 @@
+import { ByteStream, STREAM_DEFAULT_CHUNK } from "std/io";
+
+export { ByteStream } from "std/io";
+
 extern function sn_tcp_listen(host: string, port: i32): Future<i64>;
 extern function sn_tcp_accept(listener: i64): Future<i64>;
 extern function sn_tcp_connect(host: string, port: i32): Future<i64>;
@@ -152,20 +156,17 @@ export class SocketAddress {
   }
 }
 
-/** Shared stream shape for TCP/TLS (async methods). */
-export interface ByteStream {
-  rawHandle(): i64;
-  async read(maxBytes: i32): Bytes;
-  async write(data: Bytes): void;
-  async flush(): void;
-  async close(): void;
-}
+/** Shared stream shape for TCP/TLS (re-exported from std/io). */
 
 export class TcpStream implements ByteStream {
   private handle: i64;
+  private eof: bool;
+  private closed: bool;
 
   constructor(handle: i64) {
     this.handle = handle;
+    this.eof = false;
+    this.closed = false;
   }
 
   static connect(host: string, port: i32): Future<TcpStream> {
@@ -176,20 +177,43 @@ export class TcpStream implements ByteStream {
     return this.handle;
   }
 
-  async read(maxBytes: i32): Bytes {
-    return await tcpReadBytes(this.handle, maxBytes);
+  async read(): Bytes {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
+    if (this.eof) {
+      return Bytes.empty();
+    }
+    let chunk = await tcpReadBytes(this.handle, STREAM_DEFAULT_CHUNK);
+    let zero: i64 = 0;
+    if (chunk.length() == zero) {
+      this.eof = true;
+    }
+    return chunk;
   }
 
   async write(data: Bytes): void {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
     await sn_tcp_write(this.handle, data.rawHandle());
   }
 
   async flush(): void {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
     await sn_tcp_flush(this.handle);
   }
 
   async close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.eof = true;
     await tcpClose(this.handle);
+    this.handle = 0;
   }
 }
 

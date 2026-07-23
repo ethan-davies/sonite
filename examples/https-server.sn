@@ -16,7 +16,7 @@ async function client(port: i32): void {
   await tls.write(
     Bytes.fromString("GET /users/7 HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
   );
-  let chunk = await tls.read(4096);
+  let chunk = await tls.read();
   let text = chunk.decode("utf8");
   print(text.contains("user:7"));
   print(text.contains("x-powered-by: sonite"));
@@ -51,13 +51,13 @@ async function main(): void {
   let listener = await TcpListener.bind("127.0.0.1", port);
   let c = spawn(client(port));
   let tls = await TlsStream.acceptListener(listener.rawHandle(), cert, key);
-  let reqBytes = await tls.read(4096);
+  let reqBytes = await tls.read();
   let parsed = parseRequest(reqBytes.decode("utf8"));
   let req = parsed.request;
   if (!parsed.ok || req == null) {
     print("parse-fail");
   } else {
-    let response = server.handle(req);
+    let response = await server.handle(req);
     print(response.body.text());
     await tls.write(formatResponse(response));
   }

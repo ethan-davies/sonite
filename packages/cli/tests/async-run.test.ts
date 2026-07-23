@@ -102,6 +102,75 @@ describe.runIf(clangAvailable())("async sn run integration", () => {
   );
 
   it(
+    "runs bytestream-impl.sn",
+    async () => {
+      const code = await compileLinkAndRun(
+        join(examples, "bytestream-impl.sn"),
+        [],
+      );
+      expect(code).toBe(0);
+    },
+    30_000,
+  );
+
+  it(
+    "runs filestream.sn",
+    async () => {
+      const code = await compileLinkAndRun(join(examples, "filestream.sn"), []);
+      expect(code).toBe(0);
+    },
+    30_000,
+  );
+
+  it(
+    "runs http-stream-upload.sn",
+    async () => {
+      const code = await compileLinkAndRun(
+        join(examples, "http-stream-upload.sn"),
+        [],
+      );
+      expect(code).toBe(0);
+    },
+    60_000,
+  );
+
+  it(
+    "runs http-listen-smoke.sn",
+    async () => {
+      const code = await compileLinkAndRun(
+        join(examples, "http-listen-smoke.sn"),
+        [],
+      );
+      expect(code).toBe(0);
+    },
+    60_000,
+  );
+
+  it(
+    "runs http-stream-chunked.sn",
+    async () => {
+      const code = await compileLinkAndRun(
+        join(examples, "http-stream-chunked.sn"),
+        [],
+      );
+      expect(code).toBe(0);
+    },
+    60_000,
+  );
+
+  it(
+    "runs http-stream-file.sn",
+    async () => {
+      const code = await compileLinkAndRun(
+        join(examples, "http-stream-file.sn"),
+        [],
+      );
+      expect(code).toBe(0);
+    },
+    60_000,
+  );
+
+  it(
     "runs json-stringify.sn",
     async () => {
       const code = await compileLinkAndRun(

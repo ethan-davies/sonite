@@ -14,12 +14,13 @@ async function serveOnce(port: i32): void {
   server.getText("/hello", "world");
   let listener = await TcpListener.bind("127.0.0.1", port);
   let conn = await listener.accept();
-  let chunk = await conn.read(4096);
+  let chunk = await conn.read();
   let text = chunk.decode("utf8");
   let parsed = parseRequest(text);
   let req = parsed.request;
   if (parsed.ok && req != null) {
-    await conn.write(formatResponse(server.handle(req)));
+    let resp = await server.handle(req);
+    await conn.write(formatResponse(resp));
   }
   await conn.close();
   listener.close();
@@ -32,7 +33,7 @@ async function client(port: i32): void {
     sn_str_concat(sn_i32_to_string(port), "\r\nconnection: close\r\n\r\n")
   );
   await conn.write(Bytes.fromString(url));
-  let chunk = await conn.read(4096);
+  let chunk = await conn.read();
   let text = chunk.decode("utf8");
   print(text.contains("world"));
   await conn.close();

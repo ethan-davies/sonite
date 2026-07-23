@@ -381,6 +381,7 @@ void sn_future_await_run(void *fut_ptr) {
     current_task = NULL;
     sn_dns_poll_results();
     sn_tls_poll_results();
+    sn_file_poll_results();
     sn_timer_fire_due();
     if (sn_scheduler_has_runnable()) {
       sn_scheduler_run_ready();
@@ -389,6 +390,7 @@ void sn_future_await_run(void *fut_ptr) {
       sn_reactor_wait(timeout);
       sn_dns_poll_results();
     sn_tls_poll_results();
+    sn_file_poll_results();
       sn_timer_fire_due();
       sn_scheduler_run_ready();
     }
@@ -424,10 +426,12 @@ void sn_event_loop_poll(void) {
   sn_async_ensure_init();
   sn_dns_poll_results();
     sn_tls_poll_results();
+    sn_file_poll_results();
   sn_timer_fire_due();
   sn_reactor_wait(0);
   sn_dns_poll_results();
     sn_tls_poll_results();
+    sn_file_poll_results();
   sn_scheduler_run_ready();
 }
 
@@ -437,6 +441,7 @@ void sn_event_loop_run(void *root_future) {
   for (;;) {
     sn_dns_poll_results();
     sn_tls_poll_results();
+    sn_file_poll_results();
     sn_scheduler_run_ready();
     sn_timer_fire_due();
     if (root != NULL && root->state != SN_FUTURE_PENDING && active_count <= 0 &&
@@ -456,6 +461,7 @@ void sn_event_loop_run(void *root_future) {
       sn_reactor_wait(timeout);
       sn_dns_poll_results();
     sn_tls_poll_results();
+    sn_file_poll_results();
       sn_timer_fire_due();
     }
   }

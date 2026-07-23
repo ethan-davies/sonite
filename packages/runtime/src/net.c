@@ -325,6 +325,13 @@ void *sn_tcp_read(int64_t conn_handle, int32_t max_bytes) {
     sn_future_fail(fut, make_error("invalid connection"));
     return fut;
   }
+  /* Bound allocation so a peer cannot force unbounded buffers per read. */
+  if (max_bytes <= 0) {
+    max_bytes = 65536;
+  }
+  if (max_bytes > 1048576) {
+    max_bytes = 1048576;
+  }
   SnReadReq *req = (SnReadReq *)sn_alloc((int64_t)sizeof(SnReadReq));
   req->conn = conn;
   req->future = fut;

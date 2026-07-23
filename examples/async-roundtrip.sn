@@ -7,7 +7,7 @@ import { spawn } from "std/async";
 async function client(port: i32): void {
   const conn = await TcpStream.connect("127.0.0.1", port);
   await conn.write(Bytes.fromString("ping"));
-  const reply = await conn.read(64);
+  const reply = await conn.read();
   print(reply.decode("utf8"));
   await conn.close();
 }
@@ -20,7 +20,7 @@ async function main(): void {
   // Server: accept, read the request, write a response — all while the client
   // is suspended awaiting that response.
   const server = await listener.accept();
-  const req = await server.read(64);
+  const req = await server.read();
   print(req.decode("utf8"));
   await server.write(Bytes.fromString("pong"));
   await server.close();

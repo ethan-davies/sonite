@@ -1,5 +1,6 @@
 import { TcpListener, TcpStream } from "std/net";
 import { TlsStream } from "std/tls";
+import { ByteStream, STREAM_DEFAULT_CHUNK } from "std/io";
 import { sleep, spawn, race } from "std/async";
 
 extern function sn_str_to_lower(s: string): string;
@@ -21,6 +22,9 @@ extern function sn_bytes_len(handle: i64): i64;
 extern function sn_bytes_slice(handle: i64, start: i32, end: i32): i64;
 extern function sn_bytes_concat(left: i64, right: i64): i64;
 extern function sn_bytes_new(length: i64): i64;
+extern function sn_bytes_get(handle: i64, index: i32): i32;
+extern function sn_i64_trunc_i32(value: i64): i32;
+extern function sn_i32_widen_i64(value: i32): i64;
 extern function sn_map_keys(map: { [key: string]: string | null }): string[];
 extern function sn_map_set(map: { [key: string]: string | null }, key: string, val: string): void;
 extern function sn_map_get(map: { [key: string]: string | null }, key: string): string | null;
@@ -180,13 +184,118 @@ export class URL {
   }
 }
 
-export class Body {
+function findBytesCRLFCRLF(handle: i64): i32 {
+  let len = sn_i64_trunc_i32(sn_bytes_len(handle));
+  let i: i32 = 0;
+  while (i + 3 < len) {
+    if (
+      sn_bytes_get(handle, i) == 13 &&
+      sn_bytes_get(handle, i + 1) == 10 &&
+      sn_bytes_get(handle, i + 2) == 13 &&
+      sn_bytes_get(handle, i + 3) == 10
+    ) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+function parseHexLength(s: string): i64 {
+  let n: i64 = 0;
+  let i: i32 = 0;
+  let len = sn_str_len(s);
+  let sixteen: i64 = 16;
+  while (i < len) {
+    let c = sn_str_substring(s, i, i + 1);
+    let v: i32 = -1;
+    if (c == "0") { v = 0; }
+    elseif (c == "1") { v = 1; }
+    elseif (c == "2") { v = 2; }
+    elseif (c == "3") { v = 3; }
+    elseif (c == "4") { v = 4; }
+    elseif (c == "5") { v = 5; }
+    elseif (c == "6") { v = 6; }
+    elseif (c == "7") { v = 7; }
+    elseif (c == "8") { v = 8; }
+    elseif (c == "9") { v = 9; }
+    elseif (c == "a" || c == "A") { v = 10; }
+    elseif (c == "b" || c == "B") { v = 11; }
+    elseif (c == "c" || c == "C") { v = 12; }
+    elseif (c == "d" || c == "D") { v = 13; }
+    elseif (c == "e" || c == "E") { v = 14; }
+    elseif (c == "f" || c == "F") { v = 15; }
+    else {
+      break;
+    }
+    n = n * sixteen + sn_i32_widen_i64(v);
+    i = i + 1;
+  }
+  if (i == 0) {
+    let neg: i64 = 0;
+    let one: i64 = 1;
+    return neg - one;
+  }
+  return n;
+}
+
+function i64Min(a: i64, b: i64): i64 {
+  if (a < b) {
+    return a;
+  }
+  return b;
+}
+
+class EmptyByteStream implements ByteStream {
+  async read(): Bytes {
+    return Bytes.empty();
+  }
+  async write(data: Bytes): void {
+  }
+  async close(): void {
+  }
+}
+
+/**
+ * HTTP message body. Implements ByteStream.
+ * Buffered bodies (fromString/fromBytes) and live framed network bodies are supported.
+ * Empty Bytes from read() means EOF.
+ */
+export class Body implements ByteStream {
   private dataHandle: i64;
-  private consumed: bool;
+  private offset: i32;
+  private closed: bool;
+  private eof: bool;
+  private live: bool;
+  private transport: i64;
+  private isTls: bool;
+  private framing: i32;
+  private remaining: i64;
+  private pending: i64;
+  private chunkLeft: i64;
+  private chunkPhase: i32;
+  private ownedStream: ByteStream;
+  private hasOwnedStream: bool;
+  private maxPending: i64;
+  private ownsTransport: bool;
 
   constructor(dataHandle: i64) {
     this.dataHandle = dataHandle;
-    this.consumed = false;
+    this.offset = 0;
+    this.closed = false;
+    this.eof = false;
+    this.live = false;
+    this.transport = 0;
+    this.isTls = false;
+    this.framing = 0;
+    this.remaining = 0;
+    this.pending = sn_bytes_new(0);
+    this.chunkLeft = 0;
+    this.chunkPhase = 0;
+    this.ownedStream = new EmptyByteStream();
+    this.hasOwnedStream = false;
+    this.maxPending = 262144;
+    this.ownsTransport = false;
   }
 
   static empty(): Body {
@@ -205,15 +314,66 @@ export class Body {
     return new Body(b.rawHandle());
   }
 
+  /** Live body over a TCP/TLS transport with HTTP framing. */
+  static fromTransport(
+    transport: i64,
+    isTls: bool,
+    framing: i32,
+    contentLength: i64,
+    seed: i64,
+    ownsTransport: bool
+  ): Body {
+    let b = new Body(sn_bytes_new(0));
+    b.live = true;
+    b.transport = transport;
+    b.isTls = isTls;
+    b.framing = framing;
+    b.remaining = contentLength;
+    b.pending = seed;
+    b.chunkPhase = 0;
+    b.chunkLeft = 0;
+    b.ownsTransport = ownsTransport;
+    let zero: i64 = 0;
+    if (framing == 0 && contentLength == zero) {
+      b.eof = true;
+    }
+    return b;
+  }
+
+  /** Body that reads from another ByteStream (e.g. FileStream for Response.stream). */
+  static fromStream(stream: ByteStream): Body {
+    let b = new Body(sn_bytes_new(0));
+    b.live = true;
+    b.ownedStream = stream;
+    b.hasOwnedStream = true;
+    b.framing = 3;
+    return b;
+  }
+
   rawHandle(): i64 {
     return this.dataHandle;
   }
 
+  isLive(): bool {
+    return this.live;
+  }
+
+  isEof(): bool {
+    return this.eof;
+  }
+
+  /** Buffered convenience: full body bytes (live bodies must use collect()). */
   bytes(): Bytes {
+    if (this.live) {
+      throw new Error("use await body.collect() for streaming bodies");
+    }
     return Bytes.fromHandle(this.dataHandle);
   }
 
   text(): string {
+    if (this.live) {
+      throw new Error("use await body.collectText() for streaming bodies");
+    }
     let s = sn_bytes_to_utf8(this.dataHandle);
     if (s == null) {
       return "";
@@ -221,21 +381,231 @@ export class Body {
     return s;
   }
 
-  /**
-   * Streaming read of the buffered body. First call returns up to `maxBytes`
-   * (or the full buffer); subsequent calls return null (EOF).
-   */
-  read(maxBytes: i32): Bytes | null {
-    if (this.consumed) {
-      return null;
+  async collect(): Bytes {
+    if (!this.live) {
+      return Bytes.fromHandle(this.dataHandle);
     }
-    this.consumed = true;
-    let len = sn_bytes_len(this.dataHandle);
+    let out = sn_bytes_new(0);
+    while (true) {
+      let chunk = await this.read();
+      let zero: i64 = 0;
+      if (chunk.length() == zero) {
+        break;
+      }
+      out = sn_bytes_concat(out, chunk.rawHandle());
+    }
+    this.dataHandle = out;
+    this.live = false;
+    return Bytes.fromHandle(out);
+  }
+
+  async collectText(): string {
+    let b = await this.collect();
+    let s = sn_bytes_to_utf8(b.rawHandle());
+    if (s == null) {
+      return "";
+    }
+    return s;
+  }
+
+  async read(): Bytes {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
+    if (this.eof) {
+      return Bytes.empty();
+    }
+    if (!this.live) {
+      let len = sn_bytes_len(this.dataHandle);
+      let off = sn_i32_widen_i64(this.offset);
+      if (off >= len) {
+        this.eof = true;
+        return Bytes.empty();
+      }
+      let end = sn_i64_trunc_i32(len);
+      let slice = sn_bytes_slice(this.dataHandle, this.offset, end);
+      this.offset = end;
+      this.eof = true;
+      return Bytes.fromHandle(slice);
+    }
+    if (this.hasOwnedStream) {
+      let stream = this.ownedStream;
+      let chunk = await stream.read();
+      let zero: i64 = 0;
+      if (chunk.length() == zero) {
+        this.eof = true;
+      }
+      return chunk;
+    }
+    if (this.framing == 0) {
+      return await this.readContentLength();
+    }
+    if (this.framing == 1) {
+      return await this.readChunked();
+    }
+    return await this.readUntilClose();
+  }
+
+  async write(data: Bytes): void {
+    throw new Error("HTTP body is not writable");
+  }
+
+  async close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.eof = true;
+    if (this.hasOwnedStream) {
+      let stream = this.ownedStream;
+      await stream.close();
+      this.hasOwnedStream = false;
+    }
+    let zeroHandle: i64 = 0;
+    if (this.ownsTransport && this.transport != zeroHandle) {
+      if (this.isTls) {
+        sn_tls_close_i64(this.transport);
+      } else {
+        sn_tcp_close_i64(this.transport);
+      }
+      this.transport = zeroHandle;
+    }
+  }
+
+  private async fillPending(): void {
     let zero: i64 = 0;
-    if (len == zero) {
-      return null;
+    if (sn_bytes_len(this.pending) > zero) {
+      return;
     }
-    return Bytes.fromHandle(sn_bytes_slice(this.dataHandle, 0, maxBytes));
+    if (sn_bytes_len(this.pending) >= this.maxPending) {
+      return;
+    }
+    let chunk: i64;
+    if (this.isTls) {
+      chunk = await sn_tls_read(this.transport, STREAM_DEFAULT_CHUNK);
+    } else {
+      chunk = await sn_tcp_read(this.transport, STREAM_DEFAULT_CHUNK);
+    }
+    this.pending = sn_bytes_concat(this.pending, chunk);
+  }
+
+  private takePending(n: i64): Bytes {
+    let plen = sn_bytes_len(this.pending);
+    let take = i64Min(n, plen);
+    let zero: i64 = 0;
+    if (take <= zero) {
+      return Bytes.empty();
+    }
+    let take32 = sn_i64_trunc_i32(take);
+    let plen32 = sn_i64_trunc_i32(plen);
+    let out = sn_bytes_slice(this.pending, 0, take32);
+    this.pending = sn_bytes_slice(this.pending, take32, plen32);
+    return Bytes.fromHandle(out);
+  }
+
+  private async readContentLength(): Bytes {
+    let zero: i64 = 0;
+    if (this.remaining <= zero) {
+      this.eof = true;
+      return Bytes.empty();
+    }
+    while (sn_bytes_len(this.pending) == zero && this.remaining > zero) {
+      let before = sn_bytes_len(this.pending);
+      await this.fillPending();
+      if (sn_bytes_len(this.pending) == before) {
+        throw new Error("unexpected EOF");
+      }
+      if (sn_bytes_len(this.pending) == zero) {
+        throw new Error("unexpected EOF");
+      }
+    }
+    let defaultChunk: i64 = 65536;
+    let chunk = this.takePending(i64Min(this.remaining, defaultChunk));
+    this.remaining = this.remaining - chunk.length();
+    if (this.remaining <= zero) {
+      this.eof = true;
+    }
+    return chunk;
+  }
+
+  private async readUntilClose(): Bytes {
+    let defaultChunk: i64 = 65536;
+    let zero: i64 = 0;
+    while (sn_bytes_len(this.pending) == zero) {
+      let before = sn_bytes_len(this.pending);
+      await this.fillPending();
+      let after = sn_bytes_len(this.pending);
+      if (after == before) {
+        this.eof = true;
+        return Bytes.empty();
+      }
+      let got = this.takePending(defaultChunk);
+      if (got.length() == zero) {
+        this.eof = true;
+      }
+      return got;
+    }
+    return this.takePending(defaultChunk);
+  }
+
+  private async readChunked(): Bytes {
+    let zero: i64 = 0;
+    let two: i64 = 2;
+    while (true) {
+      if (this.chunkPhase == 0) {
+        while (true) {
+          let decoded = sn_bytes_to_utf8(this.pending);
+          let text = "";
+          if (decoded != null) {
+            text = decoded;
+          }
+          let lineEnd = sn_str_index_of(text, "\r\n");
+          if (lineEnd >= 0) {
+            let sizeLine = sn_str_substring(text, 0, lineEnd);
+            let size = parseHexLength(sizeLine);
+            if (size < zero) {
+              throw new Error("malformed chunked encoding");
+            }
+            let skip = lineEnd + 2;
+            this.pending = sn_bytes_slice(
+              this.pending,
+              skip,
+              sn_i64_trunc_i32(sn_bytes_len(this.pending))
+            );
+            if (size == zero) {
+              this.eof = true;
+              this.chunkPhase = 2;
+              return Bytes.empty();
+            }
+            this.chunkLeft = size;
+            this.chunkPhase = 1;
+            break;
+          }
+          let before = sn_bytes_len(this.pending);
+          await this.fillPending();
+          if (sn_bytes_len(this.pending) == before) {
+            throw new Error("unexpected EOF");
+          }
+        }
+      }
+      if (this.chunkPhase == 1) {
+        while (sn_bytes_len(this.pending) < this.chunkLeft + two) {
+          let before = sn_bytes_len(this.pending);
+          await this.fillPending();
+          if (sn_bytes_len(this.pending) == before) {
+            throw new Error("unexpected EOF");
+          }
+        }
+        let data = this.takePending(this.chunkLeft);
+        this.takePending(two);
+        this.chunkLeft = zero;
+        this.chunkPhase = 0;
+        return data;
+      }
+      this.eof = true;
+      return Bytes.empty();
+    }
+    return Bytes.empty();
   }
 }
 
@@ -259,11 +629,13 @@ export class Response {
   status: i32;
   headers: Headers;
   body: Body;
+  private streamOwned: bool;
 
   constructor(status: i32) {
     this.status = status;
     this.headers = new Headers();
     this.body = Body.empty();
+    this.streamOwned = false;
   }
 
   static text(text: string): Response {
@@ -283,6 +655,41 @@ export class Response {
   static status(code: i32): Response {
     return new Response(code);
   }
+
+  /** Stream a ByteStream as the response body (chunked transfer encoding). */
+  static stream(stream: ByteStream): Response {
+    let r = new Response(200);
+    r.body = Body.fromStream(stream);
+    r.streamOwned = true;
+    r.headers.set("transfer-encoding", "chunked");
+    return r;
+  }
+
+  /** Stream with a known Content-Length (e.g. from FileStream.size()). */
+  static streamWithLength(stream: ByteStream, length: i64): Response {
+    let r = new Response(200);
+    r.body = Body.fromStream(stream);
+    r.streamOwned = true;
+    let zero: i64 = 0;
+    if (length >= zero) {
+      r.headers.set("content-length", sn_i64_to_string(length));
+    } else {
+      r.headers.set("transfer-encoding", "chunked");
+    }
+    return r;
+  }
+
+  ownsStream(): bool {
+    return this.streamOwned;
+  }
+
+  async readBytes(): Bytes {
+    return await this.body.collect();
+  }
+
+  async readText(): string {
+    return await this.body.collectText();
+  }
 }
 
 function statusText(code: i32): string {
@@ -297,8 +704,18 @@ function statusText(code: i32): string {
 }
 
 export function formatResponse(response: Response): Bytes {
+  if (response.body.isLive()) {
+    throw new Error("formatResponse requires a buffered body; use streaming write path");
+  }
   let bodyHandle = response.body.rawHandle();
-  response.headers.set("content-length", sn_i64_to_string(sn_bytes_len(bodyHandle)));
+  if (!response.headers.has("content-length") && !response.headers.has("transfer-encoding")) {
+    response.headers.set("content-length", sn_i64_to_string(sn_bytes_len(bodyHandle)));
+  }
+  let head = formatResponseHead(response);
+  return Bytes.fromHandle(sn_bytes_concat(sn_bytes_from_cstr(head), bodyHandle));
+}
+
+function formatResponseHead(response: Response): string {
   let head = sn_str_concat(
     "HTTP/1.1 ",
     sn_str_concat(sn_i32_to_string(response.status), sn_str_concat(" ", sn_str_concat(statusText(response.status), "\r\n")))
@@ -312,8 +729,165 @@ export function formatResponse(response: Response): Bytes {
     }
     i = i + 1;
   }
-  head = sn_str_concat(head, "\r\n");
-  return Bytes.fromHandle(sn_bytes_concat(sn_bytes_from_cstr(head), bodyHandle));
+  return sn_str_concat(head, "\r\n");
+}
+
+function toChunkedFrame(data: Bytes): Bytes {
+  let hex = i64ToHex(data.length());
+  let frame = sn_str_concat(hex, "\r\n");
+  return Bytes.fromHandle(
+    sn_bytes_concat(
+      sn_bytes_concat(sn_bytes_from_cstr(frame), data.rawHandle()),
+      sn_bytes_from_cstr("\r\n")
+    )
+  );
+}
+
+function i64ToHex(n: i64): string {
+  let zero: i64 = 0;
+  if (n == zero) {
+    return "0";
+  }
+  let digits = "0123456789abcdef";
+  let out = "";
+  let v = n;
+  let parts: string[] = [];
+  let sixteen: i64 = 16;
+  let one: i64 = 1;
+  while (v > zero) {
+    let rem: i32 = 0;
+    let q: i64 = 0;
+    let t = v;
+    while (t >= sixteen) {
+      t = t - sixteen;
+      q = q + one;
+    }
+    rem = sn_i64_trunc_i32(t);
+    sn_array_push(parts, sn_str_substring(digits, rem, rem + 1));
+    v = q;
+  }
+  let i = parts.length - 1;
+  while (i >= 0) {
+    out = sn_str_concat(out, parts[i]);
+    i = i - 1;
+  }
+  return out;
+}
+
+async function writeResponseToTransport(response: Response, transport: i64, isTls: bool): void {
+  let body = response.body;
+  let live = body.isLive();
+  let shouldCloseStream = response.ownsStream();
+  let chunked = false;
+  let te = response.headers.get("transfer-encoding");
+  if (te != null) {
+    let teLower = sn_str_to_lower(te);
+    if (teLower.contains("chunked")) {
+      chunked = true;
+    }
+  }
+  if (live && !response.headers.has("content-length") && !chunked) {
+    response.headers.set("transfer-encoding", "chunked");
+    chunked = true;
+  }
+  if (!live && !response.headers.has("content-length") && !chunked) {
+    response.headers.set("content-length", sn_i64_to_string(sn_bytes_len(body.rawHandle())));
+  }
+
+  // Prefetch the first body chunk before writing headers so a worker-pool
+  // (or other) suspension cannot leave headers alone on the wire.
+  let first = Bytes.empty();
+  let haveFirst = false;
+  if (live) {
+    first = await body.read();
+    haveFirst = true;
+  }
+
+  let head = formatResponseHead(response);
+  let headBytes = sn_bytes_from_cstr(head);
+  let zero: i64 = 0;
+  if (live && haveFirst && first.length() > zero && !chunked) {
+    headBytes = sn_bytes_concat(headBytes, first.rawHandle());
+    haveFirst = false;
+  }
+  if (isTls) {
+    await sn_tls_write(transport, headBytes);
+  } else {
+    await sn_tcp_write(transport, headBytes);
+  }
+  if (!live) {
+    let bodyHandle = body.rawHandle();
+    let zeroLen: i64 = 0;
+    if (sn_bytes_len(bodyHandle) > zeroLen) {
+      if (isTls) {
+        await sn_tls_write(transport, bodyHandle);
+      } else {
+        await sn_tcp_write(transport, bodyHandle);
+      }
+    }
+    return;
+  }
+  if (haveFirst) {
+    if (first.length() == zero) {
+      if (chunked) {
+        let end = Bytes.fromString("0\r\n\r\n");
+        if (isTls) {
+          await sn_tls_write(transport, end.rawHandle());
+        } else {
+          await sn_tcp_write(transport, end.rawHandle());
+        }
+      }
+      if (shouldCloseStream) {
+        await body.close();
+      }
+      return;
+    }
+    if (chunked) {
+      let framed = toChunkedFrame(first);
+      if (isTls) {
+        await sn_tls_write(transport, framed.rawHandle());
+      } else {
+        await sn_tcp_write(transport, framed.rawHandle());
+      }
+    } else {
+      if (isTls) {
+        await sn_tls_write(transport, first.rawHandle());
+      } else {
+        await sn_tcp_write(transport, first.rawHandle());
+      }
+    }
+  }
+  while (true) {
+    let chunk = await body.read();
+    if (chunk.length() == zero) {
+      if (chunked) {
+        let end = Bytes.fromString("0\r\n\r\n");
+        if (isTls) {
+          await sn_tls_write(transport, end.rawHandle());
+        } else {
+          await sn_tcp_write(transport, end.rawHandle());
+        }
+      }
+      break;
+    }
+    if (chunked) {
+      let framed = toChunkedFrame(chunk);
+      if (isTls) {
+        await sn_tls_write(transport, framed.rawHandle());
+      } else {
+        await sn_tcp_write(transport, framed.rawHandle());
+      }
+    } else {
+      if (isTls) {
+        await sn_tls_write(transport, chunk.rawHandle());
+      } else {
+        await sn_tcp_write(transport, chunk.rawHandle());
+      }
+    }
+  }
+  if (shouldCloseStream) {
+    await body.close();
+  }
 }
 
 export class ParsedRequest {
@@ -390,8 +964,13 @@ export function parseResponse(raw: string): Response {
     i = i + 1;
   }
   let te = resp.headers.get("transfer-encoding");
-  if (te != null && sn_str_to_lower(te).contains("chunked")) {
-    resp.body = Body.fromString(decodeChunked(bodyStr));
+  if (te != null) {
+    let teLower = sn_str_to_lower(te);
+    if (teLower.contains("chunked")) {
+      resp.body = Body.fromString(decodeChunked(bodyStr));
+    } else {
+      resp.body = Body.fromString(bodyStr);
+    }
   } else {
     resp.body = Body.fromString(bodyStr);
   }
@@ -429,7 +1008,7 @@ class Route {
   hasHandler: bool;
   body: string;
   contentType: string;
-  handler: (Request) => Response;
+  handler: async (Request) => Response;
 
   constructor(
     method: string,
@@ -438,7 +1017,7 @@ class Route {
     hasHandler: bool,
     body: string,
     contentType: string,
-    handler: (Request) => Response
+    handler: async (Request) => Response
   ) {
     this.method = method;
     this.pattern = pattern;
@@ -450,7 +1029,7 @@ class Route {
   }
 }
 
-function fallbackHandler(req: Request): Response {
+async function fallbackHandler(req: Request): Response {
   return Response.status(500);
 }
 
@@ -541,19 +1120,19 @@ export class Server {
     this.errorHandlerSet = true;
   }
 
-  get(pattern: string, handler: (Request) => Response): void {
+  get(pattern: string, handler: async (Request) => Response): void {
     this.addHandlerRoute("GET", pattern, handler);
   }
 
-  post(pattern: string, handler: (Request) => Response): void {
+  post(pattern: string, handler: async (Request) => Response): void {
     this.addHandlerRoute("POST", pattern, handler);
   }
 
-  put(pattern: string, handler: (Request) => Response): void {
+  put(pattern: string, handler: async (Request) => Response): void {
     this.addHandlerRoute("PUT", pattern, handler);
   }
 
-  delete(pattern: string, handler: (Request) => Response): void {
+  delete(pattern: string, handler: async (Request) => Response): void {
     this.addHandlerRoute("DELETE", pattern, handler);
   }
 
@@ -569,7 +1148,7 @@ export class Server {
     this.addStaticRoute("POST", pattern, body, "text/plain; charset=utf-8");
   }
 
-  private addHandlerRoute(method: string, pattern: string, handler: (Request) => Response): void {
+  private addHandlerRoute(method: string, pattern: string, handler: async (Request) => Response): void {
     let norm = normalizePath(pattern);
     this.ensureUnique(method, norm);
     sn_array_push(
@@ -629,7 +1208,17 @@ export class Server {
     return serverListen(this, host, port);
   }
 
-  handle(request: Request): Response {
+  /** Handle a single accepted TCP connection (headers + body framing + response). */
+  serveTcp(tcpHandle: i64): Future<void> {
+    return handleConnection(this, tcpHandle);
+  }
+
+  /** Handle a single accepted TLS connection. */
+  serveTls(tlsHandle: i64): Future<void> {
+    return handleTlsConnection(this, tlsHandle);
+  }
+
+  handle(request: Request): Future<Response> {
     return dispatch(this, request);
   }
 }
@@ -678,7 +1267,7 @@ function matchRoute(pattern: string, path: string, params: Headers): bool {
   return i == tp.length;
 }
 
-function dispatch(server: Server, request: Request): Response {
+async function dispatch(server: Server, request: Request): Response {
   let path = normalizePath(request.url.path);
   let routes = server.getRoutes();
   let found = false;
@@ -731,7 +1320,7 @@ function dispatch(server: Server, request: Request): Response {
     let route = routes[chosenIdx];
     if (route.hasHandler) {
       let h = route.handler;
-      response = h(request);
+      response = await h(request);
     } else {
       let out = route.body;
       let id = request.params.get("id");
@@ -747,23 +1336,7 @@ function dispatch(server: Server, request: Request): Response {
     response = defaultError(server, request, 404);
   }
 
-  let mws = server.getMiddlewares();
-  if (mws.length > 0) {
-    let handler: (Request) => Response = (req: Request): Response => {
-      return response;
-    };
-    let chain: (Request) => Response = handler;
-    let m: i32 = mws.length - 1;
-    while (m >= 0) {
-      let mw = mws[m];
-      let inner = chain;
-      chain = (r: Request): Response => {
-        return mw(r, inner);
-      };
-      m = m - 1;
-    }
-    response = chain(request);
-  }
+  response = applyMiddleware(server, request, response);
 
   let names = server.getMwNames();
   let values = server.getMwValues();
@@ -775,6 +1348,27 @@ function dispatch(server: Server, request: Request): Response {
   return response;
 }
 
+function applyMiddleware(server: Server, request: Request, response: Response): Response {
+  let mws = server.getMiddlewares();
+  if (mws.length == 0) {
+    return response;
+  }
+  let handler: (Request) => Response = (req: Request): Response => {
+    return response;
+  };
+  let chain: (Request) => Response = handler;
+  let m: i32 = mws.length - 1;
+  while (m >= 0) {
+    let mw = mws[m];
+    let inner = chain;
+    chain = (r: Request): Response => {
+      return mw(r, inner);
+    };
+    m = m - 1;
+  }
+  return chain(request);
+}
+
 function defaultError(server: Server, request: Request, code: i32): Response {
   if (server.hasErrorHandler()) {
     let custom = server.getErrorHandler();
@@ -783,81 +1377,135 @@ function defaultError(server: Server, request: Request, code: i32): Response {
   return defaultErrFn(request, code);
 }
 
-async function handleConnection(server: Server, tcpHandle: i64): void {
-  let zeroI64: i64 = 0;
-  let tlsHandle: i64 = 0;
-  let useTls = false;
-  let rawHandle = sn_bytes_new(0);
+class I32I64 {
+  a: i32;
+  b: i64;
+
+  constructor(a: i32, b: i64) {
+    this.a = a;
+    this.b = b;
+  }
+}
+
+class I64Pair {
+  a: i64;
+  b: i64;
+
+  constructor(a: i64, b: i64) {
+    this.a = a;
+    this.b = b;
+  }
+}
+
+function bodyFramingFromHeaders(headers: Headers): I32I64 {
+  let te = headers.get("transfer-encoding");
+  let zero: i64 = 0;
+  if (te != null) {
+    let teLower = sn_str_to_lower(te);
+    if (teLower.contains("chunked")) {
+      return new I32I64(1, zero);
+    }
+  }
+  let cl = headers.get("content-length");
+  if (cl != null) {
+    let n = sn_str_parse_i32(cl);
+    return new I32I64(0, sn_i32_widen_i64(n));
+  }
+  return new I32I64(2, zero);
+}
+
+function parseRequestFromHead(headBytes: i64, seedBody: i64, transport: i64, isTls: bool): ParsedRequest {
+  let result = new ParsedRequest();
+  let decoded = sn_bytes_to_utf8(headBytes);
+  if (decoded == null) {
+    result.error = "invalid request encoding";
+    return result;
+  }
+  let head = decoded;
+  let lines = sn_str_split(head, "\r\n");
+  if (lines.length < 1) {
+    result.error = "missing request line";
+    return result;
+  }
+  let parts = sn_str_split(lines[0], " ");
+  if (parts.length < 3) {
+    result.error = "malformed request line";
+    return result;
+  }
+  let url = URL.parse(sn_str_concat("http://localhost", parts[1]));
+  let req = new Request(parts[0], url);
+  let i: i32 = 1;
+  while (i < lines.length) {
+    let line = lines[i];
+    let colon = sn_str_index_of(line, ":");
+    if (colon > 0) {
+      req.headers.append(
+        sn_str_trim(sn_str_substring(line, 0, colon)),
+        sn_str_trim(sn_str_substring(line, colon + 1, sn_str_len(line)))
+      );
+    }
+    i = i + 1;
+  }
+  let framing = bodyFramingFromHeaders(req.headers);
+  req.body = Body.fromTransport(transport, isTls, framing.a, framing.b, seedBody, false);
+  result.ok = true;
+  result.request = req;
+  return result;
+}
+
+async function readHttpHeaders(transport: i64, isTls: bool): I64Pair {
+  let raw = sn_bytes_new(0);
   let guard: i32 = 0;
-  while (guard < 64) {
-    let chunk = await sn_tcp_read(tcpHandle, 65536);
-    rawHandle = sn_bytes_concat(rawHandle, chunk);
-    let textLoop = "";
-    let decodedLoop = sn_bytes_to_utf8(rawHandle);
-    if (decodedLoop != null) {
-      textLoop = decodedLoop;
+  let zero: i64 = 0;
+  while (guard < 256) {
+    let chunk: i64;
+    if (isTls) {
+      chunk = await sn_tls_read(transport, STREAM_DEFAULT_CHUNK);
+    } else {
+      chunk = await sn_tcp_read(transport, STREAM_DEFAULT_CHUNK);
     }
-    if (textLoop.contains("\r\n\r\n")) {
-      break;
+    raw = sn_bytes_concat(raw, chunk);
+    let sep = findBytesCRLFCRLF(raw);
+    if (sep >= 0) {
+      let headEnd = sep;
+      let head = sn_bytes_slice(raw, 0, headEnd);
+      let seedStart = sep + 4;
+      let seed = sn_bytes_slice(raw, seedStart, sn_i64_trunc_i32(sn_bytes_len(raw)));
+      return new I64Pair(head, seed);
     }
-    if (sn_bytes_len(chunk) == zeroI64) {
+    if (sn_bytes_len(chunk) == zero) {
       break;
     }
     guard = guard + 1;
   }
-  let textFinal = "";
-  let decodedFinal = sn_bytes_to_utf8(rawHandle);
-  if (decodedFinal != null) {
-    textFinal = decodedFinal;
-  }
-  let parsed = parseRequest(textFinal);
+  return new I64Pair(raw, sn_bytes_new(0));
+}
+
+async function handleConnection(server: Server, tcpHandle: i64): void {
+  let parts = await readHttpHeaders(tcpHandle, false);
+  let parsed = parseRequestFromHead(parts.a, parts.b, tcpHandle, false);
   let response: Response;
   let parsedReq = parsed.request;
   if (!parsed.ok || parsedReq == null) {
     response = defaultError(server, new Request("GET", URL.parse("http://localhost/")), 400);
   } else {
-    response = dispatch(server, parsedReq);
+    response = await dispatch(server, parsedReq);
   }
-  let out = formatResponse(response);
-  await sn_tcp_write(tcpHandle, out.rawHandle());
+  await writeResponseToTransport(response, tcpHandle, false);
   sn_tcp_close_i64(tcpHandle);
 }
 
 async function handleTlsConnection(server: Server, tlsHandle: i64): void {
-  let zeroI64: i64 = 0;
-  let rawHandle = sn_bytes_new(0);
-  let guard: i32 = 0;
-  while (guard < 64) {
-    let chunk = await sn_tls_read(tlsHandle, 65536);
-    rawHandle = sn_bytes_concat(rawHandle, chunk);
-    let textLoop = "";
-    let decodedLoop = sn_bytes_to_utf8(rawHandle);
-    if (decodedLoop != null) {
-      textLoop = decodedLoop;
-    }
-    if (textLoop.contains("\r\n\r\n")) {
-      break;
-    }
-    if (sn_bytes_len(chunk) == zeroI64) {
-      break;
-    }
-    guard = guard + 1;
-  }
-  let textFinal = "";
-  let decodedFinal = sn_bytes_to_utf8(rawHandle);
-  if (decodedFinal != null) {
-    textFinal = decodedFinal;
-  }
-  let parsed = parseRequest(textFinal);
+  let parts = await readHttpHeaders(tlsHandle, true);
+  let parsed = parseRequestFromHead(parts.a, parts.b, tlsHandle, true);
   let response: Response;
   let parsedReq = parsed.request;
   if (!parsed.ok || parsedReq == null) {
     response = defaultError(server, new Request("GET", URL.parse("http://localhost/")), 400);
   } else {
-    response = dispatch(server, parsedReq);
+    response = await dispatch(server, parsedReq);
   }
-  let out = formatResponse(response);
-  await sn_tls_write(tlsHandle, out.rawHandle());
+  await writeResponseToTransport(response, tlsHandle, true);
   sn_tls_close_i64(tlsHandle);
 }
 
@@ -1136,48 +1784,36 @@ async function clientFetch(
     } else {
       await sn_tcp_write(connHandle, payload);
     }
-    let raw = sn_bytes_new(0);
-    let guard: i32 = 0;
-    let readDeadline = client.getReadTimeoutMs();
-    let readStart = sn_time_now_ms();
-    while (guard < 64) {
-      if (sn_time_now_ms() - readStart > readDeadline) {
-        throw new Error("read timed out");
-      }
-      let chunk: i64;
-      if (secure) {
-        chunk = await sn_tls_read(tlsHandle, 65536);
-      } else {
-        chunk = await sn_tcp_read(connHandle, 65536);
-      }
-      raw = sn_bytes_concat(raw, chunk);
-      let decodedLoop = sn_bytes_to_utf8(raw);
-      let textLoop = "";
-      if (decodedLoop != null) { textLoop = decodedLoop; }
-      if (textLoop.contains("\r\n\r\n")) { break; }
-      if (sn_bytes_len(chunk) == zeroI64) { break; }
-      guard = guard + 1;
+    let transport = connHandle;
+    if (secure) {
+      transport = tlsHandle;
     }
-    let decodedFinal = sn_bytes_to_utf8(raw);
-    if (decodedFinal == null) {
+    let headerParts = await readHttpHeaders(transport, secure);
+    let headDecoded = sn_bytes_to_utf8(headerParts.a);
+    if (headDecoded == null) {
       throw new Error("invalid response encoding");
     }
-    let resp = parseResponse(decodedFinal);
-    let connHdr = resp.headers.get("connection");
-    let keepAlive = true;
-    if (connHdr != null && sn_str_to_lower(connHdr) == "close") {
-      keepAlive = false;
+    let headText = headDecoded;
+    let lines = sn_str_split(headText, "\r\n");
+    let parts = sn_str_split(lines[0], " ");
+    let resp = new Response(sn_str_parse_i32(parts[1]));
+    let hi: i32 = 1;
+    while (hi < lines.length) {
+      let line = lines[hi];
+      let colon = sn_str_index_of(line, ":");
+      if (colon > 0) {
+        resp.headers.append(
+          sn_str_trim(sn_str_substring(line, 0, colon)),
+          sn_str_trim(sn_str_substring(line, colon + 1, sn_str_len(line)))
+        );
+      }
+      hi = hi + 1;
     }
-    if (keepAlive) {
-      let entry = new PoolEntry(key, 0, secure);
-      if (secure) { entry.handle = tlsHandle; }
-      else { entry.handle = connHandle; }
-      returnPool(client, entry);
-    } else {
-      if (secure) { sn_tls_close_i64(tlsHandle); }
-      else { sn_tcp_close_i64(connHandle); }
-    }
+    let framing = bodyFramingFromHeaders(resp.headers);
+    resp.body = Body.fromTransport(transport, secure, framing.a, framing.b, headerParts.b, true);
     if (resp.status == 301 || resp.status == 302 || resp.status == 307 || resp.status == 308) {
+      await resp.body.collect();
+      await resp.body.close();
       let loc = resp.headers.get("location");
       if (loc == null) { return resp; }
       url = URL.parse(loc);
@@ -1188,6 +1824,7 @@ async function clientFetch(
       redirects = redirects + 1;
       continue;
     }
+    // Streaming body owns the connection; do not return it to the pool.
     return resp;
   }
   throw new Error("too many redirects");

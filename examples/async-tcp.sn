@@ -12,7 +12,7 @@ async function main(): void {
   const listener = await TcpListener.bind("127.0.0.1", port);
   const c = spawn(client(port));
   const server = await listener.accept();
-  const msg = await server.read(64);
+  const msg = await server.read();
   print(msg.decode("utf8"));
   await server.close();
   await c;

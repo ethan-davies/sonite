@@ -155,6 +155,20 @@ char *sn_i64_to_string(int64_t value) {
   return buf;
 }
 
+int32_t sn_i64_trunc_i32(int64_t value) {
+  if (value > 2147483647) {
+    return 2147483647;
+  }
+  if (value < -2147483647 - 1) {
+    return (int32_t)(-2147483647 - 1);
+  }
+  return (int32_t)value;
+}
+
+int64_t sn_i32_widen_i64(int32_t value) {
+  return (int64_t)value;
+}
+
 char *sn_f32_to_string(float value) {
   char *buf = sn_alloc(32);
   sn_gc_set_type(buf, SN_TYPEID_STRING);

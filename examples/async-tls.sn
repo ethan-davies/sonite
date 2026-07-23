@@ -35,7 +35,7 @@ async function main(): void {
   let c = spawn(client(port));
   // Combined accept+TLS so handshake can finish while the client awaits connect.
   let tls = await TlsStream.acceptListener(listener.rawHandle(), cert, key);
-  let msg = await tls.read(64);
+  let msg = await tls.read();
   print(msg.decode("utf8"));
   await tls.close();
   await c;

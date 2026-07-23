@@ -848,7 +848,7 @@ Task frame (SN_TYPEID_FRAME, pointer-sized slots)
 └────────────────────────────────────────────┘
 ```
 
-The compiler spills all pointer-sized locals/params to frame slots; the slot pointers are computed in the entry block (which dominates every resume state), so they are valid at every re-entry.
+The compiler spills all pointer-sized locals/params to frame slots, and reserves two consecutive slots for each local (and for interface/callable params) so `{ data*, itable* }` fat pointers survive suspension. Slot pointers are computed in the entry block (which dominates every resume state), so they are valid at every re-entry.
 
 ### What stays alive across `await`
 
@@ -857,6 +857,7 @@ The compiler spills all pointer-sized locals/params to frame slots; the slot poi
 | `Future` | Builtin TypeInfo — scans `value`, `error`, waiter list, compose data |
 | `Task` | `SN_TYPEID_TASK` — scans `result`, `frame`, `awaiting` |
 | Task frame | `SN_TYPEID_FRAME` — **conservatively** scanned: every pointer-sized slot is treated as a potential heap pointer (non-pointer slots resolve to nothing in the side table, so this is safe and only over-retains). This is what keeps a *suspended* task's locals and result future alive between turns, since the shadow stack is unwound on every `ret void` |
+| Interface fields on classes | TypeInfo records a `PTR` root at the fat-pointer `data*` slot (itable is a global and is not traced). Objects held only via an interface-typed field stay alive. |
 | Timer / TCP requests | Hold a pointer to their completion `Future`; reactor/timer queues keep requests alive until they settle |
 
 The task is reachable from the scheduler's rooted task array, so `Task → frame → locals` is fully traced even while suspended.
@@ -868,7 +869,9 @@ Previously `await` called `sn_future_await_run`, which **stack-blocks** the curr
 ### Known limitations
 
 - Only values held in **named locals** (or params) survive an `await`; all such locals are spilled to the frame. Raw temporaries produced mid-expression around an inline `await` — e.g. `f(g(), await h())` or `(await a()) + (await b())` — are not spilled, so keep at most one `await` per expression (bind intermediate results to locals). Statement-level `const x = await …; use x;` is always safe.
-- Value-aggregate locals (structs/tuples larger than one slot) keep an `alloca` and are **not** preserved across an `await`.
+- Interface and callable fat-pointer locals (`{ data*, itable* }` / `%__Callable`) are spilled across two frame slots and **do** survive `await`.
+- Other value-aggregate locals (structs/tuples larger than one slot) keep an `alloca` and are **not** preserved across an `await`.
+- Cancelling a task that is suspended on a stream `read`/`write` cancels only that pending Future; the stream object remains open and usable for later operations unless the application closes it.
 
 ### Exceptions across await
 

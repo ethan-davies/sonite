@@ -1,0 +1,97 @@
+import { ByteStream, STREAM_DEFAULT_CHUNK } from "std/io";
+
+extern function sn_file_open(path: string, mode: string): Future<i64>;
+extern function sn_file_read(handle: i64, maxBytes: i32): Future<i64>;
+extern function sn_file_write(handle: i64, bytesHandle: i64): Future<void>;
+extern function sn_file_close(handle: i64): Future<void>;
+extern function sn_file_size(handle: i64): Future<i64>;
+
+/**
+ * Asynchronous file stream implementing ByteStream.
+ * Reads return chunks (default 64KiB); empty Bytes means EOF.
+ */
+export class FileStream implements ByteStream {
+  private handle: i64;
+  private eof: bool;
+  private closed: bool;
+  knownSize: i64;
+
+  constructor(handle: i64) {
+    this.handle = handle;
+    this.eof = false;
+    this.closed = false;
+    let neg: i64 = 0;
+    let one: i64 = 1;
+    this.knownSize = neg - one;
+  }
+
+  /** Open an existing file for reading. */
+  static open(path: string): Future<FileStream> {
+    return fileOpen(path, "r");
+  }
+
+  /** Create/truncate a file for writing. */
+  static create(path: string): Future<FileStream> {
+    return fileOpen(path, "w");
+  }
+
+  /** Open for append. */
+  static append(path: string): Future<FileStream> {
+    return fileOpen(path, "a");
+  }
+
+  rawHandle(): i64 {
+    return this.handle;
+  }
+
+  /** File size in bytes when known (-1 if unavailable). */
+  size(): i64 {
+    return this.knownSize;
+  }
+
+  async read(): Bytes {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
+    if (this.eof) {
+      return Bytes.empty();
+    }
+    let h = await sn_file_read(this.handle, STREAM_DEFAULT_CHUNK);
+    let chunk = Bytes.fromHandle(h);
+    let zero: i64 = 0;
+    if (chunk.length() == zero) {
+      this.eof = true;
+    }
+    return chunk;
+  }
+
+  async write(data: Bytes): void {
+    if (this.closed) {
+      throw new Error("stream closed");
+    }
+    await sn_file_write(this.handle, data.rawHandle());
+  }
+
+  async close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.eof = true;
+    await sn_file_close(this.handle);
+    this.handle = 0;
+  }
+}
+
+async function fileOpen(path: string, mode: string): FileStream {
+  let h = await sn_file_open(path, mode);
+  let known: i64 = 0;
+  let one: i64 = 1;
+  known = known - one;
+  if (mode == "r" || mode == "r+") {
+    known = await sn_file_size(h);
+  }
+  let stream = new FileStream(h);
+  stream.knownSize = known;
+  return stream;
+}

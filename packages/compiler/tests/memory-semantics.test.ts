@@ -55,29 +55,37 @@ describe("value vs reference memory semantics", () => {
     expect(Number(typeIdStore![1])).toBeGreaterThanOrEqual(256);
   });
 
-  it("emits TypeInfo with PTR for string fields and VALUE for i32", () => {
+  it("emits TypeInfo PTR for interface fields (data slot only)", () => {
     const result = compile(`
-      class Person {
-        name: string;
-        age: i32;
-        constructor(name: string, age: i32) {
-          this.name = name;
-          this.age = age;
+      interface Named {
+        name(): string;
+      }
+      class Person implements Named {
+        label: string;
+        constructor(label: string) {
+          this.label = label;
+        }
+        name(): string {
+          return this.label;
+        }
+      }
+      class Box {
+        item: Named;
+        constructor(item: Named) {
+          this.item = item;
         }
       }
       function main(): void {
-        let p = new Person("A", 20);
+        let b = new Box(new Person("A"));
+        print(b.item.name());
       }
     `);
     expect(result.success).toBe(true);
-    expect(result.ir).toContain(
-      "%SnTypeInfo = type { i32, i32, i32, i32, ptr, i32, i32, i32, i32, i32, i32, i32 }",
+    expect(result.ir).toContain("@Box__typeinfo_fields");
+    // Interface field → PTR at nested data offset (ref_class 1), not VALUE blob
+    expect(result.ir).toMatch(
+      /getelementptr inbounds \(%Box, ptr null, i32 0, i32 \d+, i32 0\).*i32 1, i32 0/,
     );
-    expect(result.ir).toContain("@Person__typeinfo_fields");
-    // string → PTR (ref_class 1), related type_id 1 (SN_TYPEID_STRING)
-    expect(result.ir).toMatch(/i32 1, i32 1\s*\}/);
-    // i32 → VALUE (ref_class 0)
-    expect(result.ir).toMatch(/i32 0, i32 0\s*\}/);
   });
 
   it("lays out class instances with ObjectHeader before fields", () => {

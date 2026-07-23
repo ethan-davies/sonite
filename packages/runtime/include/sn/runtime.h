@@ -268,6 +268,8 @@ char *sn_read_line(void);
 
 char *sn_i32_to_string(int32_t value);
 char *sn_i64_to_string(int64_t value);
+int32_t sn_i64_trunc_i32(int64_t value);
+int64_t sn_i32_widen_i64(int32_t value);
 char *sn_f32_to_string(float value);
 char *sn_f64_to_string(double value);
 char *sn_bool_to_string(bool value);
@@ -298,6 +300,14 @@ bool sn_fs_move_file(const char *src, const char *dst);
 bool sn_fs_create_dir(const char *path);
 bool sn_fs_delete_dir(const char *path);
 void *sn_fs_list_dir(const char *path); /* string[] or NULL on failure */
+
+/* Async file streams (worker pool + Future). Handles are opaque i64. */
+void *sn_file_open(const char *path, const char *mode); /* Future<i64> */
+void *sn_file_read(int64_t handle, int32_t max_bytes);  /* Future<i64> Bytes */
+void *sn_file_write(int64_t handle, int64_t bytes_handle); /* Future<void> */
+void *sn_file_close(int64_t handle); /* Future<void> */
+void *sn_file_size(int64_t handle); /* Future<i64> */
+void sn_file_poll_results(void);
 
 /* Path helpers */
 char *sn_path_join(const char *a, const char *b);

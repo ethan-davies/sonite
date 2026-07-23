@@ -1,3 +1,5 @@
+import { ByteStream } from "std/net";
+
 extern function sn_tls_connect(host: string, port: i32, flags: i32, caFile: string): Future<i64>;
 extern function sn_tls_accept(tcpHandle: i64, flags: i32, certPem: string, keyPem: string): Future<i64>;
 extern function sn_tls_accept_listener(listener: i64, certPem: string, keyPem: string): Future<i64>;
@@ -54,7 +56,7 @@ export class TlsConfig {
   }
 }
 
-export class TlsStream {
+export class TlsStream implements ByteStream {
   private handle: i64;
 
   constructor(handle: i64) {
@@ -86,20 +88,20 @@ export class TlsStream {
     return this.handle;
   }
 
-  read(maxBytes: i32): Future<Bytes> {
-    return tlsReadBytes(this.handle, maxBytes);
+  async read(maxBytes: i32): Bytes {
+    return await tlsReadBytes(this.handle, maxBytes);
   }
 
-  write(data: Bytes): Future<void> {
-    return sn_tls_write(this.handle, data.rawHandle());
+  async write(data: Bytes): void {
+    await sn_tls_write(this.handle, data.rawHandle());
   }
 
-  flush(): Future<void> {
-    return tlsFlush();
+  async flush(): void {
+    await tlsFlush();
   }
 
-  close(): Future<void> {
-    return tlsClose(this.handle);
+  async close(): void {
+    await tlsClose(this.handle);
   }
 }
 

@@ -7,7 +7,7 @@ extern function sn_i32_to_string(v: i32): string;
 
 /**
  * Local HTTP client↔server: Server routes a GET and the client reads the body.
- * (HttpClient.fetch works for remote URLs; try/catch across await is still limited.)
+ * (HttpClient.fetch works for remote URLs.)
  */
 async function serveOnce(port: i32): void {
   let server = new Server();

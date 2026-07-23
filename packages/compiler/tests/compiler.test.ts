@@ -1,15 +1,21 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { compile, compileFile } from "../src/compiler.js";
 import { encodeLlvmString } from "../src/codegen/llvm.js";
+import { setPackageRootsProvider } from "../src/modules/index.js";
 
 const examplesDir = join(
   dirname(fileURLToPath(import.meta.url)),
   "../../../examples",
 );
 const modulesDir = join(examplesDir, "modules");
+
+afterEach(() => {
+  setPackageRootsProvider(null);
+});
 
 const helloSource = `
 function main(): void {
@@ -729,6 +735,47 @@ describe("compile pipeline", () => {
       expect(result.success).toBe(true);
       expect(result.ir).toContain("%Drawable = type { ptr, ptr }");
       expect(result.ir).toContain("%ColorDrawable = type { ptr, ptr }");
+    });
+
+    it("rejects sync method for async interface method", () => {
+      const result = compile(`
+        interface Stream {
+          async read(): i32;
+        }
+        class Bad implements Stream {
+          constructor() {}
+          read(): i32 { return 1; }
+        }
+        function main(): void {}
+      `);
+      expect(result.success).toBe(false);
+      expect(
+        result.diagnostics.some(
+          (d) =>
+            d.code === "E0372" &&
+            d.message.includes("must be async"),
+        ),
+      ).toBe(true);
+    });
+
+    it("compiles async interface methods with Future-returning calls", () => {
+      const result = compile(`
+        interface Stream {
+          async read(): i32;
+        }
+        class Good implements Stream {
+          constructor() {}
+          async read(): i32 { return 42; }
+        }
+        async function main(): void {
+          let s: Stream = new Good();
+          let n = await s.read();
+          print(n);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("sn_task_await_suspend");
+      expect(result.ir).toContain("__itable");
     });
 
     it("rejects class missing interface method", () => {
@@ -1658,6 +1705,89 @@ function main(): void {
     expect(result.ir).toContain("define i32 @math__mul(i32 %arg0, i32 %arg1)");
     expect(result.ir).toContain("call i32 @math__add(i32 5, i32 10)");
     expect(result.ir).toContain("call i32 @math__mul(i32 3, i32 4)");
+  });
+
+  it("compiles implements of a package-exported interface", () => {
+    const pkgDir = mkdtempSync(join(tmpdir(), "sn-iface-pkg-"));
+    try {
+      mkdirSync(join(pkgDir, "src"), { recursive: true });
+      writeFileSync(
+        join(pkgDir, "src", "main.sn"),
+        `export interface Greeter {
+  async greet(): string;
+}
+`,
+        "utf8",
+      );
+      setPackageRootsProvider(
+        () => new Map([["ifacepkg", { dir: pkgDir, version: "1.0.0" }]]),
+      );
+      const files = new Map<string, string>([
+        [
+          "/proj/main.sn",
+          `import { Greeter } from "ifacepkg";
+class Hello implements Greeter {
+  constructor() {}
+  async greet(): string { return "hi"; }
+}
+async function main(): void {
+  let g: Greeter = new Hello();
+  print(await g.greet());
+}
+`,
+        ],
+      ]);
+      const result = compileFile("/proj/main.sn", {
+        readFile: (path) => {
+          if (files.has(path)) {
+            return files.get(path)!;
+          }
+          return readFileSync(path, "utf8");
+        },
+      });
+      expect(result.success).toBe(true);
+      expect(result.ir).toContain("__itable");
+    } finally {
+      setPackageRootsProvider(null);
+      rmSync(pkgDir, { recursive: true, force: true });
+    }
+  });
+
+  it("compiles implements of an imported interface", () => {
+    const files = new Map<string, string>([
+      [
+        "/virt/main.sn",
+        `import { Stream } from "./stream";
+class Pipe implements Stream {
+  constructor() {}
+  async read(): i32 { return 7; }
+}
+async function main(): void {
+  let s: Stream = new Pipe();
+  print(await s.read());
+}
+`,
+      ],
+      [
+        "/virt/stream.sn",
+        `export interface Stream {
+  async read(): i32;
+}
+`,
+      ],
+    ]);
+    const result = compileFile("/virt/main.sn", {
+      readFile: (path) => {
+        const source = files.get(path);
+        if (source === undefined) {
+          throw new Error(`ENOENT: ${path}`);
+        }
+        return source;
+      },
+    });
+    expect(result.success).toBe(true);
+    expect(result.ir).toContain("__itable");
+    expect(result.ir).toContain("sn_task_await_suspend");
   });
 
   it("compiles explicit import * as namespace syntax", () => {

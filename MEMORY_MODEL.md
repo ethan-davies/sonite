@@ -869,6 +869,7 @@ Previously `await` called `sn_future_await_run`, which **stack-blocks** the curr
 
 - Only values held in **named locals** (or params) survive an `await`; all such locals are spilled to the frame. Raw temporaries produced mid-expression around an inline `await` — e.g. `f(g(), await h())` or `(await a()) + (await b())` — are not spilled, so keep at most one `await` per expression (bind intermediate results to locals). Statement-level `const x = await …; use x;` is always safe.
 - Value-aggregate locals (structs/tuples larger than one slot) keep an `alloca` and are **not** preserved across an `await`.
-- `try`/`catch`/`finally` spanning an `await` uses setjmp/longjmp EH frames that are not re-established on resume; prefer keeping a `try` body free of suspension points for now.
 
-Failed futures surface via `sn_throw` when awaited. There is no separate async cancellation GC path beyond settling the future (`cancelled` / failed) and letting unreachable objects drop on the next collection.
+### Exceptions across await
+
+`try` / `catch` / `finally` may span `await`. Before suspension the codegen pops active setjmp/longjmp EH frames from the TLS stack; after resume it re-allocates frames and re-`setjmp`s so throws still reach the correct handler. Uncaught throws inside an async task settle the result Future via `sn_future_fail`. Failed and cancelled futures surface as `sn_throw` when awaited (cancelled uses `sn_error_new("cancelled")`). There is no separate async cancellation GC path beyond settling the future and letting unreachable objects drop on the next collection.

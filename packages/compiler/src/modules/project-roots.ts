@@ -127,11 +127,11 @@ export function applyPackageRootsFromProject(startDir?: string): void {
   try {
     const packages = discoverPackageRootsForProject(dir);
     if (packages.size === 0) {
-      setPackageRootsProvider(null);
+      // Leave any test/provider-injected roots alone when the project has no lock.
       return;
     }
     setPackageRootsProvider(() => packages);
   } catch {
-    setPackageRootsProvider(null);
+    // Keep existing provider on discovery failures.
   }
 }

@@ -1125,6 +1125,7 @@ export class Parser {
   /** Returns a signature, null on hard failure, or "skipped" after recovering from a field member. */
   private parseInterfaceMethod(): InterfaceMethodSignature | null | "skipped" {
     const start = this.peek().span.start;
+    const isAsync = this.match(TokenKind.Async);
     const nameToken = this.expect(TokenKind.Identifier, "Expected method name");
     if (!nameToken) {
       return null;
@@ -1184,6 +1185,7 @@ export class Parser {
     return {
       kind: "InterfaceMethodSignature",
       name: { kind: "Identifier", name: nameToken.lexeme, span: nameToken.span },
+      isAsync,
       typeParams,
       params,
       returnType,

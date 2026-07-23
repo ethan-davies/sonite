@@ -48,7 +48,41 @@ import {
   BUILTIN_ERROR_MANGLED,
   createBuiltinErrorClassDeclaration,
 } from "../builtins/error.js";
-import {
+
+/** Process imported modules before importers so named-import seeding works. */
+function modulesInDependencyOrder(
+  modules: readonly ResolvedModule[],
+): ResolvedModule[] {
+  const byPath = new Map(modules.map((m) => [m.path, m]));
+  const visiting = new Set<string>();
+  const done = new Set<string>();
+  const ordered: ResolvedModule[] = [];
+
+  const visit = (path: string): void => {
+    if (done.has(path) || !byPath.has(path)) {
+      return;
+    }
+    if (visiting.has(path)) {
+      return;
+    }
+    visiting.add(path);
+    const mod = byPath.get(path)!;
+    for (const binding of mod.imports) {
+      visit(binding.modulePath);
+    }
+    for (const re of mod.reexportSources) {
+      visit(re.path);
+    }
+    visiting.delete(path);
+    done.add(path);
+    ordered.push(mod);
+  };
+
+  for (const mod of modules) {
+    visit(mod.path);
+  }
+  return ordered;
+}import {
   isArrayType,
   isAssignable,
   isClassType,
@@ -183,12 +217,21 @@ type ControlContext =
   | { readonly kind: "switch"; readonly breakLabel: string }
   | {
       readonly kind: "try";
-      readonly framePtr: string;
+      /** Updated when an async try re-allocates its EH frame after resume. */
+      framePtr: string;
       readonly normalLeaveLabel: string;
       readonly afterLabel: string;
       readonly hasFinally: boolean;
       readonly finallyOnly: boolean;
+      readonly hasCatch: boolean;
+      readonly finallyArg: string;
+      readonly catchLabel: string | null;
     };
+
+/** Active async try handler that must be torn down on suspend and re-setjmp'd on resume. */
+interface AsyncEhHandler {
+  readonly tryCtx: Extract<ControlContext, { kind: "try" }>;
+}
 
 interface StructFieldInfo {
   readonly name: string;
@@ -229,6 +272,7 @@ interface ClassMethodInfo {
   readonly mangledName: string;
   readonly params: ValueType[];
   readonly returnType: ValueType | "void";
+  readonly isAsync: boolean;
   readonly isStatic: boolean;
   readonly isAbstract: boolean;
   readonly vtableSlot: number;
@@ -259,6 +303,7 @@ interface InterfaceMethodInfo {
   readonly name: string;
   readonly params: ValueType[];
   readonly returnType: ValueType | "void";
+  readonly isAsync: boolean;
   readonly itableSlot: number;
 }
 
@@ -383,6 +428,13 @@ export class LlvmCodegen {
     readonly awaitSlot: string;
     /** Number of states created so far (>= 1); also next state index. */
     stateCount: number;
+    /**
+     * Active try handlers (outer → inner). Popped from TLS before suspend and
+     * re-established with a fresh setjmp after resume.
+     */
+    readonly ehStack: AsyncEhHandler[];
+    /** Synthetic root catch that fails the result Future on uncaught throws. */
+    rootEh: Extract<ControlContext, { kind: "try" }> | null;
   } | null = null;
   /** Deferred return through a finally block. */
   private pendingReturn: {
@@ -514,8 +566,11 @@ export class LlvmCodegen {
       }
     >();
 
+    // Register types/signatures in dependency order so named imports resolve.
+    const orderedModules = modulesInDependencyOrder(modules);
+
     // Register all types and function signatures first.
-    for (const mod of modules) {
+    for (const mod of orderedModules) {
       const localEnums = new Map<string, EnumInfo>();
       const localStructs = new Map<string, StructInfo>();
       const localClasses = new Map<string, ClassInfo>();
@@ -1442,6 +1497,7 @@ export class LlvmCodegen {
           name: method.name,
           params: method.params,
           returnType: method.returnType,
+          isAsync: method.isAsync,
           itableSlot: methods.length,
         });
       }
@@ -1489,6 +1545,7 @@ export class LlvmCodegen {
         name: method.name.name,
         params,
         returnType,
+        isAsync: method.isAsync,
         itableSlot: methods.length,
       });
     }
@@ -1639,6 +1696,7 @@ export class LlvmCodegen {
           mangledName: mangledMethod,
           params,
           returnType,
+          isAsync: method.isAsync,
           isStatic: true,
           isAbstract: false,
           vtableSlot: -1,
@@ -1653,6 +1711,7 @@ export class LlvmCodegen {
           mangledName: mangledMethod,
           params,
           returnType,
+          isAsync: method.isAsync,
           isStatic: false,
           isAbstract: method.isAbstract,
           vtableSlot: existing,
@@ -1666,6 +1725,7 @@ export class LlvmCodegen {
           mangledName: mangledMethod,
           params,
           returnType,
+          isAsync: method.isAsync,
           isStatic: false,
           isAbstract: method.isAbstract,
           vtableSlot: slot,
@@ -3416,11 +3476,13 @@ export class LlvmCodegen {
       );
       declares.push("declare void @sn_eh_push(ptr noundef)");
       declares.push("declare void @sn_eh_pop(ptr noundef)");
+      declares.push("declare void @sn_eh_pop_top()");
       declares.push("declare ptr @sn_eh_jmp_buf(ptr noundef)");
       declares.push("declare i32 @setjmp(ptr noundef)");
       declares.push("declare void @sn_throw(ptr noundef)");
       declares.push("declare ptr @sn_eh_caught_exception()");
       declares.push("declare void @sn_eh_clear_exception()");
+      declares.push("declare ptr @sn_error_new(ptr noundef) nounwind");
     }
     if (this.needsSnPrint) {
       declares.push("declare void @sn_print_i32(i32 noundef) nounwind");
@@ -3470,6 +3532,9 @@ export class LlvmCodegen {
       );
       declares.push("declare ptr @sn_future_value(ptr noundef) nounwind");
       declares.push("declare ptr @sn_future_error(ptr noundef) nounwind");
+      declares.push(
+        "declare i1 @sn_future_is_cancelled(ptr noundef) nounwind",
+      );
       declares.push("declare void @sn_future_await_run(ptr noundef) nounwind");
       declares.push("declare i1 @sn_task_await_suspend(ptr noundef) nounwind");
       declares.push(
@@ -3681,6 +3746,10 @@ export class LlvmCodegen {
     if (!method.decl || method.isAbstract || !method.decl.body) {
       return;
     }
+    if (method.isAsync) {
+      this.emitAsyncClassMethod(info, method);
+      return;
+    }
     this.locals = new Map();
     this.tempCounter = 0;
     this.labelCounter = 0;
@@ -3732,6 +3801,69 @@ export class LlvmCodegen {
     this.thisType = null;
     this.currentReturnType = null;
     this.endGcFunctionScope(gcScope);
+  }
+
+  /** Lower an async class method via the same state-machine path as free async functions. */
+  private emitAsyncClassMethod(info: ClassInfo, method: ClassMethodInfo): void {
+    const decl = method.decl!;
+    const span = decl.span;
+    const classAnn: TypeAnnotation = {
+      kind: "NamedType",
+      name: info.localName,
+      namespace: null,
+      typeArgs: [],
+      span,
+    };
+    const params: Parameter[] = [];
+    if (!method.isStatic) {
+      params.push({
+        kind: "Parameter",
+        name: { kind: "Identifier", name: "this", span },
+        typeAnnotation: classAnn,
+        defaultValue: null,
+        isReceiver: true,
+        span,
+      });
+    }
+    for (const p of decl.params) {
+      params.push(p);
+    }
+
+    const fn: FunctionDeclaration = {
+      kind: "FunctionDeclaration",
+      exported: false,
+      isExtern: false,
+      isAsync: true,
+      name: { kind: "Identifier", name: method.name, span },
+      typeParams: [],
+      params,
+      returnType: decl.returnType,
+      body: decl.body,
+      span,
+    };
+
+    const sigParams: ValueType[] = method.isStatic
+      ? [...method.params]
+      : [{ kind: "class", name: info.name }, ...method.params];
+    const futureRet: ValueType = {
+      kind: "future",
+      inner: method.returnType === "void" ? "void" : method.returnType,
+    };
+    const prev = this.localFunctions.get(method.name);
+    this.localFunctions.set(method.name, {
+      name: method.name,
+      mangledName: method.mangledName,
+      params: sigParams,
+      returnType: futureRet,
+      isExtern: false,
+      isAsync: true,
+    });
+    this.emitAsyncFunction(fn);
+    if (prev) {
+      this.localFunctions.set(method.name, prev);
+    } else {
+      this.localFunctions.delete(method.name);
+    }
   }
 
   private emitNewExpression(
@@ -3968,7 +4100,14 @@ export class LlvmCodegen {
       slotPtr.set(localNames[i]!, p);
     }
 
-    this.asyncFrame = { slotPtr, stateSlot, awaitSlot, stateCount: 1 };
+    this.asyncFrame = {
+      slotPtr,
+      stateSlot,
+      awaitSlot,
+      stateCount: 1,
+      ehStack: [],
+      rootEh: null,
+    };
 
     // Bind params: receiver loaded into an SSA `this` (entry dominates all);
     // value/reference params are read from their frame slot on demand.
@@ -4000,6 +4139,7 @@ export class LlvmCodegen {
     // Emit the body into its own block stream, beginning at state 0.
     const bodyLines: string[] = [];
     bodyLines.push("state.0:");
+    this.emitAsyncRootEhEnter(bodyLines);
     let terminated = false;
     for (const stmt of fn.body) {
       if (terminated) {
@@ -4008,6 +4148,7 @@ export class LlvmCodegen {
       terminated = this.emitStatement(stmt, bodyLines);
     }
     if (!terminated) {
+      this.emitAsyncEhPopAll(bodyLines);
       if (declaredRet === "void") {
         bodyLines.push(
           `  call void @sn_future_complete_void(ptr noundef ${this.asyncResultFut})`,
@@ -4018,7 +4159,10 @@ export class LlvmCodegen {
           `Codegen: async function '${fn.name.name}' missing return`,
         );
       }
+    } else {
+      // Root catch block is emitted by emitAsyncRootEhEnter's companion.
     }
+    this.emitAsyncRootEhCatch(bodyLines);
 
     // Now that every await has registered its state, emit the dispatch switch
     // into the entry block.
@@ -4376,11 +4520,40 @@ export class LlvmCodegen {
       this.emitFinallyBlock(finallyBlock, lines);
     }
     if (popFrame) {
-      lines.push(`  call void @sn_eh_pop(ptr noundef ${framePtr})`);
+      if (this.asyncFrame) {
+        lines.push("  call void @sn_eh_pop_top()");
+      } else {
+        lines.push(`  call void @sn_eh_pop(ptr noundef ${framePtr})`);
+      }
     }
     if (this.pendingReturn) {
       const pending = this.pendingReturn;
       this.pendingReturn = null;
+      if (this.asyncResultFut) {
+        this.emitAsyncEhPopAll(lines);
+        if (pending.type === "void") {
+          lines.push(
+            `  call void @sn_future_complete_void(ptr noundef ${this.asyncResultFut})`,
+          );
+        } else if (
+          isReferenceCategory(pending.type) ||
+          pending.type === "string"
+        ) {
+          lines.push(
+            `  call void @sn_future_complete(ptr noundef ${this.asyncResultFut}, ptr noundef ${pending.llvm})`,
+          );
+        } else {
+          const box = this.nextTemp();
+          const llvmTy = toLlvmType(pending.type);
+          lines.push(`  ${box} = call ptr @sn_alloc(i64 noundef 8)`);
+          lines.push(`  store ${llvmTy} ${pending.llvm}, ptr ${box}`);
+          lines.push(
+            `  call void @sn_future_complete(ptr noundef ${this.asyncResultFut}, ptr noundef ${box})`,
+          );
+        }
+        this.emitFunctionRet(lines, "  ret void");
+        return true;
+      }
       if (pending.type === "void") {
         this.emitFunctionRet(lines, "  ret void");
       } else {
@@ -4411,26 +4584,32 @@ export class LlvmCodegen {
       stmt.finallyBlock !== null && stmt.finallyBlock.length > 0;
     const finallyOnly = hasFinally && !hasCatch;
 
-    const framePtr = this.nextTemp();
-    lines.push(`  ${framePtr} = alloca i8, i64 ${SN_EH_FRAME_SIZE}`);
-
     /* Pre-root catch param so gcRootCount matches both try-success and catch paths. */
     let catchPtr: string | null = null;
     if (hasCatch && stmt.catchClause) {
       const catchParam = stmt.catchClause.parameter.name;
-      catchPtr = `%v.${catchParam}`;
-      lines.push(`  ${catchPtr} = alloca ptr`);
-      lines.push(`  store ptr null, ptr ${catchPtr}`);
-      this.locals.set(catchParam, {
-        ptr: catchPtr,
-        type: { kind: "class", name: BUILTIN_ERROR_MANGLED },
-        boxed: false,
-      });
-      this.registerRootsForStorage(
-        catchPtr,
-        { kind: "class", name: BUILTIN_ERROR_MANGLED },
-        lines,
-      );
+      const errType: ValueType = { kind: "class", name: BUILTIN_ERROR_MANGLED };
+      const frameSlot = this.asyncFrameSlotFor(catchParam, errType);
+      if (frameSlot) {
+        catchPtr = frameSlot;
+        lines.push(`  store ptr null, ptr ${catchPtr}`);
+        this.locals.set(catchParam, {
+          ptr: catchPtr,
+          type: errType,
+          boxed: false,
+        });
+        this.registerRootsForStorage(catchPtr, errType, lines);
+      } else {
+        catchPtr = `%v.${catchParam}`;
+        lines.push(`  ${catchPtr} = alloca ptr`);
+        lines.push(`  store ptr null, ptr ${catchPtr}`);
+        this.locals.set(catchParam, {
+          ptr: catchPtr,
+          type: errType,
+          boxed: false,
+        });
+        this.registerRootsForStorage(catchPtr, errType, lines);
+      }
     }
 
     let finallyFnName: string | null = null;
@@ -4439,6 +4618,13 @@ export class LlvmCodegen {
     }
 
     const finallyArg = finallyFnName ? `ptr @${finallyFnName}` : "ptr null";
+    const tryLabel = `try.body.${id}`;
+    const normalLeaveLabel = `try.normal.${id}`;
+    const catchLabel = hasCatch ? `try.catch.${id}` : null;
+    const afterLabel = `try.after.${id}`;
+
+    const framePtr = this.nextTemp();
+    lines.push(`  ${framePtr} = alloca i8, i64 ${SN_EH_FRAME_SIZE}`);
     lines.push(
       `  call void @sn_eh_init_frame(ptr noundef ${framePtr}, i32 ${hasCatch ? 1 : 0}, ${finallyArg}, ptr null)`,
     );
@@ -4453,11 +4639,6 @@ export class LlvmCodegen {
     const isCatch = this.nextTemp();
     lines.push(`  ${isCatch} = icmp ne i32 ${sj}, 0`);
 
-    const tryLabel = `try.body.${id}`;
-    const normalLeaveLabel = `try.normal.${id}`;
-    const catchLabel = hasCatch ? `try.catch.${id}` : null;
-    const afterLabel = `try.after.${id}`;
-
     if (hasCatch) {
       lines.push(
         `  br i1 ${isCatch}, label %${catchLabel}, label %${tryLabel}`,
@@ -4468,77 +4649,222 @@ export class LlvmCodegen {
       );
     }
 
-    this.controlStack.push({
+    const tryCtx: Extract<ControlContext, { kind: "try" }> = {
       kind: "try",
       framePtr,
       normalLeaveLabel,
       afterLabel,
       hasFinally,
       finallyOnly,
-    });
+      hasCatch,
+      finallyArg,
+      catchLabel,
+    };
+    this.controlStack.push(tryCtx);
+    if (this.asyncFrame) {
+      this.asyncFrame.ehStack.push({ tryCtx });
+    }
 
     lines.push(`${tryLabel}:`);
-    let terminated = false;
+    let tryBodyTerminated = false;
     for (const s of stmt.tryBlock) {
-      if (terminated) {
+      if (tryBodyTerminated) {
         break;
       }
-      terminated = this.emitStatement(s, lines);
+      tryBodyTerminated = this.emitStatement(s, lines);
     }
-    if (!terminated) {
+    // Return/throw without finally already finished the function; return through
+    // finally only branched to normalLeave and still needs the leave block.
+    const emitTryLeaveBlock = !tryBodyTerminated || hasFinally;
+    let tryPathTerminated = tryBodyTerminated && !hasFinally;
+    if (!tryBodyTerminated) {
       lines.push(`  br label %${normalLeaveLabel}`);
     }
-
-    lines.push(`${normalLeaveLabel}:`);
-    const tryLeaveTerminated = this.emitTryLeave(
-      framePtr,
-      afterLabel,
-      stmt.finallyBlock,
-      finallyOnly,
-      lines,
-    );
+    if (emitTryLeaveBlock) {
+      lines.push(`${normalLeaveLabel}:`);
+      this.popAsyncEhHandler(tryCtx);
+      tryPathTerminated = this.emitTryLeave(
+        tryCtx.framePtr,
+        afterLabel,
+        stmt.finallyBlock,
+        finallyOnly,
+        lines,
+      );
+    } else {
+      this.popAsyncEhHandler(tryCtx);
+    }
 
     if (catchLabel && stmt.catchClause && catchPtr) {
       lines.push(`${catchLabel}:`);
-      /* Disable this catch frame so throws inside catch propagate outward. */
-      lines.push(`  call void @sn_eh_pop(ptr noundef ${framePtr})`);
+      /* After longjmp the catcher is top of TLS; avoid SSA framePtr dominance issues across await. */
+      lines.push("  call void @sn_eh_pop_top()");
+      this.popAsyncEhHandler(tryCtx);
       const err = this.nextTemp();
       lines.push(`  ${err} = call ptr @sn_eh_caught_exception()`);
       lines.push(`  store ptr ${err}, ptr ${catchPtr}`);
       lines.push("  call void @sn_eh_clear_exception()");
 
-      terminated = false;
+      let catchBodyTerminated = false;
       for (const s of stmt.catchClause.body) {
-        if (terminated) {
+        if (catchBodyTerminated) {
           break;
         }
-        terminated = this.emitStatement(s, lines);
+        catchBodyTerminated = this.emitStatement(s, lines);
       }
-      if (!terminated) {
+      const emitCatchLeaveBlock = !catchBodyTerminated || hasFinally;
+      let catchPathTerminated = catchBodyTerminated && !hasFinally;
+      if (!catchBodyTerminated) {
         lines.push(`  br label %${normalLeaveLabel}.catch.${id}`);
       }
-
-      lines.push(`${normalLeaveLabel}.catch.${id}:`);
-      const catchLeaveTerminated = this.emitTryLeave(
-        framePtr,
-        afterLabel,
-        stmt.finallyBlock,
-        finallyOnly,
-        lines,
-        false /* already popped at catch entry */,
-      );
+      if (emitCatchLeaveBlock) {
+        lines.push(`${normalLeaveLabel}.catch.${id}:`);
+        catchPathTerminated = this.emitTryLeave(
+          tryCtx.framePtr,
+          afterLabel,
+          stmt.finallyBlock,
+          finallyOnly,
+          lines,
+          false,
+        );
+      }
       this.controlStack.pop();
-      if (!(tryLeaveTerminated || catchLeaveTerminated)) {
+      const allTerminated = tryPathTerminated && catchPathTerminated;
+      if (!allTerminated) {
         lines.push(`${afterLabel}:`);
       }
-      return tryLeaveTerminated || catchLeaveTerminated;
+      return allTerminated;
     }
 
     this.controlStack.pop();
-    if (!tryLeaveTerminated) {
+    if (!tryPathTerminated) {
       lines.push(`${afterLabel}:`);
     }
-    return tryLeaveTerminated;
+    return tryPathTerminated;
+  }
+
+  private popAsyncEhHandler(
+    tryCtx: Extract<ControlContext, { kind: "try" }>,
+  ): void {
+    if (!this.asyncFrame) {
+      return;
+    }
+    const i = this.asyncFrame.ehStack.findIndex((h) => h.tryCtx === tryCtx);
+    if (i >= 0) {
+      this.asyncFrame.ehStack.splice(i, 1);
+    }
+  }
+
+  /** Install the synthetic root catch that settles the result Future on uncaught throws. */
+  private emitAsyncRootEhEnter(lines: string[]): void {
+    if (!this.asyncFrame || !this.asyncResultFut) {
+      return;
+    }
+    this.needsSnException = true;
+    const id = this.labelCounter;
+    this.labelCounter += 1;
+    const catchLabel = `async.root.catch.${id}`;
+    const bodyLabel = `async.root.body.${id}`;
+    const framePtr = this.nextTemp();
+    lines.push(`  ${framePtr} = alloca i8, i64 ${SN_EH_FRAME_SIZE}`);
+    lines.push(
+      `  call void @sn_eh_init_frame(ptr noundef ${framePtr}, i32 1, ptr null, ptr null)`,
+    );
+    lines.push(`  call void @sn_eh_push(ptr noundef ${framePtr})`);
+    const jmpBuf = this.nextTemp();
+    lines.push(
+      `  ${jmpBuf} = call ptr @sn_eh_jmp_buf(ptr noundef ${framePtr})`,
+    );
+    const sj = this.nextTemp();
+    lines.push(`  ${sj} = call i32 @setjmp(ptr noundef ${jmpBuf})`);
+    const isCatch = this.nextTemp();
+    lines.push(`  ${isCatch} = icmp ne i32 ${sj}, 0`);
+    lines.push(`  br i1 ${isCatch}, label %${catchLabel}, label %${bodyLabel}`);
+    lines.push(`${bodyLabel}:`);
+
+    const tryCtx: Extract<ControlContext, { kind: "try" }> = {
+      kind: "try",
+      framePtr,
+      normalLeaveLabel: bodyLabel,
+      afterLabel: bodyLabel,
+      hasFinally: false,
+      finallyOnly: false,
+      hasCatch: true,
+      finallyArg: "ptr null",
+      catchLabel,
+    };
+    this.asyncFrame.rootEh = tryCtx;
+    this.asyncFrame.ehStack.push({ tryCtx });
+  }
+
+  private emitAsyncRootEhCatch(lines: string[]): void {
+    if (!this.asyncFrame?.rootEh || !this.asyncResultFut) {
+      return;
+    }
+    const tryCtx = this.asyncFrame.rootEh;
+    if (!tryCtx.catchLabel) {
+      return;
+    }
+    lines.push(`${tryCtx.catchLabel}:`);
+    lines.push("  call void @sn_eh_pop_top()");
+    const err = this.nextTemp();
+    lines.push(`  ${err} = call ptr @sn_eh_caught_exception()`);
+    lines.push("  call void @sn_eh_clear_exception()");
+    lines.push(
+      `  call void @sn_future_fail(ptr noundef ${this.asyncResultFut}, ptr noundef ${err})`,
+    );
+    this.emitFunctionRet(lines, "  ret void");
+  }
+
+  /** Pop every active async EH frame from the TLS stack (before suspend / exit). */
+  private emitAsyncEhPopAll(lines: string[]): void {
+    if (!this.asyncFrame) {
+      return;
+    }
+    // Use pop_top so we never reference EH frame SSA values that may not
+    // dominate across await ready/resume merges.
+    for (let i = this.asyncFrame.ehStack.length - 1; i >= 0; i -= 1) {
+      lines.push("  call void @sn_eh_pop_top()");
+    }
+  }
+
+  /**
+   * After await resume, re-allocate EH frames and setjmp so throws (including
+   * failed-future awaits) still reach the correct catch handlers.
+   */
+  private emitAsyncEhReestablish(lines: string[]): void {
+    if (!this.asyncFrame || this.asyncFrame.ehStack.length === 0) {
+      return;
+    }
+    this.needsSnException = true;
+    for (const h of this.asyncFrame.ehStack) {
+      const tryCtx = h.tryCtx;
+      const framePtr = this.nextTemp();
+      lines.push(`  ${framePtr} = alloca i8, i64 ${SN_EH_FRAME_SIZE}`);
+      tryCtx.framePtr = framePtr;
+      lines.push(
+        `  call void @sn_eh_init_frame(ptr noundef ${framePtr}, i32 ${tryCtx.hasCatch ? 1 : 0}, ${tryCtx.finallyArg}, ptr null)`,
+      );
+      lines.push(`  call void @sn_eh_push(ptr noundef ${framePtr})`);
+      const jmpBuf = this.nextTemp();
+      lines.push(
+        `  ${jmpBuf} = call ptr @sn_eh_jmp_buf(ptr noundef ${framePtr})`,
+      );
+      const sj = this.nextTemp();
+      lines.push(`  ${sj} = call i32 @setjmp(ptr noundef ${jmpBuf})`);
+      const isCatch = this.nextTemp();
+      lines.push(`  ${isCatch} = icmp ne i32 ${sj}, 0`);
+      const cont = this.nextLabel("eh.reenter");
+      if (tryCtx.catchLabel) {
+        lines.push(
+          `  br i1 ${isCatch}, label %${tryCtx.catchLabel}, label %${cont}`,
+        );
+      } else {
+        lines.push(
+          `  br i1 ${isCatch}, label %${tryCtx.normalLeaveLabel}, label %${cont}`,
+        );
+      }
+      lines.push(`${cont}:`);
+    }
   }
 
   private emitThrowStatement(stmt: ThrowStatement, lines: string[]): boolean {
@@ -5305,7 +5631,14 @@ export class LlvmCodegen {
   /** Returns copy value aggregates / scalars; reference returns copy the ptr. */
   private emitReturn(stmt: ReturnStatement, lines: string[]): void {
     if (this.asyncResultFut) {
+      const tryCtx = this.enclosingTryWithFinally();
       if (stmt.value === null) {
+        if (tryCtx) {
+          this.pendingReturn = { llvm: "", type: "void" };
+          lines.push(`  br label %${tryCtx.normalLeaveLabel}`);
+          return;
+        }
+        this.emitAsyncEhPopAll(lines);
         lines.push(
           `  call void @sn_future_complete_void(ptr noundef ${this.asyncResultFut})`,
         );
@@ -5317,12 +5650,17 @@ export class LlvmCodegen {
           ? this.currentReturnType
           : undefined;
       const value = this.emitExpression(stmt.value, lines, expected);
+      if (tryCtx) {
+        this.pendingReturn = { llvm: value.llvm, type: value.type };
+        lines.push(`  br label %${tryCtx.normalLeaveLabel}`);
+        return;
+      }
+      this.emitAsyncEhPopAll(lines);
       if (isReferenceCategory(value.type) || value.type === "string") {
         lines.push(
           `  call void @sn_future_complete(ptr noundef ${this.asyncResultFut}, ptr noundef ${value.llvm})`,
         );
       } else {
-        // Box scalar into a heap word for Future storage.
         const box = this.nextTemp();
         const llvmTy = toLlvmType(value.type);
         lines.push(`  ${box} = call ptr @sn_alloc(i64 noundef 8)`);
@@ -5840,6 +6178,13 @@ export class LlvmCodegen {
               (m) => m.name === methodName,
             );
             if (method) {
+              if (method.isAsync) {
+                return wrapOptionalCallType({
+                  kind: "future",
+                  inner:
+                    method.returnType === "void" ? "void" : method.returnType,
+                });
+              }
               if (method.returnType === "void") {
                 throw new Error("Codegen: void static method in inference");
               }
@@ -5880,7 +6225,16 @@ export class LlvmCodegen {
           if (isClassType(objectType)) {
             const def = this.classes.get(objectType.name);
             const m = def?.instanceMethods.find((x) => x.name === method);
-            if (!m || m.returnType === "void") {
+            if (!m) {
+              throw new Error("Codegen: unexpected class method in inference");
+            }
+            if (m.isAsync) {
+              return wrapOptionalCallType({
+                kind: "future",
+                inner: m.returnType === "void" ? "void" : m.returnType,
+              });
+            }
+            if (m.returnType === "void") {
               throw new Error("Codegen: unexpected class method in inference");
             }
             return wrapOptionalCallType(m.returnType);
@@ -5888,7 +6242,18 @@ export class LlvmCodegen {
           if (isInterfaceType(objectType)) {
             const def = this.interfaces.get(objectType.name);
             const m = def?.methods.find((x) => x.name === method);
-            if (!m || m.returnType === "void") {
+            if (!m) {
+              throw new Error(
+                "Codegen: unexpected interface method in inference",
+              );
+            }
+            if (m.isAsync) {
+              return wrapOptionalCallType({
+                kind: "future",
+                inner: m.returnType === "void" ? "void" : m.returnType,
+              });
+            }
+            if (m.returnType === "void") {
               throw new Error(
                 "Codegen: unexpected interface method in inference",
               );
@@ -7025,6 +7390,19 @@ export class LlvmCodegen {
         const argList = args
           .map((a) => `${toLlvmType(a.type)} ${a.llvm}`)
           .join(", ");
+        if (method.isAsync) {
+          const tmp = this.nextTemp();
+          lines.push(
+            `  ${tmp} = call ptr @${method.mangledName}(${argList})`,
+          );
+          return {
+            llvm: tmp,
+            type: {
+              kind: "future",
+              inner: method.returnType === "void" ? "void" : method.returnType,
+            },
+          };
+        }
         if (method.returnType === "void") {
           lines.push(`  call void @${method.mangledName}(${argList})`);
           if (!asStatement) {
@@ -7116,12 +7494,27 @@ export class LlvmCodegen {
         ...args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`),
       ].join(", ");
 
+      const emitAsyncCall = (calleeFn: string): EmittedValue => {
+        const tmp = this.nextTemp();
+        lines.push(`  ${tmp} = call ptr ${calleeFn}(${argList})`);
+        return {
+          llvm: tmp,
+          type: {
+            kind: "future",
+            inner: method.returnType === "void" ? "void" : method.returnType,
+          },
+        };
+      };
+
       // Concrete class with no subclasses: direct call. Otherwise vtable (inheritance).
       const mayHaveSubclasses = [...this.classes.values()].some(
         (c) => c.superclass === def.name,
       );
       const useDirectCall = !def.isAbstract && !mayHaveSubclasses;
       if (useDirectCall) {
+        if (method.isAsync) {
+          return emitAsyncCall(`@${method.mangledName}`);
+        }
         if (method.returnType === "void") {
           lines.push(`  call void @${method.mangledName}(${argList})`);
           if (!asStatement) {
@@ -7147,6 +7540,9 @@ export class LlvmCodegen {
       );
       const fnPtr = this.nextTemp();
       lines.push(`  ${fnPtr} = load ptr, ptr ${slotPtr}`);
+      if (method.isAsync) {
+        return emitAsyncCall(fnPtr);
+      }
       if (method.returnType === "void") {
         lines.push(`  call void ${fnPtr}(${argList})`);
         if (!asStatement) {
@@ -7193,6 +7589,17 @@ export class LlvmCodegen {
         `ptr ${data}`,
         ...args.map((a) => `${toLlvmType(a.type)} ${a.llvm}`),
       ].join(", ");
+      if (method.isAsync) {
+        const tmp = this.nextTemp();
+        lines.push(`  ${tmp} = call ptr ${fnPtr}(${argList})`);
+        return {
+          llvm: tmp,
+          type: {
+            kind: "future",
+            inner: method.returnType === "void" ? "void" : method.returnType,
+          },
+        };
+      }
       if (method.returnType === "void") {
         lines.push(`  call void ${fnPtr}(${argList})`);
         if (!asStatement) {
@@ -7481,12 +7888,17 @@ export class LlvmCodegen {
       );
       const suspendLabel = this.nextLabel("await.suspend");
       const resumeLabel = `state.${nextState}`;
+      const readyLabel = this.nextLabel("await.ready");
       lines.push(
-        `  br i1 ${susp}, label %${suspendLabel}, label %${resumeLabel}`,
+        `  br i1 ${susp}, label %${suspendLabel}, label %${readyLabel}`,
       );
       lines.push(`${suspendLabel}:`);
+      this.emitAsyncEhPopAll(lines);
       this.emitFunctionRet(lines, "  ret void");
       lines.push(`${resumeLabel}:`);
+      this.emitAsyncEhReestablish(lines);
+      lines.push(`  br label %${readyLabel}`);
+      lines.push(`${readyLabel}:`);
       const reloaded = this.nextTemp();
       lines.push(`  ${reloaded} = load ptr, ptr ${frame.awaitSlot}`);
       return this.emitAwaitResult(reloaded, futVal.type, lines, expected);
@@ -7504,6 +7916,27 @@ export class LlvmCodegen {
     lines: string[],
     expected?: ValueType,
   ): EmittedValue {
+    this.needsAsync = true;
+    this.needsSnException = true;
+    const cancelled = this.nextTemp();
+    lines.push(
+      `  ${cancelled} = call i1 @sn_future_is_cancelled(ptr noundef ${futLlvm})`,
+    );
+    const cancelThrow = this.nextLabel("await.cancel");
+    const afterCancel = this.nextLabel("await.aftercancel");
+    lines.push(
+      `  br i1 ${cancelled}, label %${cancelThrow}, label %${afterCancel}`,
+    );
+    lines.push(`${cancelThrow}:`);
+    const cancelMsg = this.internString("cancelled");
+    const cancelErr = this.nextTemp();
+    lines.push(
+      `  ${cancelErr} = call ptr @sn_error_new(ptr noundef @${cancelMsg.name})`,
+    );
+    lines.push(`  call void @sn_throw(ptr noundef ${cancelErr})`);
+    lines.push("  unreachable");
+    lines.push(`${afterCancel}:`);
+
     const err = this.nextTemp();
     lines.push(`  ${err} = call ptr @sn_future_error(ptr noundef ${futLlvm})`);
     const isNull = this.nextTemp();
@@ -7512,7 +7945,6 @@ export class LlvmCodegen {
     const throwLabel = this.nextLabel("await.throw");
     lines.push(`  br i1 ${isNull}, label %${okLabel}, label %${throwLabel}`);
     lines.push(`${throwLabel}:`);
-    this.needsSnException = true;
     lines.push(`  call void @sn_throw(ptr noundef ${err})`);
     lines.push("  unreachable");
     lines.push(`${okLabel}:`);

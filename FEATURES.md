@@ -5,6 +5,7 @@ Currently supported features:
 - A single top-level `function main(): void` or `async function main(): void` with no parameters (return type required)
 - Types: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `char`, `void`, `null`, arrays `T[]`, tuples `[T, U]`, `struct`, `enum`, `class`, `interface`, and `Future<T>` types
 - Async/await: `async function`, `await` expressions (async functions only), cooperative single-threaded tasks, timers, TCP/UDP/DNS/TLS via the event loop (OpenSSL; link `-lpthread -lssl -lcrypto`)
+- Interfaces may declare `async` methods; implementations must match async-ness. `try`/`catch`/`finally` may span `await` (EH re-established on resume; failed/cancelled futures throw)
 - Generics: type parameters on structs, classes, interfaces, functions, and methods; constraints (`T extends I`); nested type arguments; call-site inference; compile-time monomorphization (no runtime generics)
 - Type aliases (`type Name = ...`), including generic aliases, unions (`|`), intersections (`&`), literal types, `keyof` / `typeof` type operators, conditional and mapped types
 - Control-flow narrowing via `typeof` checks, `== null` / `!= null`, and `is` type checks on union / nullable values; early `return` / `break` / `continue` refine types in subsequent code

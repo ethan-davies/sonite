@@ -225,6 +225,7 @@ export interface InterfaceMethodDef {
   readonly name: string;
   readonly params: ValueType[];
   readonly returnType: ReturnType;
+  readonly isAsync: boolean;
   /** Slot index in this interface's itable. */
   readonly itableSlot: number;
 }
@@ -469,6 +470,44 @@ export interface TypecheckResult {
 /**
  * Type-check a multi-module compilation unit.
  */
+/**
+ * Collect modules in dependency order (imported modules before importers) so
+ * `injectAvailableImportsFromCollected` can resolve named imports during collect.
+ */
+function modulesInDependencyOrder(
+  modules: readonly ResolvedModule[],
+): ResolvedModule[] {
+  const byPath = new Map(modules.map((m) => [m.path, m]));
+  const visiting = new Set<string>();
+  const done = new Set<string>();
+  const ordered: ResolvedModule[] = [];
+
+  const visit = (path: string): void => {
+    if (done.has(path) || !byPath.has(path)) {
+      return;
+    }
+    if (visiting.has(path)) {
+      return;
+    }
+    visiting.add(path);
+    const mod = byPath.get(path)!;
+    for (const binding of mod.imports) {
+      visit(binding.modulePath);
+    }
+    for (const re of mod.reexportSources) {
+      visit(re.path);
+    }
+    visiting.delete(path);
+    done.add(path);
+    ordered.push(mod);
+  };
+
+  for (const mod of modules) {
+    visit(mod.path);
+  }
+  return ordered;
+}
+
 export function typecheckModules(
   modules: readonly ResolvedModule[],
   diagnostics: DiagnosticCollector,
@@ -479,7 +518,8 @@ export function typecheckModules(
   const semantic = new SemanticCollector();
   activeSemantic = semantic;
 
-  for (const mod of modules) {
+  const collectOrder = modulesInDependencyOrder(modules);
+  for (const mod of collectOrder) {
     diagnostics.setFile(mod.path);
     const symbols = collectModuleSymbols(mod, diagnostics);
     byPath.set(mod.path, symbols);
@@ -1727,6 +1767,7 @@ function collectModuleSymbols(
     enums,
     diagnostics,
     genericInterfaces,
+    importedInterfaces,
   );
   activeInterfaces = new Map([...importedInterfaces, ...interfaces]);
 
@@ -2329,6 +2370,7 @@ function collectInterfaces(
   enums: Map<string, EnumDef>,
   diagnostics: DiagnosticCollector,
   genericInterfaces: Map<string, GenericInterfaceTemplate>,
+  importedInterfaces: Map<string, InterfaceDef> = new Map(),
 ): Map<string, InterfaceDef> {
   const declarations: InterfaceDeclaration[] = [];
   const byLocal = new Map<string, InterfaceDeclaration>();
@@ -2398,7 +2440,7 @@ function collectInterfaces(
   }
 
   const prevActive = activeInterfaces;
-  activeInterfaces = interfaces;
+  activeInterfaces = new Map([...importedInterfaces, ...interfaces]);
 
   const visiting = new Set<string>();
   const done = new Set<string>();
@@ -2441,8 +2483,8 @@ function collectInterfaces(
           visiting.delete(localName);
           return null;
         }
-      } else if (interfaces.has(baseType.name)) {
-        base = interfaces.get(baseType.name)!;
+      } else if (activeInterfaces.has(baseType.name)) {
+        base = activeInterfaces.get(baseType.name)!;
       } else {
         diagnostics.error(
           `Unknown interface '${baseType.name}'`,
@@ -2477,6 +2519,7 @@ function collectInterfaces(
             !existing.params.every((p, i) =>
               typesEqual(p, method.params[i]!),
             ) ||
+            existing.isAsync !== method.isAsync ||
             (existing.returnType === "void") !==
               (method.returnType === "void") ||
             (existing.returnType !== "void" &&
@@ -2497,6 +2540,7 @@ function collectInterfaces(
           name: method.name,
           params: method.params,
           returnType: method.returnType,
+          isAsync: method.isAsync,
           itableSlot: methods.length,
         });
       }
@@ -2543,6 +2587,7 @@ function collectInterfaces(
         name: method.name.name,
         params,
         returnType,
+        isAsync: method.isAsync,
         itableSlot: methods.length,
       });
     }
@@ -2741,8 +2786,8 @@ function collectClasses(
           visiting.delete(localName);
           return null;
         }
-      } else if (classes.has(decl.superclass.name)) {
-        superclass = classes.get(decl.superclass.name)!;
+      } else if (activeClasses.has(decl.superclass.name)) {
+        superclass = activeClasses.get(decl.superclass.name)!;
       } else {
         diagnostics.error(
           `Unknown superclass '${decl.superclass.name}'`,
@@ -2770,17 +2815,20 @@ function collectClasses(
           visiting.delete(localName);
           return null;
         }
-      } else {
+      } else if (byLocal.has(ifaceType.name) && interfaces.has(ifaceType.name)) {
+        // Same-module interface (not yet finished is fine — interfaces are complete).
         iface = interfaces.get(ifaceType.name);
-        if (!iface) {
-          diagnostics.error(
-            `Unknown interface '${ifaceType.name}'`,
-            ifaceType.span,
-            "E0104",
-          );
-          visiting.delete(localName);
-          return null;
-        }
+      } else {
+        iface = activeInterfaces.get(ifaceType.name);
+      }
+      if (!iface) {
+        diagnostics.error(
+          `Unknown interface '${ifaceType.name}'`,
+          ifaceType.span,
+          "E0104",
+        );
+        visiting.delete(localName);
+        return null;
       }
       if (seenIfaces.has(iface.name)) {
         diagnostics.error(
@@ -3080,6 +3128,16 @@ function collectClasses(
         if (provided.visibility !== "public") {
           diagnostics.error(
             `Method '${req.name}' implementing interface '${iface.localName}' must be public`,
+            provided.decl?.name.span ?? decl.name.span,
+            "E0372",
+          );
+          ok = false;
+        }
+        if (provided.isAsync !== req.isAsync) {
+          diagnostics.error(
+            req.isAsync
+              ? `Method '${req.name}' must be async to implement interface '${iface.localName}'`
+              : `Method '${req.name}' must not be async to implement interface '${iface.localName}'`,
             provided.decl?.name.span ?? decl.name.span,
             "E0372",
           );
@@ -4725,6 +4783,7 @@ function instantiateGenericInterface(
       name: method.name.name,
       params,
       returnType,
+      isAsync: method.isAsync,
       itableSlot: methods.length,
     });
   }
@@ -5805,6 +5864,8 @@ function checkClassMembers(
       diagnostics,
     );
     const body = method.decl.body ?? [];
+    const prevAsync = inAsyncFunction;
+    inAsyncFunction = method.isAsync;
     for (const stmt of body) {
       checkStatement(
         stmt,
@@ -5818,6 +5879,7 @@ function checkClassMembers(
         0,
       );
     }
+    inAsyncFunction = prevAsync;
     if (method.returnType !== "void") {
       const last = body[body.length - 1];
       if (
@@ -5880,6 +5942,8 @@ function checkClassMembers(
       diagnostics,
     );
     if (returnType !== undefined && member.body) {
+      const prevAsync = inAsyncFunction;
+      inAsyncFunction = member.isAsync;
       for (const stmt of member.body) {
         checkStatement(
           stmt,
@@ -5893,6 +5957,7 @@ function checkClassMembers(
           0,
         );
       }
+      inAsyncFunction = prevAsync;
     }
     activeTypeParams = prev;
   }
@@ -10210,6 +10275,7 @@ function checkMethodCall(
         enums,
         diagnostics,
         allowVoidCall,
+        method.isAsync,
       ),
     );
   }
@@ -10246,6 +10312,7 @@ function checkMethodCall(
         enums,
         diagnostics,
         allowVoidCall,
+        method.isAsync,
       ),
     );
   }
@@ -10291,6 +10358,7 @@ function checkMethodCall(
             enums,
             diagnostics,
             allowVoidCall,
+            method.isAsync,
           ),
         );
       }

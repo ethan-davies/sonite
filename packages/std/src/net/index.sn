@@ -152,13 +152,13 @@ export class SocketAddress {
   }
 }
 
-/** Shared stream shape for TCP/TLS (async methods return Futures). */
+/** Shared stream shape for TCP/TLS (async methods). */
 export interface ByteStream {
   rawHandle(): i64;
-  read(maxBytes: i32): Future<Bytes>;
-  write(data: Bytes): Future<void>;
-  flush(): Future<void>;
-  close(): Future<void>;
+  async read(maxBytes: i32): Bytes;
+  async write(data: Bytes): void;
+  async flush(): void;
+  async close(): void;
 }
 
 export class TcpStream implements ByteStream {
@@ -176,20 +176,20 @@ export class TcpStream implements ByteStream {
     return this.handle;
   }
 
-  read(maxBytes: i32): Future<Bytes> {
-    return tcpReadBytes(this.handle, maxBytes);
+  async read(maxBytes: i32): Bytes {
+    return await tcpReadBytes(this.handle, maxBytes);
   }
 
-  write(data: Bytes): Future<void> {
-    return sn_tcp_write(this.handle, data.rawHandle());
+  async write(data: Bytes): void {
+    await sn_tcp_write(this.handle, data.rawHandle());
   }
 
-  flush(): Future<void> {
-    return sn_tcp_flush(this.handle);
+  async flush(): void {
+    await sn_tcp_flush(this.handle);
   }
 
-  close(): Future<void> {
-    return tcpClose(this.handle);
+  async close(): void {
+    await tcpClose(this.handle);
   }
 }
 

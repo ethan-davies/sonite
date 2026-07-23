@@ -21,11 +21,15 @@ typedef void (*SnFinallyFn)(void *ctx);
 void sn_eh_init_frame(void *frame, int32_t has_catch, SnFinallyFn finally_fn, void *finally_ctx);
 void sn_eh_push(void *frame);
 void sn_eh_pop(void *frame);
+/** Pop the current top EH frame (used after longjmp into a catch). */
+void sn_eh_pop_top(void);
 jmp_buf *sn_eh_jmp_buf(void *frame);
 void sn_throw(void *error);
 void *sn_eh_caught_exception(void);
 void sn_eh_clear_exception(void);
 void sn_uncaught_exception(void *error);
+/** Allocate a builtin Error with the given message (UTF-8 C string). */
+void *sn_error_new(const char *message);
 
 /* Shared header on every class instance. Must match %ObjectHeader in llvm.ts.
  * type_id indexes TypeInfo (class IDs start at SN_TYPEID_CLASS_BASE).

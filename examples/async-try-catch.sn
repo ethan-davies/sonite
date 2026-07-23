@@ -1,0 +1,47 @@
+import { sleep } from "std/async";
+
+async function failing(): i32 {
+  await sleep(5);
+  throw new Error("boom");
+}
+
+async function ok(): i32 {
+  await sleep(5);
+  return 42;
+}
+
+async function fetchData(): i32 {
+  try {
+    const response = await failing();
+    return response;
+  } catch (error) {
+    return -1;
+  }
+}
+
+async function afterResume(): i32 {
+  try {
+    const value = await ok();
+    if (value > 0) {
+      throw new Error("after");
+    }
+    return value;
+  } catch (error) {
+    return 99;
+  }
+}
+
+async function withFinally(): i32 {
+  try {
+    await sleep(5);
+    return 1;
+  } finally {
+    print(7);
+  }
+}
+
+async function main(): void {
+  print(await fetchData());
+  print(await afterResume());
+  print(await withFinally());
+}

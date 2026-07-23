@@ -323,6 +323,7 @@ export interface ClassDeclaration extends AstNodeBase {
 export interface InterfaceMethodSignature extends AstNodeBase {
   readonly kind: "InterfaceMethodSignature";
   readonly name: Identifier;
+  readonly isAsync: boolean;
   readonly typeParams: TypeParameter[];
   readonly params: Parameter[];
   readonly returnType: TypeAnnotation;

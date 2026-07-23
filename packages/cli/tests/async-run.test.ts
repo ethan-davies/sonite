@@ -139,6 +139,18 @@ describe.runIf(clangAvailable())("async sn run integration", () => {
   );
 
   it(
+    "runs async-try-catch.sn",
+    async () => {
+      const code = await compileLinkAndRun(
+        join(examples, "async-try-catch.sn"),
+        [],
+      );
+      expect(code).toBe(0);
+    },
+    30_000,
+  );
+
+  it(
     "runs async-roundtrip.sn",
     async () => {
       const code = await compileLinkAndRun(

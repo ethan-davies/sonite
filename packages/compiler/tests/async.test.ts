@@ -133,4 +133,92 @@ async function main(): void {
     expect(result.ir).toContain("sn_tcp_connect");
     expect(result.ir).toContain("sn_task_await_suspend");
   });
+
+  it("compiles try/catch across await with EH re-establish", () => {
+    const src = `
+extern function sn_sleep_ms(ms: i64): Future<void>;
+
+async function boom(): i32 {
+  await sn_sleep_ms(1);
+  throw new Error("fail");
+}
+
+async function main(): void {
+  try {
+    const n = await boom();
+    print(n);
+  } catch (e) {
+    print(e.message);
+  }
+}
+`;
+    const result = compile(src);
+    expect(result.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
+    expect(result.ir).toContain("sn_task_await_suspend");
+    expect(result.ir).toContain("sn_eh_pop_top");
+    expect(result.ir).toContain("sn_future_fail");
+    expect(result.ir).toContain("setjmp");
+  });
+
+  it("compiles nested async exception propagation IR", () => {
+    const src = `
+extern function sn_sleep_ms(ms: i64): Future<void>;
+
+async function inner(): i32 {
+  await sn_sleep_ms(1);
+  throw new Error("inner");
+}
+
+async function outer(): i32 {
+  try {
+    return await inner();
+  } catch (e) {
+    throw e;
+  }
+}
+
+async function main(): void {
+  try {
+    print(await outer());
+  } catch (e) {
+    print(e.message);
+  }
+}
+`;
+    const result = compile(src);
+    expect(result.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
+    expect(result.ir).toContain("sn_future_fail");
+    expect(result.ir).toContain("sn_throw");
+  });
+
+  it("compiles finally across await", () => {
+    const src = `
+extern function sn_sleep_ms(ms: i64): Future<void>;
+
+async function main(): void {
+  try {
+    await sn_sleep_ms(1);
+  } finally {
+    print(1);
+  }
+}
+`;
+    const result = compile(src);
+    expect(result.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
+    expect(result.ir).toContain("sn_task_await_suspend");
+    expect(result.ir).toContain("sn_eh_pop");
+  });
+
+  it("compiles user ByteStream implementor", () => {
+    const result = compileFile(path.join(root, "examples/bytestream-impl.sn"));
+    expect(result.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
+    expect(result.ir).toContain("ByteStream");
+    expect(result.ir).toContain("__itable");
+  });
+
+  it("compiles stdlib ByteStream implements via TlsStream module", () => {
+    const result = compileFile(path.join(root, "examples/async-tls.sn"));
+    expect(result.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
+    expect(result.ir).toContain("ByteStream");
+  });
 });

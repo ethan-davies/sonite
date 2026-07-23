@@ -3,6 +3,7 @@
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct SnEhFrame {
   struct SnEhFrame *parent;
@@ -50,6 +51,12 @@ void sn_eh_pop(void *frame) {
   }
 }
 
+void sn_eh_pop_top(void) {
+  if (sn_eh_stack != NULL) {
+    sn_eh_stack = sn_eh_stack->parent;
+  }
+}
+
 jmp_buf *sn_eh_jmp_buf(void *frame) {
   return &((SnEhFrame *)frame)->buf;
 }
@@ -60,6 +67,18 @@ void *sn_eh_caught_exception(void) {
 
 void sn_eh_clear_exception(void) {
   sn_eh_current_exception = NULL;
+}
+
+void *sn_error_new(const char *message) {
+  /* Layout must match builtin Error: ObjectHeader (16) + message ptr. */
+  void *err = sn_alloc(16 + (int64_t)sizeof(void *));
+  memset(err, 0, 16 + sizeof(void *));
+  ((SnObjectHeader *)err)->type_id = SN_TYPEID_CLASS_BASE;
+  ((SnObjectHeader *)err)->vtable = NULL;
+  const char *msg = message != NULL ? message : "";
+  char *m = sn_str_concat(msg, "");
+  *((char **)((char *)err + 16)) = m;
+  return err;
 }
 
 void sn_uncaught_exception(void *error) {

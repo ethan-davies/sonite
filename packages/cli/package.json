@@ -14,7 +14,9 @@
     "build": "tsc -p tsconfig.build.json",
     "clean": "rm -rf dist",
     "dev": "tsx src/cli.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "engines": {
     "node": ">=20"
@@ -24,13 +26,16 @@
     "@sonite/runtime": "workspace:*",
     "@sonite/std": "workspace:*",
     "commander": "^14.0.3",
+    "semver": "^7.8.5",
     "smol-toml": "^1.7.0",
     "tar": "^7.5.21"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
+    "@types/semver": "^7.7.1",
     "@types/tar": "^7.0.87",
     "tsx": "^4.20.3",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
   }
 }

@@ -1,15 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
-import * as tar from "tar";
-import { getPackagesStoreDir } from "../config.js";
-import { RegistryError } from "../registry/client.js";
+import type { Project } from "../project.js";
 import {
-  downloadPackageVersion,
   getPackage,
   getVersion,
+  listVersions,
 } from "../registry/packages.js";
-import type { Project } from "../project.js";
+import { installPackageVersion } from "./install-fetch.js";
 import {
   loadLockfile,
   lockPackageMap,
@@ -17,141 +14,196 @@ import {
   type LockPackage,
 } from "./lock.js";
 import {
-  addDependant,
-  isPackageVersionInstalled,
+  lockSatisfiesRoots,
+  resolveDependencies,
+  ResolveError,
+} from "./resolve.js";
+import {
+  caretOf,
+  maxSatisfying,
+  parseVersionRequirement,
+} from "./semver.js";
+import {
   packageVersionPath,
-  releasePreviousVersion,
   removeDependant,
+  releasePreviousVersion,
 } from "./store.js";
+
+export { installPackageVersion } from "./install-fetch.js";
+export { ResolveError } from "./resolve.js";
 
 export async function resolveInstallVersion(
   name: string,
   requested: string | undefined,
-): Promise<{ version: string; checksum: string }> {
+): Promise<{ requirement: string; version: string; checksum: string }> {
   if (requested) {
-    const ver = await getVersion(name, requested);
-    return { version: ver.version, checksum: ver.checksumSha256 };
+    const req = parseVersionRequirement(requested);
+    if (req.kind === "exact") {
+      const ver = await getVersion(name, req.raw);
+      return {
+        requirement: req.raw,
+        version: ver.version,
+        checksum: ver.checksumSha256,
+      };
+    }
+    const listed = await listVersions(name);
+    const versions = listed.versions.map((v) => v.version);
+    const version = maxSatisfying(versions, req);
+    if (!version) {
+      throw new ResolveError(
+        `no version of '${name}' satisfies '${requested}'`,
+      );
+    }
+    const ver = await getVersion(name, version);
+    return {
+      requirement: req.raw,
+      version: ver.version,
+      checksum: ver.checksumSha256,
+    };
   }
+
   const pkg = await getPackage(name);
   if (!pkg.latestVersion) {
-    throw new RegistryError(
-      `package '${name}' has no published versions`,
-      404,
-      "not_found",
-    );
+    throw new ResolveError(`package '${name}' has no published versions`);
   }
+  const version = pkg.latestVersion.version;
   return {
-    version: pkg.latestVersion.version,
+    requirement: caretOf(version),
+    version,
     checksum: pkg.latestVersion.checksumSha256,
   };
 }
 
 /**
- * Ensure `name@version` exists in the global store and register `projectRoot`
- * as a dependant. Skips download when already cached.
+ * Resolve from project.toml (ignoring lock), write project.lock, install everything.
  */
-export async function installPackageVersion(
-  projectRoot: string,
-  name: string,
-  version: string,
-  expectedChecksum?: string,
-): Promise<LockPackage> {
-  const dest = packageVersionPath(name, version);
-  mkdirSync(getPackagesStoreDir(), { recursive: true });
+export async function resolveAndInstall(
+  project: Project,
+  opts?: {
+    prefer?: ReadonlyMap<string, string>;
+    float?: ReadonlySet<string>;
+  },
+): Promise<readonly LockPackage[]> {
+  const resolved = await resolveDependencies(
+    project.root,
+    project.dependencies,
+    opts,
+  );
+  const packages: LockPackage[] = resolved.packages.map((p) => ({
+    name: p.name,
+    version: p.version,
+    checksum: p.checksum,
+    source: p.source,
+    dependencies: p.dependencies,
+  }));
 
-  let checksum = expectedChecksum ?? "";
-
-  if (!isPackageVersionInstalled(name, version)) {
-    const tmp = mkdtempSync(join(tmpdir(), "sn-pkg-"));
-    const archivePath = join(tmp, `${name}-${version}.tar.gz`);
-    try {
-      const downloaded = await downloadPackageVersion(
-        name,
-        version,
-        archivePath,
-      );
-      checksum = downloaded.checksumSha256;
-      if (
-        expectedChecksum &&
-        expectedChecksum.toLowerCase() !== checksum.toLowerCase()
-      ) {
-        throw new RegistryError(
-          `checksum mismatch for ${name}@${version} (lockfile vs download)`,
-          502,
-          "checksum_mismatch",
-        );
-      }
-
-      rmSync(dest, { recursive: true, force: true });
-      mkdirSync(dest, { recursive: true });
-      await tar.x({
-        file: archivePath,
-        cwd: dest,
-      });
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
+  const previous = lockPackageMap(loadLockfile(project.root));
+  const nextNames = new Set(packages.map((p) => p.name));
+  for (const [name, entry] of previous) {
+    if (!nextNames.has(name)) {
+      removeDependant(name, entry.version, project.root);
     }
-  } else if (!checksum) {
-    // Cached hit without a checksum from caller — keep empty; lock may refresh later.
-    checksum = expectedChecksum ?? "";
   }
 
-  // Drop this project from any other version of the same package, then register.
-  releasePreviousVersion(name, version, projectRoot);
-  addDependant(name, version, projectRoot);
+  for (const pkg of packages) {
+    await installPackageVersion(
+      project.root,
+      pkg.name,
+      pkg.version,
+      pkg.checksum,
+    );
+  }
 
-  return { name, version, checksum };
+  writeLockfile(project.root, packages);
+  return packages;
 }
 
+/**
+ * Install from project.lock when it still satisfies project.toml ranges;
+ * otherwise re-resolve.
+ */
 export async function installProjectDependencies(
   project: Project,
 ): Promise<readonly LockPackage[]> {
   const lock = loadLockfile(project.root);
   const locked = lockPackageMap(lock);
-  const installed: LockPackage[] = [];
 
-  // Release deps that were removed from the manifest.
-  for (const [name, entry] of locked) {
-    if (!(name in project.dependencies)) {
+  if (Object.keys(project.dependencies).length === 0) {
+    for (const [name, entry] of locked) {
       removeDependant(name, entry.version, project.root);
     }
+    writeLockfile(project.root, []);
+    return [];
   }
 
-  for (const [name, versionPin] of Object.entries(project.dependencies)) {
-    const lockEntry = locked.get(name);
-    const checksumHint =
-      lockEntry && lockEntry.version === versionPin
-        ? lockEntry.checksum
-        : undefined;
+  if (
+    lock &&
+    lock.packages.length > 0 &&
+    lockSatisfiesRoots(project.dependencies, locked)
+  ) {
+    const nextNames = new Set(lock.packages.map((p) => p.name));
+    for (const [name, entry] of locked) {
+      if (!nextNames.has(name)) {
+        removeDependant(name, entry.version, project.root);
+      }
+    }
 
-    const cached = isPackageVersionInstalled(name, versionPin);
-    console.log(
-      cached
-        ? `using cached ${name}@${versionPin}`
-        : `installing ${name}@${versionPin}`,
-    );
-    const entry = await installPackageVersion(
-      project.root,
-      name,
-      versionPin,
-      checksumHint,
-    );
-    // Prefer lock checksum when we skipped download and had one.
-    installed.push({
-      name: entry.name,
-      version: entry.version,
-      checksum: entry.checksum || checksumHint || "",
-    });
+    for (const pkg of lock.packages) {
+      const cached = existsSync(
+        join(packageVersionPath(pkg.name, pkg.version), "project.toml"),
+      );
+      console.log(
+        cached
+          ? `using cached ${pkg.name}@${pkg.version}`
+          : `installing ${pkg.name}@${pkg.version}`,
+      );
+      await installPackageVersion(
+        project.root,
+        pkg.name,
+        pkg.version,
+        pkg.checksum,
+      );
+    }
+    return lock.packages;
   }
 
-  writeLockfile(project.root, installed);
-  return installed;
+  console.log("resolving dependencies");
+  return resolveAndInstall(project);
 }
 
 /**
- * Unregister this project's use of `name` (version from lockfile if present).
- * Removes the global cache entry when no projects remain.
+ * Re-resolve dependencies from project.toml ranges and refresh the lockfile.
+ *
+ * When `only` is set, keep locked versions for other packages when they still
+ * satisfy constraints; float `only` to the highest matching version.
  */
+export async function updateProjectDependencies(
+  project: Project,
+  only?: string,
+): Promise<readonly LockPackage[]> {
+  if (only && !(only in project.dependencies)) {
+    throw new ResolveError(`dependency '${only}' is not in project.toml`);
+  }
+
+  if (!only) {
+    console.log("updating dependencies");
+    return resolveAndInstall(project);
+  }
+
+  const lock = loadLockfile(project.root);
+  const prefer = new Map<string, string>();
+  if (lock) {
+    for (const pkg of lock.packages) {
+      prefer.set(pkg.name, pkg.version);
+    }
+  }
+  console.log(`updating ${only}`);
+  return resolveAndInstall(project, {
+    prefer,
+    float: new Set([only]),
+  });
+}
+
 export function removeInstalledPackage(
   projectRoot: string,
   name: string,
@@ -167,22 +219,18 @@ export function removeInstalledPackage(
     removeDependant(name, entry.version, projectRoot);
     return;
   }
-  // Fallback: release any version this project was registered for.
   releasePreviousVersion(name, null, projectRoot);
 }
 
-/**
- * Map dependency names → global package root for the versions this project uses.
- */
+/** Map package names → global package roots for this project's lockfile. */
 export function discoverInstalledPackages(
   project: Project,
 ): Map<string, string> {
   const map = new Map<string, string>();
   const lock = lockPackageMap(loadLockfile(project.root));
 
-  for (const [name, versionPin] of Object.entries(project.dependencies)) {
-    const version = lock.get(name)?.version ?? versionPin;
-    const dir = packageVersionPath(name, version);
+  for (const [name, entry] of lock) {
+    const dir = packageVersionPath(name, entry.version);
     if (existsSync(join(dir, "project.toml"))) {
       map.set(name, dir);
     }

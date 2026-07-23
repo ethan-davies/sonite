@@ -29,6 +29,11 @@ export function packageVersionPath(name: string, version: string): string {
   );
 }
 
+/** Sidecar storing the SHA-256 of the downloaded `.tar.gz`. */
+export function packageChecksumPath(name: string, version: string): string {
+  return join(packageVersionPath(name, version), ".sn-checksum");
+}
+
 function dependantsPath(): string {
   return join(getPackagesStoreDir(), "dependants.json");
 }

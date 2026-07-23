@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
+import { parseVersionRequirement } from "./deps/semver.js";
 
 export interface ProjectPackage {
   readonly name: string;
@@ -21,7 +22,7 @@ export interface Project {
   readonly manifestPath: string;
   readonly package: ProjectPackage;
   readonly build: ProjectBuild;
-  /** Exact version pins from `[dependencies]`. */
+  /** Version requirements from `[dependencies]` (exact, `^`, or `~`). */
   readonly dependencies: Readonly<Record<string, string>>;
   /** Absolute path to the entry .sn file. */
   readonly entryPath: string;
@@ -155,6 +156,12 @@ function parseDependencies(
       throw new ProjectError(
         `project.toml: dependencies.${key} must be a non-empty version string`,
       );
+    }
+    try {
+      parseVersionRequirement(value.trim());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ProjectError(`project.toml: dependencies.${key}: ${message}`);
     }
     deps[key] = value.trim();
   }

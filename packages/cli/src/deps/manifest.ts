@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { parse as parseToml } from "smol-toml";
 import { ProjectError, type Project } from "../project.js";
+import { parseVersionRequirement } from "./semver.js";
 
 const PACKAGE_NAME_RE = /^[a-z0-9](?:[a-z0-9._-]{0,213})$/;
 
@@ -72,12 +73,13 @@ export function writeDependencies(
 export function setDependency(
   project: Project,
   name: string,
-  version: string,
+  versionRequirement: string,
 ): Record<string, string> {
   if (!isValidPackageName(name)) {
     throw new ProjectError(`invalid package name '${name}'`);
   }
-  const next = { ...project.dependencies, [name]: version };
+  parseVersionRequirement(versionRequirement);
+  const next = { ...project.dependencies, [name]: versionRequirement };
   writeDependencies(project, next);
   return next;
 }

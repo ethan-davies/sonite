@@ -140,14 +140,14 @@ program
 
 program
   .command("install")
-  .description("Install dependencies from project.toml / sn.lock")
+  .description("Install dependencies from project.toml / project.lock")
   .action(async () => {
     process.exitCode = await runInstall();
   });
 
 program
   .command("update")
-  .description("Update dependencies to their latest versions")
+  .description("Re-resolve dependencies from project.toml and refresh project.lock")
   .argument("[package]", "update only this package")
   .action(async (pkg: string | undefined) => {
     process.exitCode = await runUpdate(pkg);

@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { ensureLockfile } from "../deps/lock.js";
 
 const DEFAULT_MAIN = `function main(): void {
   print("Hello, world!");
@@ -61,6 +62,7 @@ export function runInit(options: InitOptions): number {
   mkdirSync(srcDir, { recursive: true });
   writeFileSync(manifestPath, manifest, "utf8");
   writeFileSync(mainPath, DEFAULT_MAIN, "utf8");
+  ensureLockfile(dir);
   if (!existsSync(gitignorePath) || options.force) {
     writeFileSync(gitignorePath, DEFAULT_GITIGNORE, "utf8");
   }
@@ -68,6 +70,7 @@ export function runInit(options: InitOptions): number {
   console.log(`created project '${answers.name}' in ${dir}`);
   console.log(`  ${manifestPath}`);
   console.log(`  ${mainPath}`);
+  console.log(`  ${join(dir, "project.lock")}`);
   return 0;
 }
 

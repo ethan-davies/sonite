@@ -17,6 +17,7 @@ const EXCLUDE_NAMES = new Set([
   ".git",
   "node_modules",
   "sn.lock",
+  "project.lock",
 ]);
 
 function shouldExclude(projectRoot: string, absolutePath: string): boolean {

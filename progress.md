@@ -52,7 +52,7 @@ Target pipeline:
 - [x] `sn <file.sn>` — shorthand for `run`
 - [x] Clang resolution: `SN_CLANG` → system PATH → download/cache pinned LLVM under `~/.cache/sonite/`
 - [x] `pnpm dev` builds the compiler then runs the CLI via `tsx`
-- [x] Registry package manager — `sn login`/`logout` (device-code Bearer token), `search`/`info`, `add`/`remove`/`install`/`update`/`publish`; `[dependencies]` + `sn.lock`; global install store under `~/.config/sonite/packages/<name>/<name>@<ver>/` with dependant tracking; bare package imports in the compiler
+- [x] Registry package manager — `sn login`/`logout` (device-code Bearer token), `search`/`info`, `add`/`remove`/`install`/`update`/`publish`; `[dependencies]` with exact/`^`/`~` semver + transitive resolution; `project.lock` with checksums; global store under `~/.config/sonite/packages/`; bare package imports in the compiler
 
 ### Language surface
 (See README for the full feature list — modules, generics, classes, interfaces, control flow, exceptions, std, etc.)
@@ -70,7 +70,7 @@ Add features one at a time (implement end-to-end when adding — no stubs):
 
 ## Deferred / later
 
-- [ ] Semver ranges / transitive dependency resolution
+- [ ] Broader semver operators (`>=`, ranges, `*`) / PubGrub-style backtracking
 - [ ] Cross-compilation targets
 - [ ] Memory model / GC maturity
 - [ ] CI (GitHub Actions: typecheck + test + build)

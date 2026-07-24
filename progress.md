@@ -374,10 +374,10 @@ This phase is about making the ecosystem production-ready.
 * [x] Version conflict resolution
 * [x] Dependency updates
 * [x] Dependency removal
-* [ ] Dependency overrides
-* [ ] Local/path dependencies
-* [ ] Git dependencies if desired
-* [ ] Development dependencies if desired
+* [x] Dependency overrides
+* [x] Local/path dependencies
+* [ ] Git dependencies if desired — **deferred / unsupported in v1** (explicit rejection + docs)
+* [x] Development dependencies if desired
 
 ### CLI
 
@@ -395,6 +395,13 @@ Ensure the package system has:
 * [x] `sn logout`
 * [x] `sn build`
 * [x] `sn run`
+* [x] `sn tree`
+* [x] `sn clean`
+* [x] `sn audit`
+* [x] `sn deprecate`
+* [x] `sn owner` (list/add/remove/transfer)
+* [x] `sn cache clean`
+* [x] `sn fmt`
 
 ### Lockfiles
 
@@ -406,6 +413,7 @@ Ensure the package system has:
 * [x] Platform-specific dependency information
 * [x] Reproducible installs
 * [x] Lockfile validation
+* [x] Override / path / dev / provenance fields
 
 ### Registry
 
@@ -413,14 +421,14 @@ Ensure the package system has:
 * [x] Package downloading
 * [x] Package metadata
 * [x] Version management
-* [ ] Package ownership
+* [x] Package ownership (owner + maintainers + transfer)
 * [x] Authentication
-* [ ] Package deletion policy
-* [ ] Deprecation
+* [x] Package deletion policy (documented; no public delete)
+* [x] Deprecation
 * [x] Package search
-* [ ] Package documentation
-* [ ] Download statistics
-* [ ] Abuse/security controls
+* [x] Package documentation metadata
+* [x] Download statistics
+* [x] Abuse/security controls (rate limits, name protection, report)
 
 ### Package security
 
@@ -429,30 +437,31 @@ Ensure the package system has:
 * [x] Registry HTTPS
 * [x] Authentication tokens
 * [x] Secure credential storage
-* [ ] Dependency provenance where practical
+* [x] Dependency provenance where practical
+* [x] `sn audit` / advisory lookup
 
 ### Project management
 
 * [x] Project configuration validation
-* [ ] Build profiles
+* [x] Build profiles
 * [x] Debug build
 * [x] Release build
-* [ ] Optimisation levels
+* [x] Optimisation levels (`0`–`3`)
 * [x] Project metadata
 * [x] Entry point configuration
-* [x] Build output configuration
+* [x] Build output configuration (`build/<profile>/`)
 
 ### Workspaces
 
 If desired before v1:
 
-* [ ] Workspace configuration
+* [ ] Workspace configuration — **deferred past v1.0.0**
 * [ ] Multiple Sonite packages
 * [ ] Shared lockfile
 * [ ] Workspace dependencies
 * [ ] Workspace builds
 
-I would consider workspaces optional for v1 unless Sonite's own repository structure requires them.
+Workspaces remain optional for v1; use path dependencies for related local packages. See [docs/packages.md](docs/packages.md).
 
 ---
 

@@ -5,7 +5,12 @@ import {
   deployRuntimeLibraries,
   resolveProjectNativeLink,
 } from "../project-native.js";
-import { loadProject, ProjectError } from "../project.js";
+import {
+  loadProject,
+  ProjectError,
+  resolveProfile,
+  type OptLevelInt,
+} from "../project.js";
 import type { OptLevel } from "@sonite/llvm";
 
 export interface BuildOptions {
@@ -14,8 +19,41 @@ export interface BuildOptions {
   /** When true, only emit IR and skip native linking. */
   readonly irOnly?: boolean;
   readonly release?: boolean;
+  /** Named profile from project.toml (`debug`, `release`, or custom). */
+  readonly profile?: string;
   readonly optLevel?: OptLevel;
   readonly warningsAsErrors?: boolean;
+}
+
+function optLevelFromInt(n: OptLevelInt): OptLevel {
+  switch (n) {
+    case 0:
+      return "O0";
+    case 1:
+      return "O1";
+    case 2:
+      return "O2";
+    case 3:
+      return "O3";
+    default: {
+      const _exhaustive: never = n;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * Resolve which profile to build with.
+ * `--release` is sugar for `--profile release`.
+ */
+export function selectProfileName(options: BuildOptions): string {
+  if (options.profile) {
+    return options.profile;
+  }
+  if (options.release) {
+    return "release";
+  }
+  return "debug";
 }
 
 export async function runBuild(options: BuildOptions = {}): Promise<number> {
@@ -30,25 +68,44 @@ export async function runBuild(options: BuildOptions = {}): Promise<number> {
     throw error;
   }
 
+  let profile;
+  try {
+    profile = resolveProfile(project, selectProfileName(options));
+  } catch (error) {
+    if (error instanceof ProjectError) {
+      console.error(`error: ${error.message}`);
+      return 1;
+    }
+    throw error;
+  }
+
+  const optLevel = options.optLevel ?? optLevelFromInt(profile.optimization);
+  const releaseLike = profile.name === "release" || profile.optimization >= 2;
+
   const compiled = compileSourceFile(project.entryPath, {
     ...(options.warningsAsErrors ? { warningsAsErrors: true } : {}),
-    ...(options.release !== undefined ? { release: options.release } : {}),
+    debugInfo: profile.debugInfo,
+    release: releaseLike,
   });
   if (!compiled) {
     return 1;
   }
 
+  // Profile-aware default: <outdir>/<profile>/<binary>
+  const profileOutdir = join(project.outdirPath, profile.name);
   const binaryPath = options.output
     ? resolve(options.output)
-    : join(project.outdirPath, project.binaryName);
+    : join(profileOutdir, project.binaryName);
 
-  const irPath = options.emitIr || options.irOnly
-    ? join(project.outdirPath, `${project.binaryName}.ll`)
-    : undefined;
+  const irOutdir = options.output ? project.outdirPath : profileOutdir;
+  const irPath =
+    options.emitIr || options.irOnly
+      ? join(irOutdir, `${project.binaryName}.ll`)
+      : undefined;
 
   if (options.irOnly) {
-    mkdirSync(project.outdirPath, { recursive: true });
-    const out = irPath ?? join(project.outdirPath, `${project.binaryName}.ll`);
+    mkdirSync(irOutdir, { recursive: true });
+    const out = irPath ?? join(irOutdir, `${project.binaryName}.ll`);
     writeFileSync(out, compiled.ir, "utf8");
     console.log(`wrote ${out}`);
     return 0;
@@ -60,9 +117,9 @@ export async function runBuild(options: BuildOptions = {}): Promise<number> {
     ir: compiled.ir,
     outputPath: binaryPath,
     nativeLink,
+    optLevel,
     ...(irPath !== undefined ? { emitIrPath: irPath } : {}),
-    ...(options.release !== undefined ? { release: options.release } : {}),
-    ...(options.optLevel !== undefined ? { optLevel: options.optLevel } : {}),
+    release: releaseLike,
   };
 
   const status = await linkNative(linkOpts);

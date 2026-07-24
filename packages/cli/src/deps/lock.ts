@@ -1,4 +1,9 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { getRegistryUrl } from "../config.js";
@@ -7,12 +12,20 @@ import { ProjectError } from "../project.js";
 export interface LockPackage {
   readonly name: string;
   readonly version: string;
-  /** SHA-256 hex digest of the downloaded `.tar.gz`. */
+  /** SHA-256 hex digest of the downloaded `.tar.gz` (or path manifest hash). */
   readonly checksum: string;
-  /** Registry base URL this package was resolved from. */
+  /** Registry base URL, or `path:<absolute>` for path dependencies. */
   readonly source: string;
   /** Direct dependency package names in the resolved graph. */
   readonly dependencies: readonly string[];
+  /** True when forced by a root `[overrides]` entry. */
+  readonly override?: boolean;
+  /** True when only reachable via `[dev-dependencies]`. */
+  readonly dev?: boolean;
+  /** Publisher username when recorded at resolve time. */
+  readonly publishedBy?: string;
+  /** ISO publish timestamp when recorded at resolve time. */
+  readonly publishedAt?: string;
 }
 
 /** Locked native artifact for a specific host platform. */
@@ -94,13 +107,39 @@ function parseLockPackage(row: Record<string, unknown>): LockPackage {
     }
     dependencies = [...row.dependencies].sort();
   }
-  return {
+
+  const pkg: {
+    name: string;
+    version: string;
+    checksum: string;
+    source: string;
+    dependencies: string[];
+    override?: boolean;
+    dev?: boolean;
+    publishedBy?: string;
+    publishedAt?: string;
+  } = {
     name: row.name,
     version: row.version,
     checksum: row.checksum,
     source,
     dependencies,
   };
+
+  if (row.override === true) {
+    pkg.override = true;
+  }
+  if (row.dev === true) {
+    pkg.dev = true;
+  }
+  if (typeof row.published_by === "string" && row.published_by.trim()) {
+    pkg.publishedBy = row.published_by.trim();
+  }
+  if (typeof row.published_at === "string" && row.published_at.trim()) {
+    pkg.publishedAt = row.published_at.trim();
+  }
+
+  return pkg;
 }
 
 function requireStringField(
@@ -222,6 +261,18 @@ export function writeLockfile(
       parts.push(
         `dependencies = [${deps.map((d) => JSON.stringify(d)).join(", ")}]`,
       );
+      if (pkg.override) {
+        parts.push("override = true");
+      }
+      if (pkg.dev) {
+        parts.push("dev = true");
+      }
+      if (pkg.publishedBy) {
+        parts.push(`published_by = ${JSON.stringify(pkg.publishedBy)}`);
+      }
+      if (pkg.publishedAt) {
+        parts.push(`published_at = ${JSON.stringify(pkg.publishedAt)}`);
+      }
       parts.push("");
     }
     for (const native of sortedNatives) {
@@ -240,7 +291,10 @@ export function writeLockfile(
     }
   }
 
-  writeFileSync(lockfilePath(projectRoot), parts.join("\n"), "utf8");
+  const dest = lockfilePath(projectRoot);
+  const tmp = `${dest}.tmp`;
+  writeFileSync(tmp, parts.join("\n"), "utf8");
+  renameSync(tmp, dest);
 }
 
 export function ensureLockfile(projectRoot: string): void {

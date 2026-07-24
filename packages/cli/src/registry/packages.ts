@@ -12,12 +12,24 @@ export interface PackageOwner {
   readonly avatarUrl: string;
 }
 
+export interface PackageMaintainer extends PackageOwner {
+  readonly role: "owner" | "maintainer";
+}
+
 export interface PackageSummary {
   readonly id: string;
   readonly name: string;
   readonly description: string;
   readonly createdAt: string;
   readonly owner: PackageOwner;
+  readonly license?: string | null;
+  readonly repository?: string | null;
+  readonly documentation?: string | null;
+  readonly keywords?: readonly string[];
+  readonly downloadCount?: number;
+  readonly deprecated?: boolean;
+  readonly deprecationReason?: string | null;
+  readonly replacement?: string | null;
 }
 
 export interface PackageVersionInfo {
@@ -26,10 +38,15 @@ export interface PackageVersionInfo {
   readonly checksumSha256: string;
   readonly sizeBytes: number;
   readonly createdAt: string;
+  readonly downloadCount?: number;
+  readonly deprecated?: boolean;
+  readonly deprecationReason?: string | null;
+  readonly replacement?: string | null;
 }
 
 export interface PackageDetails extends PackageSummary {
   readonly latestVersion: PackageVersionInfo | null;
+  readonly maintainers?: readonly PackageMaintainer[];
 }
 
 export interface VersionDetails {
@@ -41,6 +58,22 @@ export interface VersionDetails {
   readonly sizeBytes: number;
   readonly createdAt: string;
   readonly publishedBy: PackageOwner;
+  readonly downloadCount?: number;
+  readonly deprecated?: boolean;
+  readonly deprecationReason?: string | null;
+  readonly replacement?: string | null;
+}
+
+export interface Advisory {
+  readonly id: string;
+  readonly advisoryId: string;
+  readonly packageName: string;
+  readonly affectedVersions: string;
+  readonly severity: "low" | "moderate" | "high" | "critical";
+  readonly title: string;
+  readonly description: string;
+  readonly fixedIn: string | null;
+  readonly createdAt: string;
 }
 
 export async function searchPackages(
@@ -65,9 +98,7 @@ export async function getPackage(name: string): Promise<PackageDetails> {
 
 export async function listVersions(name: string): Promise<{
   name: string;
-  versions: Array<
-    VersionDetails & { publishedBy: PackageOwner }
-  >;
+  versions: Array<VersionDetails & { publishedBy: PackageOwner }>;
 }> {
   return registryJson(`/packages/${encodeURIComponent(name)}/versions`);
 }
@@ -164,6 +195,10 @@ export async function publishPackageVersion(options: {
   readonly name: string;
   readonly version: string;
   readonly description?: string;
+  readonly license?: string;
+  readonly repository?: string;
+  readonly documentation?: string;
+  readonly keywords?: readonly string[];
   readonly metadata?: Record<string, unknown>;
   readonly archivePath: string;
   readonly archiveBytes: Uint8Array;
@@ -172,6 +207,18 @@ export async function publishPackageVersion(options: {
   form.append("version", options.version);
   if (options.description !== undefined) {
     form.append("description", options.description);
+  }
+  if (options.license !== undefined) {
+    form.append("license", options.license);
+  }
+  if (options.repository !== undefined) {
+    form.append("repository", options.repository);
+  }
+  if (options.documentation !== undefined) {
+    form.append("documentation", options.documentation);
+  }
+  if (options.keywords !== undefined) {
+    form.append("keywords", JSON.stringify(options.keywords));
   }
   if (options.metadata !== undefined) {
     form.append("metadata", JSON.stringify(options.metadata));
@@ -191,4 +238,154 @@ export async function publishPackageVersion(options: {
       body: form,
     },
   );
+}
+
+export async function listMaintainers(name: string): Promise<{
+  name: string;
+  maintainers: PackageMaintainer[];
+}> {
+  return registryJson(
+    `/packages/${encodeURIComponent(name)}/maintainers`,
+  );
+}
+
+export async function addMaintainer(
+  name: string,
+  username: string,
+  role: "maintainer" = "maintainer",
+): Promise<unknown> {
+  return registryJson(`/packages/${encodeURIComponent(name)}/maintainers`, {
+    method: "POST",
+    auth: true,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, role }),
+  });
+}
+
+export async function removeMaintainer(
+  name: string,
+  username: string,
+): Promise<unknown> {
+  return registryJson(
+    `/packages/${encodeURIComponent(name)}/maintainers/${encodeURIComponent(username)}`,
+    { method: "DELETE", auth: true },
+  );
+}
+
+export async function transferOwnership(
+  name: string,
+  username: string,
+): Promise<unknown> {
+  return registryJson(`/packages/${encodeURIComponent(name)}/transfer`, {
+    method: "POST",
+    auth: true,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username }),
+  });
+}
+
+export async function deprecatePackage(
+  name: string,
+  reason: string,
+  replacement?: string,
+): Promise<unknown> {
+  const body: { reason: string; replacement?: string } = { reason };
+  if (replacement !== undefined) {
+    body.replacement = replacement;
+  }
+  return registryJson(`/packages/${encodeURIComponent(name)}/deprecate`, {
+    method: "POST",
+    auth: true,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deprecatePackageVersion(
+  name: string,
+  version: string,
+  reason: string,
+  replacement?: string,
+): Promise<unknown> {
+  const body: { reason: string; replacement?: string } = { reason };
+  if (replacement !== undefined) {
+    body.replacement = replacement;
+  }
+  return registryJson(
+    `/packages/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}/deprecate`,
+    {
+      method: "POST",
+      auth: true,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export async function reportPackage(
+  name: string,
+  reason: string,
+): Promise<unknown> {
+  return registryJson(`/packages/${encodeURIComponent(name)}/report`, {
+    method: "POST",
+    authOptional: true,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+}
+
+export async function auditPackages(
+  packages: ReadonlyArray<{ name: string; version: string }>,
+): Promise<{ advisories: Advisory[] }> {
+  const result = await registryJson<{
+    packages: Array<{
+      name: string;
+      version: string;
+      advisories: Advisory[];
+    }>;
+  }>(`/audit`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ packages }),
+  });
+  const advisories: Advisory[] = [];
+  for (const entry of result.packages ?? []) {
+    for (const adv of entry.advisories ?? []) {
+      advisories.push(adv);
+    }
+  }
+  return { advisories };
+}
+
+export async function listAdvisories(options?: {
+  package?: string;
+  version?: string;
+}): Promise<{ advisories: Advisory[] }> {
+  const params = new URLSearchParams();
+  if (options?.package) {
+    params.set("package", options.package);
+  }
+  if (options?.version) {
+    params.set("version", options.version);
+  }
+  const qs = params.toString();
+  return registryJson(`/advisories${qs ? `?${qs}` : ""}`);
+}
+
+/** Format a deprecation warning for CLI display. */
+export function formatDeprecationWarning(
+  name: string,
+  version: string | undefined,
+  reason: string | null | undefined,
+  replacement: string | null | undefined,
+): string {
+  const label = version ? `${name}@${version}` : name;
+  const lines = [`Warning: package \`${label}\` is deprecated.`];
+  if (reason) {
+    lines.push("", "Reason:", reason);
+  }
+  if (replacement) {
+    lines.push("", `Replacement: ${replacement}`);
+  }
+  return lines.join("\n");
 }

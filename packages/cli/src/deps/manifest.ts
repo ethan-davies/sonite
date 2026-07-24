@@ -2,6 +2,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { parse as parseToml } from "smol-toml";
 import { ProjectError, type Project } from "../project.js";
 import { parseVersionRequirement } from "./semver.js";
+import {
+  formatDepSpecToml,
+  type DepSpec,
+} from "./types.js";
 
 const PACKAGE_NAME_RE = /^[a-z0-9](?:[a-z0-9._-]{0,213})$/;
 
@@ -26,24 +30,40 @@ export function parsePackageSpec(spec: string): {
 
 /**
  * Rewrite `[dependencies]` in project.toml while preserving other content when possible.
- * Falls back to a full structured rewrite from the loaded project + new deps.
  */
 export function writeDependencies(
   project: Project,
-  dependencies: Record<string, string>,
+  dependencies: Record<string, DepSpec>,
+): void {
+  writeDepSection(project.manifestPath, "dependencies", dependencies);
+}
+
+export function writeDevDependencies(
+  project: Project,
+  dependencies: Record<string, DepSpec>,
+): void {
+  writeDepSection(project.manifestPath, "dev-dependencies", dependencies);
+}
+
+function writeDepSection(
+  manifestPath: string,
+  section: "dependencies" | "dev-dependencies",
+  dependencies: Record<string, DepSpec>,
 ): void {
   const sortedKeys = Object.keys(dependencies).sort();
   const depsBlock =
     sortedKeys.length === 0
-      ? "[dependencies]\n"
-      : `[dependencies]\n${sortedKeys
-          .map((k) => `${k} = ${JSON.stringify(dependencies[k])}`)
+      ? `[${section}]\n`
+      : `[${section}]\n${sortedKeys
+          .map((k) => `${k} = ${formatDepSpecToml(dependencies[k]!)}`)
           .join("\n")}\n`;
 
-  const original = readFileSync(project.manifestPath, "utf8");
-  const depsMatch = original.match(
-    /(^|\n)\[dependencies\][^\n]*\n(?:(?!\[[^\]]+\]).*\n?)*/m,
+  const original = readFileSync(manifestPath, "utf8");
+  const sectionRe = new RegExp(
+    `(^|\\n)\\[${section.replace("-", "\\-")}\\][^\\n]*\\n(?:(?!\\[[^\\]]+\\]).*\\n?)*`,
+    "m",
   );
+  const depsMatch = original.match(sectionRe);
 
   let next: string;
   if (depsMatch && depsMatch.index !== undefined) {
@@ -59,27 +79,29 @@ export function writeDependencies(
     next = `${original.replace(/\s*$/, "\n\n")}${depsBlock}`;
   }
 
-  // Validate the result still parses.
   try {
     parseToml(next);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new ProjectError(`failed to write dependencies: ${message}`);
+    throw new ProjectError(`failed to write ${section}: ${message}`);
   }
 
-  writeFileSync(project.manifestPath, next.endsWith("\n") ? next : `${next}\n`, "utf8");
+  writeFileSync(manifestPath, next.endsWith("\n") ? next : `${next}\n`, "utf8");
 }
 
 export function setDependency(
   project: Project,
   name: string,
   versionRequirement: string,
-): Record<string, string> {
+): Record<string, DepSpec> {
   if (!isValidPackageName(name)) {
     throw new ProjectError(`invalid package name '${name}'`);
   }
   parseVersionRequirement(versionRequirement);
-  const next = { ...project.dependencies, [name]: versionRequirement };
+  const next: Record<string, DepSpec> = {
+    ...project.dependencies,
+    [name]: { kind: "version", range: versionRequirement },
+  };
   writeDependencies(project, next);
   return next;
 }
@@ -87,12 +109,18 @@ export function setDependency(
 export function removeDependency(
   project: Project,
   name: string,
-): Record<string, string> {
-  if (!(name in project.dependencies)) {
+): Record<string, DepSpec> {
+  if (!(name in project.dependencies) && !(name in project.devDependencies)) {
     throw new ProjectError(`dependency '${name}' is not in project.toml`);
   }
-  const next = { ...project.dependencies };
+  if (name in project.dependencies) {
+    const next = { ...project.dependencies };
+    delete next[name];
+    writeDependencies(project, next);
+    return next;
+  }
+  const next = { ...project.devDependencies };
   delete next[name];
-  writeDependencies(project, next);
+  writeDevDependencies(project, next);
   return next;
 }

@@ -7,13 +7,14 @@ const DEFAULT_MAIN = `function main(): void {
 }
 `;
 
-const DEFAULT_GITIGNORE = `dist/
+const DEFAULT_GITIGNORE = `build/
+dist/
 .sn/
 *.ll
 `;
 
 const HARDCODED_ENTRY = "src/main.sn";
-const HARDCODED_OUTDIR = "dist";
+const HARDCODED_OUTDIR = "build";
 
 export interface InitOptions {
   readonly directory: string;

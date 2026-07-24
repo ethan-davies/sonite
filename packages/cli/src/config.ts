@@ -89,6 +89,15 @@ function credentialsPath(): string {
 }
 
 export function loadCredentials(): Credentials | null {
+  const envToken = process.env.SN_REGISTRY_TOKEN?.trim();
+  if (envToken) {
+    const username = process.env.SN_REGISTRY_USERNAME?.trim();
+    const result: Credentials = { token: envToken };
+    if (username) {
+      return { ...result, username };
+    }
+    return result;
+  }
   const path = credentialsPath();
   if (!existsSync(path)) {
     return null;

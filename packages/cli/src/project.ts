@@ -1,7 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { parseVersionRequirement } from "./deps/semver.js";
+import type { DepSpec } from "./deps/types.js";
 import {
   parseNativeConfig,
   type ParsedNativeConfig,
@@ -14,6 +15,9 @@ export interface ProjectPackage {
   readonly description?: string;
   readonly license?: string;
   readonly authors?: readonly string[];
+  readonly documentation?: string;
+  readonly repository?: string;
+  readonly keywords?: readonly string[];
   readonly entry: string;
 }
 
@@ -34,6 +38,24 @@ export interface ProjectDiagnostics {
   readonly unreachableCode: "off" | "warn" | "error";
 }
 
+export type OptLevelInt = 0 | 1 | 2 | 3;
+
+/** Fully resolved build profile. */
+export interface ProjectProfile {
+  readonly name: string;
+  readonly optimization: OptLevelInt;
+  readonly debugInfo: boolean;
+  readonly inherits?: string;
+}
+
+/** Raw `[profile.*]` entry before inheritance is applied. */
+interface RawProfile {
+  readonly name: string;
+  readonly optimization?: OptLevelInt;
+  readonly debugInfo?: boolean;
+  readonly inherits?: string;
+}
+
 export type ProjectNative = ParsedNativeConfig;
 
 export interface Project {
@@ -44,11 +66,17 @@ export interface Project {
   readonly format: ProjectFormat;
   readonly diagnostics: ProjectDiagnostics;
   readonly native: ProjectNative;
-  /** Version requirements from `[dependencies]` (exact, `^`, or `~`). */
-  readonly dependencies: Readonly<Record<string, string>>;
+  /** Production dependencies from `[dependencies]`. */
+  readonly dependencies: Readonly<Record<string, DepSpec>>;
+  /** Development-only dependencies from `[dev-dependencies]`. */
+  readonly devDependencies: Readonly<Record<string, DepSpec>>;
+  /** Forced versions from `[overrides]` (exact semver). */
+  readonly overrides: Readonly<Record<string, string>>;
+  /** Named build profiles from project.toml (may be partial before resolve). */
+  readonly profiles: Readonly<Record<string, RawProfile>>;
   /** Absolute path to the entry .sn file. */
   readonly entryPath: string;
-  /** Absolute path to the build output directory. */
+  /** Absolute path to the build output directory (base; profile subdirs added by build). */
   readonly outdirPath: string;
   /** Output binary basename (package.name). */
   readonly binaryName: string;
@@ -125,8 +153,14 @@ export function loadProjectFromManifest(manifestPath: string): Project {
   const description = optionalString(pkgTable, "description");
   const license = optionalString(pkgTable, "license");
   const authors = optionalStringArray(pkgTable, "authors");
-  const outdir = optionalString(buildTable, "outdir") ?? "dist";
-  const dependencies = parseDependencies(table);
+  const documentation = optionalString(pkgTable, "documentation");
+  const repository = optionalString(pkgTable, "repository");
+  const keywords = optionalStringArray(pkgTable, "keywords");
+  const outdir = optionalString(buildTable, "outdir") ?? "build";
+  const dependencies = parseDepTable(table, "dependencies");
+  const devDependencies = parseDepTable(table, "dev-dependencies");
+  const overrides = parseOverrides(table);
+  const profiles = parseProfiles(table);
   const format = parseFormatTable(table);
   const diagnostics = parseDiagnosticsTable(table);
   const native = parseNativeConfig(table);
@@ -145,6 +179,9 @@ export function loadProjectFromManifest(manifestPath: string): Project {
     description?: string;
     license?: string;
     authors?: readonly string[];
+    documentation?: string;
+    repository?: string;
+    keywords?: readonly string[];
   } = { name, version, entry };
   if (description !== undefined) {
     pkg.description = description;
@@ -154,6 +191,15 @@ export function loadProjectFromManifest(manifestPath: string): Project {
   }
   if (authors !== undefined) {
     pkg.authors = authors;
+  }
+  if (documentation !== undefined) {
+    pkg.documentation = documentation;
+  }
+  if (repository !== undefined) {
+    pkg.repository = repository;
+  }
+  if (keywords !== undefined) {
+    pkg.keywords = keywords;
   }
 
   return {
@@ -165,10 +211,148 @@ export function loadProjectFromManifest(manifestPath: string): Project {
     diagnostics,
     native,
     dependencies,
+    devDependencies,
+    overrides,
+    profiles,
     entryPath: resolve(root, entry),
     outdirPath: resolve(root, outdir),
     binaryName: name,
   };
+}
+
+/** Resolve a named profile (defaults + inheritance). */
+export function resolveProfile(
+  project: Project,
+  name: string,
+): ProjectProfile {
+  const defaults = defaultProfiles();
+  const merged: Record<string, RawProfile> = { ...defaults };
+  for (const [key, profile] of Object.entries(project.profiles)) {
+    merged[key] = profile;
+  }
+
+  const seen = new Set<string>();
+  function resolveOne(profileName: string): ProjectProfile {
+    if (seen.has(profileName)) {
+      throw new ProjectError(
+        `project.toml: profile inheritance cycle involving '${profileName}'`,
+      );
+    }
+    seen.add(profileName);
+    const profile = merged[profileName];
+    if (!profile) {
+      throw new ProjectError(`unknown build profile '${profileName}'`);
+    }
+    if (!profile.inherits) {
+      return {
+        name: profileName,
+        optimization: profile.optimization ?? 0,
+        debugInfo: profile.debugInfo ?? true,
+      };
+    }
+    const base = resolveOne(profile.inherits);
+    return {
+      name: profileName,
+      optimization: profile.optimization ?? base.optimization,
+      debugInfo: profile.debugInfo ?? base.debugInfo,
+      inherits: profile.inherits,
+    };
+  }
+
+  return resolveOne(name);
+}
+
+export function defaultProfiles(): Record<string, RawProfile> {
+  return {
+    debug: {
+      name: "debug",
+      optimization: 0,
+      debugInfo: true,
+    },
+    release: {
+      name: "release",
+      optimization: 2,
+      debugInfo: false,
+    },
+  };
+}
+
+function parseProfiles(
+  table: Record<string, unknown>,
+): Record<string, RawProfile> {
+  if (table.profile === undefined) {
+    return {};
+  }
+  const profileTable = requireTable(table, "profile");
+  const out: Record<string, RawProfile> = {};
+  for (const [name, value] of Object.entries(profileTable)) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new ProjectError(
+        `project.toml: [profile.${name}] must be a table`,
+      );
+    }
+    const row = value as Record<string, unknown>;
+    const inherits =
+      row.inherits === undefined
+        ? undefined
+        : typeof row.inherits === "string"
+          ? row.inherits
+          : (() => {
+              throw new ProjectError(
+                `project.toml: profile.${name}.inherits must be a string`,
+              );
+            })();
+
+    let optimization: OptLevelInt | undefined;
+    if (row.optimization !== undefined) {
+      if (
+        typeof row.optimization !== "number" ||
+        !Number.isInteger(row.optimization) ||
+        row.optimization < 0 ||
+        row.optimization > 3
+      ) {
+        throw new ProjectError(
+          `project.toml: profile.${name}.optimization must be an integer 0–3`,
+        );
+      }
+      optimization = row.optimization as OptLevelInt;
+    }
+
+    let debugInfo: boolean | undefined;
+    if (row["debug-info"] !== undefined) {
+      if (typeof row["debug-info"] !== "boolean") {
+        throw new ProjectError(
+          `project.toml: profile.${name}.debug-info must be a boolean`,
+        );
+      }
+      debugInfo = row["debug-info"];
+    } else if (row.debug_info !== undefined) {
+      if (typeof row.debug_info !== "boolean") {
+        throw new ProjectError(
+          `project.toml: profile.${name}.debug_info must be a boolean`,
+        );
+      }
+      debugInfo = row.debug_info;
+    }
+
+    const raw: {
+      name: string;
+      optimization?: OptLevelInt;
+      debugInfo?: boolean;
+      inherits?: string;
+    } = { name };
+    if (optimization !== undefined) {
+      raw.optimization = optimization;
+    }
+    if (debugInfo !== undefined) {
+      raw.debugInfo = debugInfo;
+    }
+    if (inherits !== undefined) {
+      raw.inherits = inherits;
+    }
+    out[name] = raw;
+  }
+  return out;
 }
 
 function parseFormatTable(table: Record<string, unknown>): ProjectFormat {
@@ -272,29 +456,98 @@ function parseDiagnosticsTable(
   return result;
 }
 
-function parseDependencies(
+function parseOverrides(
   table: Record<string, unknown>,
 ): Record<string, string> {
-  if (table.dependencies === undefined) {
+  if (table.overrides === undefined) {
     return {};
   }
-  const depsTable = requireTable(table, "dependencies");
-  const deps: Record<string, string> = {};
-  for (const [key, value] of Object.entries(depsTable)) {
+  const overridesTable = requireTable(table, "overrides");
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(overridesTable)) {
     if (typeof value !== "string" || !value.trim()) {
       throw new ProjectError(
-        `project.toml: dependencies.${key} must be a non-empty version string`,
+        `project.toml: overrides.${key} must be a non-empty exact version string`,
+      );
+    }
+    const trimmed = value.trim();
+    try {
+      const req = parseVersionRequirement(trimmed);
+      if (req.kind !== "exact") {
+        throw new ProjectError(
+          `project.toml: overrides.${key} must be an exact version (got '${trimmed}')`,
+        );
+      }
+    } catch (error) {
+      if (error instanceof ProjectError) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ProjectError(`project.toml: overrides.${key}: ${message}`);
+    }
+    out[key] = trimmed;
+  }
+  return out;
+}
+
+function parseDepTable(
+  table: Record<string, unknown>,
+  key: "dependencies" | "dev-dependencies",
+): Record<string, DepSpec> {
+  if (table[key] === undefined) {
+    return {};
+  }
+  const depsTable = requireTable(table, key);
+  const deps: Record<string, DepSpec> = {};
+  for (const [depName, value] of Object.entries(depsTable)) {
+    deps[depName] = parseDepSpec(key, depName, value);
+  }
+  return deps;
+}
+
+export function parseDepSpec(
+  section: string,
+  key: string,
+  value: unknown,
+): DepSpec {
+  if (typeof value === "string") {
+    if (!value.trim()) {
+      throw new ProjectError(
+        `project.toml: ${section}.${key} must be a non-empty version string`,
       );
     }
     try {
       parseVersionRequirement(value.trim());
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new ProjectError(`project.toml: dependencies.${key}: ${message}`);
+      throw new ProjectError(`project.toml: ${section}.${key}: ${message}`);
     }
-    deps[key] = value.trim();
+    return { kind: "version", range: value.trim() };
   }
-  return deps;
+
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const row = value as Record<string, unknown>;
+    if (row.git !== undefined) {
+      throw new ProjectError(
+        `project.toml: ${section}.${key}: git dependencies are not supported yet`,
+      );
+    }
+    if (typeof row.path === "string" && row.path.trim()) {
+      return { kind: "path", path: row.path.trim() };
+    }
+    throw new ProjectError(
+      `project.toml: ${section}.${key} table must include path = "..."`,
+    );
+  }
+
+  throw new ProjectError(
+    `project.toml: ${section}.${key} must be a version string or { path = "..." }`,
+  );
+}
+
+/** Resolve a path dependency relative to a project root. */
+export function resolveDepPath(projectRoot: string, pathSpec: string): string {
+  return isAbsolute(pathSpec) ? resolve(pathSpec) : resolve(projectRoot, pathSpec);
 }
 
 function requireTable(

@@ -47,6 +47,7 @@ Currently supported features:
   - `export` on declarations; re-exports `export { X as Y } from "…"` and `export * from "…"`
   - Formal export tables; private declarations are not importable; circular imports/re-exports diagnosed
   - No default exports
+- Package manager: overrides, path deps, dev-dependencies, `sn tree` / `sn update` diffs, build profiles (`debug`/`release`/custom), `sn clean` / `sn audit` / `sn deprecate` / `sn owner` — see [docs/packages.md](docs/packages.md)
 - Tuples: fixed-length heterogeneous products `[string, i32]`, const/dynamic indexing (dynamic → union), `.length`, element assignment with constant indexes, destructuring with holes
 - Function types `(i32, i32) => i32`: annotate variables, parameters, and return types; use in `type` aliases; assign and pass named functions as first-class values; call through function-typed expressions
 - Default parameter values (`greeting: string = "Hello"`) evaluated at the call site when omitted; required parameters must precede defaults

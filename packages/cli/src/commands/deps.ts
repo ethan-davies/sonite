@@ -1,4 +1,5 @@
 import {
+  formatUpdateChanges,
   installProjectDependencies,
   removeInstalledPackage,
   resolveAndInstall,
@@ -19,9 +20,15 @@ import {
 } from "../deps/manifest.js";
 import { formatNativeAddReport } from "../deps/native-resolve.js";
 import { NativeIntegrityError } from "../deps/native-cache.js";
+import { mergeRootDeps } from "../deps/resolve.js";
 import { parseVersionRequirement } from "../deps/semver.js";
 import { loadProject, ProjectError } from "../project.js";
 import { RegistryError } from "../registry/client.js";
+import {
+  formatDeprecationWarning,
+  getPackage,
+  getVersion,
+} from "../registry/packages.js";
 
 function printError(error: unknown): void {
   if (
@@ -54,6 +61,31 @@ export async function runAdd(spec: string): Promise<number> {
     }
 
     const resolved = await resolveInstallVersion(name, requested);
+    try {
+      const ver = await getVersion(name, resolved.version);
+      const pkg = await getPackage(name);
+      if (pkg.deprecated) {
+        console.warn(
+          formatDeprecationWarning(
+            name,
+            undefined,
+            pkg.deprecationReason,
+            pkg.replacement,
+          ),
+        );
+      } else if (ver.deprecated) {
+        console.warn(
+          formatDeprecationWarning(
+            name,
+            ver.version,
+            ver.deprecationReason,
+            ver.replacement,
+          ),
+        );
+      }
+    } catch {
+      // Deprecation lookup is best-effort.
+    }
     console.log(`adding ${name}@${resolved.requirement} (resolved ${resolved.version})`);
     setDependency(project, name, resolved.requirement);
 
@@ -83,7 +115,11 @@ export async function runRemove(name: string): Promise<number> {
 
     // Re-resolve remaining deps (drops transitive packages only needed by `name`).
     const refreshed = loadProject(project.root);
-    if (Object.keys(refreshed.dependencies).length === 0) {
+    const { roots } = mergeRootDeps(
+      refreshed.dependencies,
+      refreshed.devDependencies,
+    );
+    if (Object.keys(roots).length === 0) {
       if (lock) {
         for (const entry of lock.packages) {
           removeInstalledPackage(project.root, entry.name, entry.version);
@@ -107,8 +143,11 @@ export async function runRemove(name: string): Promise<number> {
 export async function runInstall(): Promise<number> {
   try {
     const project = loadProject();
-    const deps = Object.keys(project.dependencies);
-    if (deps.length === 0) {
+    const { roots } = mergeRootDeps(
+      project.dependencies,
+      project.devDependencies,
+    );
+    if (Object.keys(roots).length === 0) {
       const lock = loadLockfile(project.root);
       if (lock) {
         for (const entry of lock.packages) {
@@ -138,11 +177,17 @@ export async function runInstall(): Promise<number> {
 export async function runUpdate(name: string | undefined): Promise<number> {
   try {
     const project = loadProject();
-    if (Object.keys(project.dependencies).length === 0) {
+    const { roots } = mergeRootDeps(
+      project.dependencies,
+      project.devDependencies,
+    );
+    if (Object.keys(roots).length === 0) {
       console.log("no dependencies to update");
       return 0;
     }
     const installed = await updateProjectDependencies(project, name);
+    console.log(formatUpdateChanges(installed.changes));
+    console.log("");
     console.log(
       `updated ${installed.packages.length} package(s)` +
         (installed.natives.length > 0

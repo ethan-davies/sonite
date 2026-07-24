@@ -1,15 +1,25 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { runAudit } from "./commands/audit.js";
 import { runBuild } from "./commands/build.js";
+import { runClean } from "./commands/clean.js";
 import { runCompile } from "./commands/compile.js";
 import { runCacheClean } from "./commands/cache.js";
 import { runAdd, runInstall, runRemove, runUpdate } from "./commands/deps.js";
 import { runFmt } from "./commands/fmt.js";
 import { runInit } from "./commands/init.js";
 import { runLogin, runLogout } from "./commands/login.js";
+import {
+  runDeprecate,
+  runOwnerAdd,
+  runOwnerList,
+  runOwnerRemove,
+  runOwnerTransfer,
+} from "./commands/owner.js";
 import { runPublish } from "./commands/publish.js";
 import { runInfo, runSearch } from "./commands/search.js";
 import { runRun } from "./commands/run.js";
+import { runTree } from "./commands/tree.js";
 import { reportInternalError } from "./crash-report.js";
 import { isInternalError } from "@sonite/compiler";
 
@@ -38,7 +48,8 @@ program
   .option("-o, --output <file>", "output binary path")
   .option("--emit-ir", "also write LLVM IR next to the binary", false)
   .option("--ir-only", "emit LLVM IR only (skip native linking)", false)
-  .option("--release", "build with optimizations (LLVM -O2)", false)
+  .option("--release", "build with the release profile (LLVM -O2)", false)
+  .option("--profile <name>", "build profile (default: debug)")
   .option("--warnings-as-errors", "treat warnings as errors", false)
   .action(
     async (options: {
@@ -46,6 +57,7 @@ program
       emitIr?: boolean;
       irOnly?: boolean;
       release?: boolean;
+      profile?: string;
       warningsAsErrors?: boolean;
     }) => {
       const buildOpts: {
@@ -53,6 +65,7 @@ program
         emitIr?: boolean;
         irOnly?: boolean;
         release?: boolean;
+        profile?: string;
         warningsAsErrors?: boolean;
       } = {};
       if (options.output !== undefined) {
@@ -67,6 +80,9 @@ program
       if (options.release) {
         buildOpts.release = true;
       }
+      if (options.profile !== undefined) {
+        buildOpts.profile = options.profile;
+      }
       if (options.warningsAsErrors) {
         buildOpts.warningsAsErrors = true;
       }
@@ -80,19 +96,31 @@ program
     "Compile and run a .sn file, or build and run the current project",
   )
   .argument("[input]", "path to a .sn source file (default: project entry)")
-  .option("--release", "build with optimizations (LLVM -O2)", false)
+  .option("--release", "build with the release profile (LLVM -O2)", false)
+  .option("--profile <name>", "build profile (default: debug)")
   .option("--warnings-as-errors", "treat warnings as errors", false)
   .action(
     async (
       input: string | undefined,
-      options: { release?: boolean; warningsAsErrors?: boolean },
+      options: {
+        release?: boolean;
+        profile?: string;
+        warningsAsErrors?: boolean;
+      },
     ) => {
       const dashIndex = process.argv.indexOf("--");
       const programArgs =
         dashIndex >= 0 ? process.argv.slice(dashIndex + 1) : [];
-      const runOpts: { release?: boolean; warningsAsErrors?: boolean } = {};
+      const runOpts: {
+        release?: boolean;
+        profile?: string;
+        warningsAsErrors?: boolean;
+      } = {};
       if (options.release) {
         runOpts.release = true;
+      }
+      if (options.profile !== undefined) {
+        runOpts.profile = options.profile;
       }
       if (options.warningsAsErrors) {
         runOpts.warningsAsErrors = true;
@@ -100,6 +128,13 @@ program
       process.exitCode = await runRun(input, programArgs, runOpts);
     },
   );
+
+program
+  .command("clean")
+  .description("Remove generated build artifacts (not dependencies)")
+  .action(() => {
+    process.exitCode = runClean();
+  });
 
 program
   .command("fmt")
@@ -206,6 +241,80 @@ program
   .argument("[package]", "update only this package")
   .action(async (pkg: string | undefined) => {
     process.exitCode = await runUpdate(pkg);
+  });
+
+program
+  .command("tree")
+  .description("Print the locked dependency tree")
+  .action(() => {
+    process.exitCode = runTree();
+  });
+
+program
+  .command("audit")
+  .description("Check locked dependencies for known security advisories")
+  .action(async () => {
+    process.exitCode = await runAudit();
+  });
+
+program
+  .command("deprecate")
+  .description("Deprecate a package or package@version on the registry")
+  .argument("<package>", "package name, or name@version")
+  .requiredOption("--reason <text>", "deprecation reason")
+  .option("--replacement <spec>", "suggested replacement package or version")
+  .action(
+    async (
+      pkg: string,
+      options: { reason: string; replacement?: string },
+    ) => {
+      const deprecateOpts: { reason: string; replacement?: string } = {
+        reason: options.reason,
+      };
+      if (options.replacement !== undefined) {
+        deprecateOpts.replacement = options.replacement;
+      }
+      process.exitCode = await runDeprecate(pkg, deprecateOpts);
+    },
+  );
+
+const ownerCommand = program
+  .command("owner")
+  .description("Manage package owners and maintainers");
+
+ownerCommand
+  .command("list")
+  .description("List package owners and maintainers")
+  .argument("<package>", "package name")
+  .action(async (name: string) => {
+    process.exitCode = await runOwnerList(name);
+  });
+
+ownerCommand
+  .command("add")
+  .description("Add a maintainer to a package")
+  .argument("<package>", "package name")
+  .argument("<username>", "GitHub username")
+  .action(async (name: string, username: string) => {
+    process.exitCode = await runOwnerAdd(name, username);
+  });
+
+ownerCommand
+  .command("remove")
+  .description("Remove a maintainer from a package")
+  .argument("<package>", "package name")
+  .argument("<username>", "GitHub username")
+  .action(async (name: string, username: string) => {
+    process.exitCode = await runOwnerRemove(name, username);
+  });
+
+ownerCommand
+  .command("transfer")
+  .description("Transfer package ownership to another user")
+  .argument("<package>", "package name")
+  .argument("<username>", "GitHub username of the new owner")
+  .action(async (name: string, username: string) => {
+    process.exitCode = await runOwnerTransfer(name, username);
   });
 
 program

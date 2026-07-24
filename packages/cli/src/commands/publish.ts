@@ -16,7 +16,15 @@ export async function runPublish(): Promise<number> {
     }
 
     const project = loadProject();
-    const { name, version, description } = project.package;
+    const {
+      name,
+      version,
+      description,
+      license,
+      repository,
+      documentation,
+      keywords,
+    } = project.package;
 
     const { targets, metadata } = collectNativePublishArtifacts(project);
 
@@ -35,6 +43,10 @@ export async function runPublish(): Promise<number> {
         name: string;
         version: string;
         description?: string;
+        license?: string;
+        repository?: string;
+        documentation?: string;
+        keywords?: readonly string[];
         metadata?: Record<string, unknown>;
         archivePath: string;
         archiveBytes: Uint8Array;
@@ -46,6 +58,18 @@ export async function runPublish(): Promise<number> {
       };
       if (description) {
         publishOpts.description = description;
+      }
+      if (license) {
+        publishOpts.license = license;
+      }
+      if (repository) {
+        publishOpts.repository = repository;
+      }
+      if (documentation) {
+        publishOpts.documentation = documentation;
+      }
+      if (keywords && keywords.length > 0) {
+        publishOpts.keywords = keywords;
       }
       if (metadata) {
         publishOpts.metadata = metadata as unknown as Record<string, unknown>;

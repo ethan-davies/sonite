@@ -1,12 +1,18 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { getRegistryUrl } from "../config.js";
 import { listVersions, getVersion } from "../registry/packages.js";
 import { RegistryError } from "../registry/client.js";
-import { ProjectError } from "../project.js";
+import {
+  parseDepSpec,
+  ProjectError,
+  resolveDepPath,
+} from "../project.js";
 import {
   parseVersionRequirement,
+  versionSatisfies,
   versionsMatchingAll,
   type VersionRequirement,
 } from "./semver.js";
@@ -15,6 +21,12 @@ import {
   packageVersionPath,
 } from "./store.js";
 import { installPackageVersion } from "./install-fetch.js";
+import {
+  isPathDep,
+  isVersionDep,
+  pathLockSource,
+  type DepSpec,
+} from "./types.js";
 
 export interface ResolvedPackage {
   readonly name: string;
@@ -22,6 +34,14 @@ export interface ResolvedPackage {
   readonly checksum: string;
   readonly source: string;
   readonly dependencies: readonly string[];
+  /** True when this package was forced by a root `[overrides]` entry. */
+  readonly override?: boolean;
+  /** True when only reachable via `[dev-dependencies]`. */
+  readonly dev?: boolean;
+  /** Publisher username when known from the registry. */
+  readonly publishedBy?: string;
+  /** ISO publish timestamp when known. */
+  readonly publishedAt?: string;
 }
 
 export interface ResolveResult {
@@ -37,6 +57,15 @@ export interface ResolveOptions {
   readonly prefer?: ReadonlyMap<string, string>;
   /** Package names that should ignore lock preferences and float to highest match. */
   readonly float?: ReadonlySet<string>;
+  /** Exact versions forced by `[overrides]`. */
+  readonly overrides?: Readonly<Record<string, string>>;
+  /**
+   * Root package names that come from `[dev-dependencies]` only (not also
+   * in production dependencies). Used to mark the reachable subgraph as `dev`.
+   */
+  readonly devRootNames?: ReadonlySet<string>;
+  /** Production root names (for computing which packages are production). */
+  readonly productionRootNames?: ReadonlySet<string>;
 }
 
 export class ResolveError extends Error {
@@ -56,8 +85,13 @@ interface Selected {
   version: string;
   checksum: string;
   source: string;
-  /** name → requirement string from that package's project.toml */
-  dependencies: Record<string, string>;
+  /** name → requirement from that package's project.toml */
+  dependencies: Record<string, DepSpec>;
+  override?: boolean;
+  publishedBy?: string;
+  publishedAt?: string;
+  /** Absolute path for path dependencies. */
+  pathRoot?: string;
 }
 
 /**
@@ -67,20 +101,27 @@ interface Selected {
  */
 export async function resolveDependencies(
   projectRoot: string,
-  rootDeps: Readonly<Record<string, string>>,
+  rootDeps: Readonly<Record<string, DepSpec>>,
   opts?: ResolveOptions,
 ): Promise<ResolveResult> {
   const prefer = opts?.prefer;
   const float = opts?.float ?? new Set<string>();
+  const overrides = opts?.overrides ?? {};
   const registrySource = getRegistryUrl();
 
-  const rootRequirements = new Map<string, VersionRequirement>();
-  for (const [name, raw] of Object.entries(rootDeps)) {
-    try {
-      rootRequirements.set(name, parseVersionRequirement(raw));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new ResolveError(`dependency '${name}': ${message}`);
+  const rootVersionReqs = new Map<string, VersionRequirement>();
+  const rootPathSpecs = new Map<string, string>();
+
+  for (const [name, spec] of Object.entries(rootDeps)) {
+    if (spec.kind === "version") {
+      try {
+        rootVersionReqs.set(name, parseVersionRequirement(spec.range));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new ResolveError(`dependency '${name}': ${message}`);
+      }
+    } else {
+      rootPathSpecs.set(name, spec.path);
     }
   }
 
@@ -105,22 +146,45 @@ export async function resolveDependencies(
     }
   }
 
-  // Seed: ensure every root package is considered.
-  for (const name of rootRequirements.keys()) {
-    selected.set(name, {
-      version: "",
-      checksum: "",
-      source: registrySource,
-      dependencies: {},
-    });
+  // Seed path roots immediately.
+  for (const [name, pathSpec] of rootPathSpecs) {
+    const loaded = loadPathPackage(projectRoot, name, pathSpec);
+    selected.set(name, loaded);
+  }
+
+  // Seed version roots.
+  for (const name of rootVersionReqs.keys()) {
+    if (!selected.has(name)) {
+      selected.set(name, {
+        version: "",
+        checksum: "",
+        source: registrySource,
+        dependencies: {},
+      });
+    }
   }
 
   const maxRounds = 64;
   for (let round = 0; round < maxRounds; round++) {
-    const constraints = collectConstraints(rootRequirements, selected);
+    const constraints = collectConstraints(rootVersionReqs, selected);
     let changed = false;
 
-    // Packages that appear in constraints must be selected.
+    // Discover new path deps from selected packages.
+    for (const [, sel] of selected) {
+      if (!sel.version && !sel.pathRoot) {
+        continue;
+      }
+      for (const [depName, depSpec] of Object.entries(sel.dependencies)) {
+        if (isPathDep(depSpec) && !selected.has(depName)) {
+          const base = sel.pathRoot ?? projectRoot;
+          const loaded = loadPathPackage(base, depName, depSpec.path);
+          selected.set(depName, loaded);
+          changed = true;
+        }
+      }
+    }
+
+    // Packages that appear in version constraints must be selected.
     for (const name of constraints.keys()) {
       if (!selected.has(name)) {
         selected.set(name, {
@@ -133,15 +197,83 @@ export async function resolveDependencies(
       }
     }
 
-    // Drop packages no longer constrained (unreachable).
+    // Drop packages no longer constrained (unreachable), except path roots.
+    const reachable = new Set<string>([
+      ...rootVersionReqs.keys(),
+      ...rootPathSpecs.keys(),
+    ]);
+    // Walk from roots through selected deps.
+    const queue = [...reachable];
+    while (queue.length > 0) {
+      const cur = queue.pop()!;
+      const sel = selected.get(cur);
+      if (!sel) continue;
+      for (const dep of Object.keys(sel.dependencies)) {
+        if (!reachable.has(dep)) {
+          reachable.add(dep);
+          queue.push(dep);
+        }
+      }
+      // Also ensure constraint names stay.
+      for (const name of constraints.keys()) {
+        reachable.add(name);
+      }
+    }
+
     for (const name of [...selected.keys()]) {
-      if (!constraints.has(name)) {
+      if (!reachable.has(name) && !rootPathSpecs.has(name)) {
         selected.delete(name);
         changed = true;
       }
     }
 
     for (const [name, reqs] of constraints) {
+      const existing = selected.get(name);
+      // Path packages are not re-resolved via the registry.
+      if (existing?.pathRoot) {
+        continue;
+      }
+
+      const overrideVersion = overrides[name];
+      if (overrideVersion) {
+        validateOverride(name, overrideVersion, reqs);
+        const available = await versionsOf(name);
+        if (!available.includes(overrideVersion)) {
+          throw new ResolveError(
+            formatOverrideMissing(name, overrideVersion, available),
+          );
+        }
+        const current = selected.get(name);
+        if (
+          current &&
+          current.version === overrideVersion &&
+          current.checksum &&
+          current.override
+        ) {
+          continue;
+        }
+        const loaded = await loadPackageManifest(
+          projectRoot,
+          name,
+          overrideVersion,
+        );
+        selected.set(name, {
+          version: overrideVersion,
+          checksum: loaded.checksum,
+          source: registrySource,
+          dependencies: loaded.dependencies,
+          override: true,
+          ...(loaded.publishedBy !== undefined
+            ? { publishedBy: loaded.publishedBy }
+            : {}),
+          ...(loaded.publishedAt !== undefined
+            ? { publishedAt: loaded.publishedAt }
+            : {}),
+        });
+        changed = true;
+        continue;
+      }
+
       const available = await versionsOf(name);
       if (available.length === 0) {
         throw new ResolveError(`package '${name}' has no published versions`);
@@ -166,6 +298,12 @@ export async function resolveDependencies(
         checksum: loaded.checksum,
         source: registrySource,
         dependencies: loaded.dependencies,
+        ...(loaded.publishedBy !== undefined
+          ? { publishedBy: loaded.publishedBy }
+          : {}),
+        ...(loaded.publishedAt !== undefined
+          ? { publishedAt: loaded.publishedAt }
+          : {}),
       });
       changed = true;
     }
@@ -184,14 +322,38 @@ export async function resolveDependencies(
     }
   }
 
+  const productionReachable = computeReachable(
+    selected,
+    opts?.productionRootNames ??
+      new Set(Object.keys(rootDeps).filter((n) => !opts?.devRootNames?.has(n))),
+  );
+
   const packages: ResolvedPackage[] = [...selected.entries()]
-    .map(([name, s]) => ({
-      name,
-      version: s.version,
-      checksum: s.checksum,
-      source: s.source || registrySource,
-      dependencies: Object.keys(s.dependencies).sort(),
-    }))
+    .map(([name, s]) => {
+      const pkg: ResolvedPackage = {
+        name,
+        version: s.version,
+        checksum: s.checksum,
+        source: s.source || registrySource,
+        dependencies: Object.keys(s.dependencies).sort(),
+      };
+      const withFlags: {
+        -readonly [K in keyof ResolvedPackage]: ResolvedPackage[K];
+      } = { ...pkg };
+      if (s.override) {
+        withFlags.override = true;
+      }
+      if (!productionReachable.has(name)) {
+        withFlags.dev = true;
+      }
+      if (s.publishedBy) {
+        withFlags.publishedBy = s.publishedBy;
+      }
+      if (s.publishedAt) {
+        withFlags.publishedAt = s.publishedAt;
+      }
+      return withFlags;
+    })
     .sort((a, b) => a.name.localeCompare(b.name));
 
   for (const pkg of packages) {
@@ -201,6 +363,79 @@ export async function resolveDependencies(
   }
 
   return { packages };
+}
+
+function computeReachable(
+  selected: ReadonlyMap<string, Selected>,
+  roots: ReadonlySet<string>,
+): Set<string> {
+  const reachable = new Set<string>();
+  const queue = [...roots].filter((n) => selected.has(n));
+  for (const r of queue) {
+    reachable.add(r);
+  }
+  while (queue.length > 0) {
+    const cur = queue.pop()!;
+    const sel = selected.get(cur);
+    if (!sel) continue;
+    for (const dep of Object.keys(sel.dependencies)) {
+      if (!reachable.has(dep) && selected.has(dep)) {
+        reachable.add(dep);
+        queue.push(dep);
+      }
+    }
+  }
+  return reachable;
+}
+
+function validateOverride(
+  name: string,
+  overrideVersion: string,
+  constraints: readonly Constraint[],
+): void {
+  for (const c of constraints) {
+    if (!versionSatisfies(overrideVersion, c.range)) {
+      throw new ResolveError(formatOverrideConflict(name, overrideVersion, c));
+    }
+  }
+}
+
+/** Exported for unit tests. */
+export function formatOverrideConflict(
+  name: string,
+  overrideVersion: string,
+  constraint: Constraint,
+): string {
+  const requiredBy =
+    constraint.requiredBy === "project"
+      ? "project"
+      : constraint.requiredByVersion
+        ? `${constraint.requiredBy}`
+        : constraint.requiredBy;
+  return [
+    "Dependency override conflict:",
+    "",
+    `  Package: ${name}`,
+    `  Requested override: ${overrideVersion}`,
+    "",
+    `  ${requiredBy} requires: ${constraint.range.raw}`,
+    "",
+    "The override is incompatible with the dependency constraints.",
+  ].join("\n");
+}
+
+function formatOverrideMissing(
+  name: string,
+  overrideVersion: string,
+  available: readonly string[],
+): string {
+  return [
+    `Dependency override for '${name}' requests ${overrideVersion},`,
+    `but that version is not published on the registry.`,
+    available.length
+      ? `Available: ${available.slice(0, 8).join(", ")}${available.length > 8 ? ", ..." : ""}`
+      : "No versions are available.",
+  ].join("\n");
 }
 
 /** Exported for unit tests — prefer locked version when still valid and not floating. */
@@ -226,7 +461,7 @@ export function pickVersion(
  * Returns a path like `["a", "b", "a"]` or null if none.
  */
 export function findDependencyCycle(
-  selected: ReadonlyMap<string, { dependencies: Record<string, string> }>,
+  selected: ReadonlyMap<string, { dependencies: Record<string, DepSpec | string> }>,
 ): string[] | null {
   const visiting = new Set<string>();
   const visited = new Set<string>();
@@ -287,10 +522,13 @@ function collectConstraints(
     if (!sel.version) {
       continue;
     }
-    for (const [depName, depRange] of Object.entries(sel.dependencies)) {
+    for (const [depName, depSpec] of Object.entries(sel.dependencies)) {
+      if (!isVersionDep(depSpec)) {
+        continue;
+      }
       let req: VersionRequirement;
       try {
-        req = parseVersionRequirement(depRange);
+        req = parseVersionRequirement(depSpec.range);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         throw new ResolveError(
@@ -330,31 +568,113 @@ export function formatConflict(
   return lines.join("\n");
 }
 
+function loadPathPackage(
+  fromRoot: string,
+  expectedName: string,
+  pathSpec: string,
+): Selected {
+  const absolute = resolveDepPath(fromRoot, pathSpec);
+  const manifestPath = join(absolute, "project.toml");
+  if (!existsSync(manifestPath)) {
+    throw new ResolveError(
+      `path dependency '${expectedName}' not found at ${absolute} (missing project.toml)`,
+    );
+  }
+  let raw: Record<string, unknown>;
+  try {
+    raw = parseToml(readFileSync(manifestPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ResolveError(
+      `failed to parse project.toml for path dependency '${expectedName}': ${message}`,
+    );
+  }
+  const pkg = raw.package;
+  if (typeof pkg !== "object" || pkg === null || Array.isArray(pkg)) {
+    throw new ResolveError(
+      `path dependency '${expectedName}' at ${absolute}: missing [package]`,
+    );
+  }
+  const pkgTable = pkg as Record<string, unknown>;
+  const name = pkgTable.name;
+  const version = pkgTable.version;
+  if (typeof name !== "string" || !name.trim()) {
+    throw new ResolveError(
+      `path dependency at ${absolute}: package.name must be a non-empty string`,
+    );
+  }
+  if (name !== expectedName) {
+    throw new ResolveError(
+      `path dependency '${expectedName}' at ${absolute}: package.name is '${name}' (names must match)`,
+    );
+  }
+  if (typeof version !== "string" || !version.trim()) {
+    throw new ResolveError(
+      `path dependency '${expectedName}' at ${absolute}: package.version must be a non-empty string`,
+    );
+  }
+
+  const checksum = createHash("sha256")
+    .update(readFileSync(manifestPath))
+    .digest("hex");
+
+  return {
+    version: version.trim(),
+    checksum,
+    source: pathLockSource(absolute),
+    dependencies: readDependenciesFromTable(raw, `${expectedName}@${version}`),
+    pathRoot: absolute,
+  };
+}
+
 async function loadPackageManifest(
   projectRoot: string,
   name: string,
   version: string,
-): Promise<{ checksum: string; dependencies: Record<string, string> }> {
+): Promise<{
+  checksum: string;
+  dependencies: Record<string, DepSpec>;
+  publishedBy?: string;
+  publishedAt?: string;
+}> {
   let checksum: string;
+  let publishedBy: string | undefined;
+  let publishedAt: string | undefined;
   if (!isPackageVersionInstalled(name, version)) {
     const installed = await installPackageVersion(projectRoot, name, version);
     checksum = installed.checksum;
   } else {
     const meta = await getVersion(name, version);
     checksum = meta.checksumSha256;
+    publishedBy = meta.publishedBy?.username;
+    publishedAt = meta.createdAt;
     await installPackageVersion(projectRoot, name, version, checksum);
+  }
+
+  // Prefer provenance from registry when available.
+  try {
+    const meta = await getVersion(name, version);
+    publishedBy = meta.publishedBy?.username;
+    publishedAt = meta.createdAt;
+  } catch {
+    // ignore — install already succeeded
   }
 
   return {
     checksum,
     dependencies: readPackageDependencies(name, version),
+    ...(publishedBy !== undefined ? { publishedBy } : {}),
+    ...(publishedAt !== undefined ? { publishedAt } : {}),
   };
 }
 
 export function readPackageDependencies(
   name: string,
   version: string,
-): Record<string, string> {
+): Record<string, DepSpec> {
   const manifestPath = join(packageVersionPath(name, version), "project.toml");
   if (!existsSync(manifestPath)) {
     return {};
@@ -364,26 +684,7 @@ export function readPackageDependencies(
       string,
       unknown
     >;
-    const deps = raw.dependencies;
-    if (deps === undefined) {
-      return {};
-    }
-    if (typeof deps !== "object" || deps === null || Array.isArray(deps)) {
-      throw new ProjectError(
-        `${name}@${version}: invalid [dependencies] in project.toml`,
-      );
-    }
-    const out: Record<string, string> = {};
-    for (const [key, value] of Object.entries(deps)) {
-      if (typeof value !== "string" || !value.trim()) {
-        throw new ProjectError(
-          `${name}@${version}: dependencies.${key} must be a non-empty string`,
-        );
-      }
-      parseVersionRequirement(value);
-      out[key] = value.trim();
-    }
-    return out;
+    return readDependenciesFromTable(raw, `${name}@${version}`);
   } catch (error) {
     if (error instanceof ProjectError || error instanceof ResolveError) {
       throw error;
@@ -395,17 +696,52 @@ export function readPackageDependencies(
   }
 }
 
+function readDependenciesFromTable(
+  raw: Record<string, unknown>,
+  label: string,
+): Record<string, DepSpec> {
+  const deps = raw.dependencies;
+  if (deps === undefined) {
+    return {};
+  }
+  if (typeof deps !== "object" || deps === null || Array.isArray(deps)) {
+    throw new ProjectError(`${label}: invalid [dependencies] in project.toml`);
+  }
+  const out: Record<string, DepSpec> = {};
+  for (const [key, value] of Object.entries(deps)) {
+    try {
+      out[key] = parseDepSpec("dependencies", key, value);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ProjectError(`${label}: ${message}`);
+    }
+  }
+  return out;
+}
+
 export function lockSatisfiesRoots(
-  rootDeps: Readonly<Record<string, string>>,
-  locked: ReadonlyMap<string, { version: string }>,
+  rootDeps: Readonly<Record<string, DepSpec>>,
+  locked: ReadonlyMap<
+    string,
+    { version: string; source: string }
+  >,
 ): boolean {
-  for (const [name, raw] of Object.entries(rootDeps)) {
+  for (const [name, spec] of Object.entries(rootDeps)) {
     const entry = locked.get(name);
     if (!entry) {
       return false;
     }
+    if (spec.kind === "path") {
+      const expected = pathLockSource(resolveDepPath(resolve("."), spec.path));
+      // Path check is approximate here; install.ts does a proper check with project root.
+      if (!entry.source.startsWith("path:")) {
+        return false;
+      }
+      void expected;
+      continue;
+    }
     try {
-      const req = parseVersionRequirement(raw);
+      const req = parseVersionRequirement(spec.range);
       if (!versionsMatchingAll([entry.version], [req]).length) {
         return false;
       }
@@ -414,4 +750,55 @@ export function lockSatisfiesRoots(
     }
   }
   return true;
+}
+
+/** Check that locked packages still satisfy root deps for a known project root. */
+export function lockSatisfiesRootsAt(
+  projectRoot: string,
+  rootDeps: Readonly<Record<string, DepSpec>>,
+  locked: ReadonlyMap<string, { version: string; source: string }>,
+): boolean {
+  for (const [name, spec] of Object.entries(rootDeps)) {
+    const entry = locked.get(name);
+    if (!entry) {
+      return false;
+    }
+    if (spec.kind === "path") {
+      const expected = pathLockSource(resolveDepPath(projectRoot, spec.path));
+      if (entry.source !== expected) {
+        return false;
+      }
+      continue;
+    }
+    try {
+      const req = parseVersionRequirement(spec.range);
+      if (!versionsMatchingAll([entry.version], [req]).length) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Merge production + dev dependency maps for resolution. */
+export function mergeRootDeps(
+  dependencies: Readonly<Record<string, DepSpec>>,
+  devDependencies: Readonly<Record<string, DepSpec>>,
+): {
+  roots: Record<string, DepSpec>;
+  productionRootNames: Set<string>;
+  devRootNames: Set<string>;
+} {
+  const roots: Record<string, DepSpec> = { ...dependencies };
+  const productionRootNames = new Set(Object.keys(dependencies));
+  const devRootNames = new Set<string>();
+  for (const [name, spec] of Object.entries(devDependencies)) {
+    if (!(name in roots)) {
+      roots[name] = spec;
+      devRootNames.add(name);
+    }
+  }
+  return { roots, productionRootNames, devRootNames };
 }

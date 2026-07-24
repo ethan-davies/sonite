@@ -3,6 +3,7 @@ import { parseVersionRequirement } from "../../src/deps/semver.js";
 import {
   findDependencyCycle,
   formatConflict,
+  formatOverrideConflict,
   pickVersion,
 } from "../../src/deps/resolve.js";
 
@@ -34,7 +35,7 @@ describe("pickVersion", () => {
 describe("findDependencyCycle", () => {
   it("returns null when the graph is acyclic", () => {
     const selected = new Map([
-      ["http", { dependencies: { url: "^1.0.0" } }],
+      ["http", { dependencies: { url: { kind: "version" as const, range: "^1.0.0" } } }],
       ["url", { dependencies: {} }],
     ]);
     expect(findDependencyCycle(selected)).toBeNull();
@@ -42,8 +43,8 @@ describe("findDependencyCycle", () => {
 
   it("returns a cycle path when packages depend on each other", () => {
     const selected = new Map([
-      ["a", { dependencies: { b: "^1.0.0" } }],
-      ["b", { dependencies: { a: "^1.0.0" } }],
+      ["a", { dependencies: { b: { kind: "version" as const, range: "^1.0.0" } } }],
+      ["b", { dependencies: { a: { kind: "version" as const, range: "^1.0.0" } } }],
     ]);
     const cycle = findDependencyCycle(selected);
     expect(cycle).not.toBeNull();
@@ -53,8 +54,8 @@ describe("findDependencyCycle", () => {
 
   it("formats like the non-convergence diagnostic", () => {
     const selected = new Map([
-      ["a", { dependencies: { b: "^1.0.0" } }],
-      ["b", { dependencies: { a: "^1.0.0" } }],
+      ["a", { dependencies: { b: { kind: "version" as const, range: "^1.0.0" } } }],
+      ["b", { dependencies: { a: { kind: "version" as const, range: "^1.0.0" } } }],
     ]);
     const cycle = findDependencyCycle(selected)!;
     const message = `dependency resolution did not converge\ncycle: ${cycle.join(" -> ")}`;
@@ -82,5 +83,22 @@ describe("formatConflict", () => {
     expect(message).toContain("url ^1.5.0");
     expect(message).toContain("json 2.1.0 requires:");
     expect(message).toContain("No compatible version of url exists.");
+  });
+});
+
+describe("formatOverrideConflict", () => {
+  it("describes an incompatible override", () => {
+    const message = formatOverrideConflict("bar", "2.0.0", {
+      range: parseVersionRequirement("^1.0.0"),
+      requiredBy: "foo",
+      requiredByVersion: "1.0.0",
+    });
+    expect(message).toContain("Dependency override conflict:");
+    expect(message).toContain("Package: bar");
+    expect(message).toContain("Requested override: 2.0.0");
+    expect(message).toContain("foo requires: ^1.0.0");
+    expect(message).toContain(
+      "The override is incompatible with the dependency constraints.",
+    );
   });
 });

@@ -66,6 +66,7 @@ describe("native-deps", () => {
       const spec = resolveNativeLinkSpec(root, config, "linux-x64");
       expect(spec.libraryFiles).toEqual([]);
       expect(spec.systemLibraries).toEqual(["m"]);
+      expect(spec.runtimeLibraries).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

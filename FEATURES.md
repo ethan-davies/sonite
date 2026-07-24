@@ -19,7 +19,7 @@ Currently supported features:
 - String methods via the auto-loaded prelude (`.contains`, `.startsWith`, `.trim`, `.trimStart`, `.slice`, `.replaceAll`, `.join`, …)
 - Template literals with interpolation: `` `Hello ${name}!` `` (lowered to `sn_*_to_string` + `sn_str_concat`)
 - Extension methods: `export function contains(this: string, needle: string): bool` callable as `"hi".contains("h")`
-- `extern function` declarations for C ABI imports; `@abi("C")` / `@symbol("…")`; `@repr("C")` structs; `unsafe` blocks/functions; project `[native]` linking (see [docs/ffi.md](docs/ffi.md))
+- `extern function` declarations for C ABI imports; `@abi("C")` / `@symbol("…")`; `@repr("C")` structs; `unsafe` blocks/functions; project `[native]` linking and package-resolved native dependencies (see [docs/ffi.md](docs/ffi.md), [docs/native-packages.md](docs/native-packages.md))
 - Explicit standard-library modules via `import { … } from "std/…"`:
   - `std/math` — abs/min/max/clamp/floor/ceil/round/sqrt/pow, trig (sin/cos/tan/asin/acos/atan/atan2), constants `PI`/`E`/`TAU`
   - `std/random` — `random` / `randomInt` / `randomFloat` / `randomBool` / `seed` (pseudo-random, not crypto)

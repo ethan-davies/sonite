@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import { runBuild } from "./commands/build.js";
 import { runCompile } from "./commands/compile.js";
+import { runCacheClean } from "./commands/cache.js";
 import { runAdd, runInstall, runRemove, runUpdate } from "./commands/deps.js";
 import { runFmt } from "./commands/fmt.js";
 import { runInit } from "./commands/init.js";
@@ -212,6 +213,17 @@ program
   .description("Publish the current project to the registry")
   .action(async () => {
     process.exitCode = await runPublish();
+  });
+
+const cacheCommand = program
+  .command("cache")
+  .description("Manage the local Sonite cache");
+
+cacheCommand
+  .command("clean")
+  .description("Remove cached native artifacts (safe to re-download)")
+  .action(() => {
+    process.exitCode = runCacheClean();
   });
 
 // `sn examples/hello.sn` is shorthand for `sn run examples/hello.sn`

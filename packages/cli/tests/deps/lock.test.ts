@@ -78,5 +78,6 @@ dependencies = []
     );
     const loaded = loadLockfile(root);
     expect(loaded!.packages[0]!.source).toBe(getRegistryUrl());
+    expect(loaded!.natives).toEqual([]);
   });
 });

@@ -1,4 +1,8 @@
 import { packProject } from "../deps/pack.js";
+import {
+  collectNativePublishArtifacts,
+  formatNativePublishChecklist,
+} from "../deps/native-publish.js";
 import { loadCredentials } from "../config.js";
 import { loadProject, ProjectError } from "../project.js";
 import { RegistryError } from "../registry/client.js";
@@ -14,14 +18,24 @@ export async function runPublish(): Promise<number> {
     const project = loadProject();
     const { name, version, description } = project.package;
 
+    const { targets, metadata } = collectNativePublishArtifacts(project);
+
+    console.log(`Publishing ${name}@${version}`);
+    console.log("");
+    for (const line of formatNativePublishChecklist(targets)) {
+      console.log(line);
+    }
+    console.log("");
+
     console.log(`packing ${name}@${version}`);
     const packed = await packProject(project);
     try {
-      console.log(`publishing ${name}@${version}`);
+      console.log("Publishing...");
       const publishOpts: {
         name: string;
         version: string;
         description?: string;
+        metadata?: Record<string, unknown>;
         archivePath: string;
         archiveBytes: Uint8Array;
       } = {
@@ -33,9 +47,12 @@ export async function runPublish(): Promise<number> {
       if (description) {
         publishOpts.description = description;
       }
+      if (metadata) {
+        publishOpts.metadata = metadata as unknown as Record<string, unknown>;
+      }
       const result = await publishPackageVersion(publishOpts);
       console.log(
-        `published ${result.name}@${result.version} (${result.sizeBytes} bytes)`,
+        `Published successfully (${result.name}@${result.version}, ${result.sizeBytes} bytes).`,
       );
       return 0;
     } finally {

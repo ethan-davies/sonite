@@ -4,7 +4,7 @@ import { parse as parseToml } from "smol-toml";
 import { parseVersionRequirement } from "./deps/semver.js";
 import {
   parseNativeConfig,
-  type NativeConfigSection,
+  type ParsedNativeConfig,
 } from "./native-deps.js";
 
 export interface ProjectPackage {
@@ -34,10 +34,7 @@ export interface ProjectDiagnostics {
   readonly unreachableCode: "off" | "warn" | "error";
 }
 
-export interface ProjectNative {
-  readonly base: NativeConfigSection;
-  readonly platforms: ReadonlyMap<string, NativeConfigSection>;
-}
+export type ProjectNative = ParsedNativeConfig;
 
 export interface Project {
   readonly root: string;

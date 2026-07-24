@@ -133,26 +133,37 @@ A `FnPtr` to a top-level Sonite function remains valid for the process lifetime.
 
 ```toml
 [native]
+name = "foo"
+version = "1.0.0"
+kind = "static"
+link = "auto"
 libraries = ["foo"]
 library_paths = ["native/lib"]
 link_args = ["-pthread"]
 headers = ["include/foo.h"]   # documentation only — not compiled
+
+[native.system]
+libraries = ["m"]
 
 [native.linux]
 libraries = ["foo"]
 
 [native.macos-arm64]
 library_paths = ["native/macos-arm64"]
+library = "libfoo.a"
 ```
 
 Resolution for the host platform (`linux-x64`, `macos-arm64`, …):
 
 1. Merge `[native]` with matching `[native.<os>]` then `[native.<os>-<arch>]`.
-2. Search `library_paths` and `native/<platform>/` for `libfoo.a` / `.so` / `.dylib` / `.lib`.
-3. Prefer a found artifact file; otherwise link as a system library (`-lfoo`).
+2. Search `library_paths`, `native/<platform>/`, dependency package trees, and the native cache.
+3. Prefer a found artifact file; `[native.system]` and unresolved names link as system libraries (`-l`).
 4. Apply `link_args` as raw linker arguments.
+5. Copy dynamic runtime libraries next to the output binary (`$ORIGIN` / `@loader_path` on Unix).
 
 Header paths are recorded for documentation; Sonite does **not** invoke a C compiler or parse headers.
+
+For package distribution, lockfiles, publish, and install flow, see [Native Packages](native-packages.md).
 
 ## Internal runtime ABI
 

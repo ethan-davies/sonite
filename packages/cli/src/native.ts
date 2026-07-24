@@ -20,6 +20,7 @@ import {
 } from "@sonite/runtime";
 import { reportInternalError } from "./crash-report.js";
 import { applyProjectPackageRoots } from "./deps/roots.js";
+import { portableRpathArgs } from "./native-deps.js";
 
 export interface CompileToIrResult {
   readonly ir: string;
@@ -166,8 +167,14 @@ export async function linkNative(options: LinkOptions): Promise<number> {
       for (const arg of nativeLink.linkArgs) {
         linker.addArg(arg);
       }
-      // rpath for dirs containing dynamic libs (Unix)
-      if (process.platform !== "win32") {
+      // Prefer portable rpath so app-local dynlibs resolve without LD_LIBRARY_PATH
+      const runtimeLibs = nativeLink.runtimeLibraries ?? [];
+      if (process.platform !== "win32" && runtimeLibs.length > 0) {
+        for (const arg of portableRpathArgs(hostRuntimePlatformId())) {
+          linker.addArg(arg);
+        }
+      } else if (process.platform !== "win32") {
+        // Fallback: absolute rpath for dynlibs linked from non-deployed locations
         for (const file of nativeLink.libraryFiles) {
           if (/\.(so|dylib)$/i.test(file)) {
             const dir = dirname(file);

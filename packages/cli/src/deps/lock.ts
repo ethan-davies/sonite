@@ -15,8 +15,27 @@ export interface LockPackage {
   readonly dependencies: readonly string[];
 }
 
+/** Locked native artifact for a specific host platform. */
+export interface LockNative {
+  /** Owning Sonite package name. */
+  readonly package: string;
+  /** Native dependency identity (from `[native].name` or library name). */
+  readonly name: string;
+  readonly version: string;
+  readonly platform: string;
+  readonly architecture: string;
+  readonly kind: "static" | "dynamic";
+  /** `bundled` when shipped inside the Sonite package tarball. */
+  readonly source: string;
+  /** Path relative to the owning package root (e.g. `native/linux-x64/libfoo.a`). */
+  readonly path: string;
+  readonly sha256: string;
+  readonly filename: string;
+}
+
 export interface Lockfile {
   readonly packages: readonly LockPackage[];
+  readonly natives: readonly LockNative[];
 }
 
 const LOCKFILE_HEADER = `\
@@ -38,6 +57,87 @@ export function migrateLegacyLockfile(projectRoot: string): void {
   }
 }
 
+function parseLockPackage(row: Record<string, unknown>): LockPackage {
+  if (
+    typeof row.name !== "string" ||
+    typeof row.version !== "string" ||
+    typeof row.checksum !== "string"
+  ) {
+    throw new ProjectError(
+      "project.lock: each package needs name, version, checksum strings",
+    );
+  }
+  if (!row.name.trim() || !row.version.trim() || !row.checksum.trim()) {
+    throw new ProjectError(
+      "project.lock: name, version, and checksum must be non-empty",
+    );
+  }
+  let source: string;
+  if (row.source === undefined) {
+    source = getRegistryUrl();
+  } else if (typeof row.source !== "string" || !row.source.trim()) {
+    throw new ProjectError(
+      "project.lock: source must be a non-empty string when present",
+    );
+  } else {
+    source = row.source.trim().replace(/\/$/, "");
+  }
+  let dependencies: string[] = [];
+  if (row.dependencies !== undefined) {
+    if (
+      !Array.isArray(row.dependencies) ||
+      !row.dependencies.every((d) => typeof d === "string")
+    ) {
+      throw new ProjectError(
+        "project.lock: dependencies must be an array of strings",
+      );
+    }
+    dependencies = [...row.dependencies].sort();
+  }
+  return {
+    name: row.name,
+    version: row.version,
+    checksum: row.checksum,
+    source,
+    dependencies,
+  };
+}
+
+function requireStringField(
+  row: Record<string, unknown>,
+  key: string,
+  label: string,
+): string {
+  const value = row[key];
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ProjectError(
+      `project.lock: each native entry needs a non-empty ${label}`,
+    );
+  }
+  return value.trim();
+}
+
+function parseLockNative(row: Record<string, unknown>): LockNative {
+  const kind = row.kind;
+  if (kind !== "static" && kind !== "dynamic") {
+    throw new ProjectError(
+      'project.lock: native.kind must be "static" or "dynamic"',
+    );
+  }
+  return {
+    package: requireStringField(row, "package", "package"),
+    name: requireStringField(row, "name", "name"),
+    version: requireStringField(row, "version", "version"),
+    platform: requireStringField(row, "platform", "platform"),
+    architecture: requireStringField(row, "architecture", "architecture"),
+    kind,
+    source: requireStringField(row, "source", "source"),
+    path: requireStringField(row, "path", "path"),
+    sha256: requireStringField(row, "sha256", "sha256"),
+    filename: requireStringField(row, "filename", "filename"),
+  };
+}
+
 export function loadLockfile(projectRoot: string): Lockfile | null {
   migrateLegacyLockfile(projectRoot);
   const path = lockfilePath(projectRoot);
@@ -49,63 +149,31 @@ export function loadLockfile(projectRoot: string): Lockfile | null {
       string,
       unknown
     >;
-    const list = raw.package;
-    if (list === undefined) {
-      return { packages: [] };
-    }
-    const entries = Array.isArray(list) ? list : [list];
     const packages: LockPackage[] = [];
-    for (const entry of entries) {
-      if (typeof entry !== "object" || entry === null) {
-        throw new ProjectError("project.lock: invalid [[package]] entry");
-      }
-      const row = entry as Record<string, unknown>;
-      if (
-        typeof row.name !== "string" ||
-        typeof row.version !== "string" ||
-        typeof row.checksum !== "string"
-      ) {
-        throw new ProjectError(
-          "project.lock: each package needs name, version, checksum strings",
-        );
-      }
-      if (!row.name.trim() || !row.version.trim() || !row.checksum.trim()) {
-        throw new ProjectError(
-          "project.lock: name, version, and checksum must be non-empty",
-        );
-      }
-      let source: string;
-      if (row.source === undefined) {
-        // Older lockfiles omit source; default to the active registry URL.
-        source = getRegistryUrl();
-      } else if (typeof row.source !== "string" || !row.source.trim()) {
-        throw new ProjectError(
-          "project.lock: source must be a non-empty string when present",
-        );
-      } else {
-        source = row.source.trim().replace(/\/$/, "");
-      }
-      let dependencies: string[] = [];
-      if (row.dependencies !== undefined) {
-        if (
-          !Array.isArray(row.dependencies) ||
-          !row.dependencies.every((d) => typeof d === "string")
-        ) {
-          throw new ProjectError(
-            "project.lock: dependencies must be an array of strings",
-          );
+    const packageList = raw.package;
+    if (packageList !== undefined) {
+      const entries = Array.isArray(packageList) ? packageList : [packageList];
+      for (const entry of entries) {
+        if (typeof entry !== "object" || entry === null) {
+          throw new ProjectError("project.lock: invalid [[package]] entry");
         }
-        dependencies = [...row.dependencies].sort();
+        packages.push(parseLockPackage(entry as Record<string, unknown>));
       }
-      packages.push({
-        name: row.name,
-        version: row.version,
-        checksum: row.checksum,
-        source,
-        dependencies,
-      });
     }
-    return { packages };
+
+    const natives: LockNative[] = [];
+    const nativeList = raw.native;
+    if (nativeList !== undefined) {
+      const entries = Array.isArray(nativeList) ? nativeList : [nativeList];
+      for (const entry of entries) {
+        if (typeof entry !== "object" || entry === null) {
+          throw new ProjectError("project.lock: invalid [[native]] entry");
+        }
+        natives.push(parseLockNative(entry as Record<string, unknown>));
+      }
+    }
+
+    return { packages, natives };
   } catch (error) {
     if (error instanceof ProjectError) {
       throw error;
@@ -118,6 +186,7 @@ export function loadLockfile(projectRoot: string): Lockfile | null {
 export function writeLockfile(
   projectRoot: string,
   packages: readonly LockPackage[],
+  natives: readonly LockNative[] = [],
 ): void {
   const sorted = [...packages].sort((a, b) => a.name.localeCompare(b.name));
   for (const pkg of sorted) {
@@ -128,8 +197,18 @@ export function writeLockfile(
     }
   }
 
+  const sortedNatives = [...natives].sort((a, b) => {
+    const byName = a.name.localeCompare(b.name);
+    if (byName !== 0) return byName;
+    const byPkg = a.package.localeCompare(b.package);
+    if (byPkg !== 0) return byPkg;
+    return `${a.platform}-${a.architecture}`.localeCompare(
+      `${b.platform}-${b.architecture}`,
+    );
+  });
+
   const parts: string[] = [LOCKFILE_HEADER];
-  if (sorted.length === 0) {
+  if (sorted.length === 0 && sortedNatives.length === 0) {
     parts.push("");
   } else {
     for (const pkg of sorted) {
@@ -145,6 +224,20 @@ export function writeLockfile(
       );
       parts.push("");
     }
+    for (const native of sortedNatives) {
+      parts.push("[[native]]");
+      parts.push(`package = ${JSON.stringify(native.package)}`);
+      parts.push(`name = ${JSON.stringify(native.name)}`);
+      parts.push(`version = ${JSON.stringify(native.version)}`);
+      parts.push(`platform = ${JSON.stringify(native.platform)}`);
+      parts.push(`architecture = ${JSON.stringify(native.architecture)}`);
+      parts.push(`kind = ${JSON.stringify(native.kind)}`);
+      parts.push(`source = ${JSON.stringify(native.source)}`);
+      parts.push(`path = ${JSON.stringify(native.path)}`);
+      parts.push(`sha256 = ${JSON.stringify(native.sha256)}`);
+      parts.push(`filename = ${JSON.stringify(native.filename)}`);
+      parts.push("");
+    }
   }
 
   writeFileSync(lockfilePath(projectRoot), parts.join("\n"), "utf8");
@@ -153,7 +246,7 @@ export function writeLockfile(
 export function ensureLockfile(projectRoot: string): void {
   migrateLegacyLockfile(projectRoot);
   if (!existsSync(lockfilePath(projectRoot))) {
-    writeLockfile(projectRoot, []);
+    writeLockfile(projectRoot, [], []);
   }
 }
 

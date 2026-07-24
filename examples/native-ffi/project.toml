@@ -7,20 +7,33 @@ entry = "src/main.sn"
 outdir = "dist"
 
 [native]
+name = "sn_example"
+version = "1.0.0"
+kind = "static"
+link = "static"
 libraries = ["sn_example"]
 headers = ["native/include/sn_example.h"]
 
 [native.linux-x64]
 library_paths = ["native/linux-x64"]
+library = "libsn_example.a"
 
 [native.linux-arm64]
 library_paths = ["native/linux-arm64"]
+library = "libsn_example.a"
 
 [native.macos-x64]
 library_paths = ["native/macos-x64"]
+library = "libsn_example.a"
 
 [native.macos-arm64]
 library_paths = ["native/macos-arm64"]
+library = "libsn_example.a"
+
+[native.win32-x64]
+library_paths = ["native/win32-x64"]
+library = "sn_example.lib"
 
 [native.windows-x64]
 library_paths = ["native/windows-x64"]
+library = "sn_example.lib"

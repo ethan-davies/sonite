@@ -5,6 +5,7 @@ import {
   resolveInstallVersion,
   updateProjectDependencies,
   ResolveError,
+  NativeResolveError,
 } from "../deps/install.js";
 import {
   loadLockfile,
@@ -16,12 +17,18 @@ import {
   removeDependency,
   setDependency,
 } from "../deps/manifest.js";
+import { formatNativeAddReport } from "../deps/native-resolve.js";
+import { NativeIntegrityError } from "../deps/native-cache.js";
 import { parseVersionRequirement } from "../deps/semver.js";
 import { loadProject, ProjectError } from "../project.js";
 import { RegistryError } from "../registry/client.js";
 
 function printError(error: unknown): void {
-  if (error instanceof ResolveError) {
+  if (
+    error instanceof ResolveError ||
+    error instanceof NativeResolveError ||
+    error instanceof NativeIntegrityError
+  ) {
     console.error(error.message);
     return;
   }
@@ -52,9 +59,13 @@ export async function runAdd(spec: string): Promise<number> {
 
     // Full graph resolve so transitive deps and the lockfile stay consistent.
     const refreshed = loadProject(project.root);
-    await resolveAndInstall(refreshed);
+    const result = await resolveAndInstall(refreshed);
 
     console.log(`added ${name}@${resolved.requirement}`);
+    const nativeNote = formatNativeAddReport(result.natives);
+    if (nativeNote) {
+      console.log(nativeNote);
+    }
     return 0;
   } catch (error) {
     printError(error);
@@ -80,7 +91,7 @@ export async function runRemove(name: string): Promise<number> {
       } else if (previous) {
         removeInstalledPackage(project.root, name, previous.version);
       }
-      writeLockfile(project.root, []);
+      writeLockfile(project.root, [], []);
     } else {
       await resolveAndInstall(refreshed);
     }
@@ -105,11 +116,18 @@ export async function runInstall(): Promise<number> {
         }
       }
       console.log("no dependencies to install");
-      writeLockfile(project.root, []);
+      writeLockfile(project.root, [], []);
       return 0;
     }
-    const installed = await installProjectDependencies(project);
-    console.log(`installed ${installed.length} package(s)`);
+    const installed = await installProjectDependencies(project, {
+      report: true,
+    });
+    console.log(
+      `installed ${installed.packages.length} package(s)` +
+        (installed.natives.length > 0
+          ? `, ${installed.natives.length} native`
+          : ""),
+    );
     return 0;
   } catch (error) {
     printError(error);
@@ -125,7 +143,12 @@ export async function runUpdate(name: string | undefined): Promise<number> {
       return 0;
     }
     const installed = await updateProjectDependencies(project, name);
-    console.log(`updated ${installed.length} package(s)`);
+    console.log(
+      `updated ${installed.packages.length} package(s)` +
+        (installed.natives.length > 0
+          ? `, ${installed.natives.length} native`
+          : ""),
+    );
     return 0;
   } catch (error) {
     printError(error);

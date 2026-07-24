@@ -11,8 +11,15 @@ import {
   loadLockfile,
   lockPackageMap,
   writeLockfile,
+  type LockNative,
   type LockPackage,
 } from "./lock.js";
+import {
+  formatNativeInstallReport,
+  installNativeArtifacts,
+  NativeResolveError,
+  resolveNativeArtifacts,
+} from "./native-resolve.js";
 import {
   lockSatisfiesRoots,
   resolveDependencies,
@@ -31,6 +38,16 @@ import {
 
 export { installPackageVersion } from "./install-fetch.js";
 export { ResolveError } from "./resolve.js";
+export { NativeResolveError } from "./native-resolve.js";
+
+function finalizeNativeLock(
+  project: Project,
+  packages: readonly LockPackage[],
+  previousNatives?: readonly LockNative[],
+): LockNative[] {
+  const artifacts = resolveNativeArtifacts(packages);
+  return installNativeArtifacts(artifacts, previousNatives);
+}
 
 export async function resolveInstallVersion(
   name: string,
@@ -82,8 +99,10 @@ export async function resolveAndInstall(
   opts?: {
     prefer?: ReadonlyMap<string, string>;
     float?: ReadonlySet<string>;
+    /** When true, print the Sonite/Native install report. */
+    report?: boolean;
   },
-): Promise<readonly LockPackage[]> {
+): Promise<{ packages: readonly LockPackage[]; natives: readonly LockNative[] }> {
   const resolved = await resolveDependencies(
     project.root,
     project.dependencies,
@@ -97,7 +116,8 @@ export async function resolveAndInstall(
     dependencies: p.dependencies,
   }));
 
-  const previous = lockPackageMap(loadLockfile(project.root));
+  const previousLock = loadLockfile(project.root);
+  const previous = lockPackageMap(previousLock);
   const nextNames = new Set(packages.map((p) => p.name));
   for (const [name, entry] of previous) {
     if (!nextNames.has(name)) {
@@ -114,8 +134,18 @@ export async function resolveAndInstall(
     );
   }
 
-  writeLockfile(project.root, packages);
-  return packages;
+  const natives = finalizeNativeLock(
+    project,
+    packages,
+    previousLock?.natives,
+  );
+  writeLockfile(project.root, packages, natives);
+
+  if (opts?.report) {
+    console.log(formatNativeInstallReport(packages, natives));
+  }
+
+  return { packages, natives };
 }
 
 /**
@@ -124,7 +154,8 @@ export async function resolveAndInstall(
  */
 export async function installProjectDependencies(
   project: Project,
-): Promise<readonly LockPackage[]> {
+  opts?: { report?: boolean },
+): Promise<{ packages: readonly LockPackage[]; natives: readonly LockNative[] }> {
   const lock = loadLockfile(project.root);
   const locked = lockPackageMap(lock);
 
@@ -132,8 +163,8 @@ export async function installProjectDependencies(
     for (const [name, entry] of locked) {
       removeDependant(name, entry.version, project.root);
     }
-    writeLockfile(project.root, []);
-    return [];
+    writeLockfile(project.root, [], []);
+    return { packages: [], natives: [] };
   }
 
   if (
@@ -152,11 +183,13 @@ export async function installProjectDependencies(
       const cached = existsSync(
         join(packageVersionPath(pkg.name, pkg.version), "project.toml"),
       );
-      console.log(
-        cached
-          ? `using cached ${pkg.name}@${pkg.version}`
-          : `installing ${pkg.name}@${pkg.version}`,
-      );
+      if (!opts?.report) {
+        console.log(
+          cached
+            ? `using cached ${pkg.name}@${pkg.version}`
+            : `installing ${pkg.name}@${pkg.version}`,
+        );
+      }
       await installPackageVersion(
         project.root,
         pkg.name,
@@ -164,11 +197,23 @@ export async function installProjectDependencies(
         pkg.checksum,
       );
     }
-    return lock.packages;
+
+    // Re-verify / refresh native artifacts against the lock
+    const natives = finalizeNativeLock(project, lock.packages, lock.natives);
+    writeLockfile(project.root, lock.packages, natives);
+
+    if (opts?.report) {
+      console.log(formatNativeInstallReport(lock.packages, natives));
+    }
+
+    return { packages: lock.packages, natives };
   }
 
   console.log("resolving dependencies");
-  return resolveAndInstall(project);
+  return resolveAndInstall(
+    project,
+    opts?.report ? { report: true } : undefined,
+  );
 }
 
 /**
@@ -180,14 +225,14 @@ export async function installProjectDependencies(
 export async function updateProjectDependencies(
   project: Project,
   only?: string,
-): Promise<readonly LockPackage[]> {
+): Promise<{ packages: readonly LockPackage[]; natives: readonly LockNative[] }> {
   if (only && !(only in project.dependencies)) {
     throw new ResolveError(`dependency '${only}' is not in project.toml`);
   }
 
   if (!only) {
     console.log("updating dependencies");
-    return resolveAndInstall(project);
+    return resolveAndInstall(project, { report: true });
   }
 
   const lock = loadLockfile(project.root);
@@ -201,6 +246,7 @@ export async function updateProjectDependencies(
   return resolveAndInstall(project, {
     prefer,
     float: new Set([only]),
+    report: true,
   });
 }
 

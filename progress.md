@@ -332,8 +332,8 @@ Support:
 * [x] Platform-specific native dependencies
 * [x] Native library discovery
 * [x] Native library bundling
-* [ ] Native dependency installation
-* [ ] Cross-platform native package handling
+* [x] Native dependency installation
+* [x] Cross-platform native package handling
 
 ### Safety
 
@@ -403,7 +403,7 @@ Ensure the package system has:
 * [x] Resolved package URLs
 * [x] Integrity hashes
 * [x] Transitive dependency information
-* [ ] Platform-specific dependency information
+* [x] Platform-specific dependency information
 * [x] Reproducible installs
 * [x] Lockfile validation
 
@@ -550,7 +550,7 @@ I would add this as a final phase **after Phase 7**. This is not a new feature p
 * [ ] Error handling documented
 * [ ] Module system documented
 * [ ] Package system documented
-* [ ] FFI documented
+* [x] FFI documented
 * [ ] Runtime behaviour documented
 * [ ] Standard library API documented
 
@@ -634,7 +634,7 @@ Create official examples for:
 * [x] HTTP client
 * [ ] Package usage
 * [ ] Package creation
-* [ ] FFI example
+* [x] FFI example
 * [ ] Debugging example
 
 ## Testing
@@ -646,7 +646,7 @@ Create official examples for:
 * [x] Formatter tests
 * [x] Package manager tests
 * [ ] Registry tests
-* [ ] FFI tests
+* [x] FFI tests
 * [ ] Debugger tests
 * [x] Cross-platform CI
 * [x] Clean-machine tests

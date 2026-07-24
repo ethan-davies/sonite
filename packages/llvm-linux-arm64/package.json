@@ -1,0 +1,12 @@
+{
+  "name": "@sonite/llvm-linux-arm64",
+  "version": "0.0.0",
+  "description": "Sonite LLVM/LLD native toolchain for linux-arm64",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "files": ["index.js", "native", "lib", "BUILD_INFO.json"],
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "engines": { "node": ">=20" }
+}

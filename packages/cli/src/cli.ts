@@ -35,16 +35,19 @@ program
   .option("-o, --output <file>", "output binary path")
   .option("--emit-ir", "also write LLVM IR next to the binary", false)
   .option("--ir-only", "emit LLVM IR only (skip native linking)", false)
+  .option("--release", "build with optimizations (LLVM -O2)", false)
   .action(
     async (options: {
       output?: string;
       emitIr?: boolean;
       irOnly?: boolean;
+      release?: boolean;
     }) => {
       const buildOpts: {
         output?: string;
         emitIr?: boolean;
         irOnly?: boolean;
+        release?: boolean;
       } = {};
       if (options.output !== undefined) {
         buildOpts.output = options.output;
@@ -54,6 +57,9 @@ program
       }
       if (options.irOnly) {
         buildOpts.irOnly = true;
+      }
+      if (options.release) {
+        buildOpts.release = true;
       }
       process.exitCode = await runBuild(buildOpts);
     },
@@ -65,10 +71,15 @@ program
     "Compile and run a .sn file, or build and run the current project",
   )
   .argument("[input]", "path to a .sn source file (default: project entry)")
-  .action(async (input: string | undefined) => {
+  .option("--release", "build with optimizations (LLVM -O2)", false)
+  .action(async (input: string | undefined, options: { release?: boolean }) => {
     const dashIndex = process.argv.indexOf("--");
     const programArgs = dashIndex >= 0 ? process.argv.slice(dashIndex + 1) : [];
-    process.exitCode = await runRun(input, programArgs);
+    const runOpts: { release?: boolean } = {};
+    if (options.release) {
+      runOpts.release = true;
+    }
+    process.exitCode = await runRun(input, programArgs, runOpts);
   });
 
 program

@@ -60,5 +60,5 @@ Currently supported features:
 - Exceptions: built-in `Error` class (`message`), `throw`, `try` / `catch` / `finally` (every thrown value must be `Error` or a subclass)
 - `//` line comments and `/* */` block comments
 
-`print` and `console.*` are builtins. They lower to `sn_print_*` / `sn_eprint_*` / `sn_read_line` runtime calls in the generated LLVM IR, and `sn run` links `libsn_runtime.a` when building the native binary.
+`print` and `console.*` are builtins. They lower to `sn_print_*` / `sn_eprint_*` / `sn_read_line` runtime calls in the generated LLVM IR, and `sn run` links `libsn_runtime.a` (via the direct LLVM/LLD toolchain) when building the native binary.
 `createMap()` is a builtin that allocates an empty string-keyed map (for index-signature types).

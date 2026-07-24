@@ -1,0 +1,12 @@
+build/
+dist/
+*.node
+!prebuilds/*.node
+# Bundled LLVM/LLD shared libraries are build outputs (often >100MB).
+prebuilds/lib/
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+!prebuilds/.gitkeep

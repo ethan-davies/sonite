@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@sonite/compiler": "workspace:*",
+    "@sonite/llvm": "workspace:*",
     "@sonite/runtime": "workspace:*",
     "@sonite/std": "workspace:*",
     "commander": "^14.0.3",

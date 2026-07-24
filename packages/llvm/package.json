@@ -1,0 +1,54 @@
+{
+  "name": "@sonite/llvm",
+  "version": "0.0.0",
+  "description": "Pinned LLVM/LLD native binding for the Sonite toolchain",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "native",
+    "prebuilds",
+    "scripts",
+    "binding.gyp",
+    "README.md"
+  ],
+  "scripts": {
+    "install": "node scripts/install-native.js",
+    "build": "node scripts/build-native.js && tsc -p tsconfig.build.json",
+    "build:native": "node scripts/build-native.js",
+    "build:ts": "tsc -p tsconfig.build.json",
+    "fetch-sdk": "node scripts/fetch-llvm-sdk.js",
+    "validate-deps": "node scripts/validate-native-deps.js",
+    "clean": "rm -rf dist build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.3.1"
+  },
+  "optionalDependencies": {
+    "@sonite/llvm-linux-x64": "workspace:*",
+    "@sonite/llvm-linux-arm64": "workspace:*",
+    "@sonite/llvm-macos-x64": "workspace:*",
+    "@sonite/llvm-macos-arm64": "workspace:*",
+    "@sonite/llvm-win32-x64": "workspace:*",
+    "@sonite/llvm-win32-arm64": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,51 @@
+# Windows (MSVC/clang-cl) minimal runtime build.
+# Produces sn_runtime.lib for win32-x64. Requires clang-cl or cl on PATH.
+#
+# Usage (from packages/runtime):
+#   make -f Makefile.win CC=clang-cl
+
+CC ?= clang-cl
+AR ?= llvm-ar
+CFLAGS ?= /nologo /O2 /Iinclude /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN
+OBJ_DIR := dist/obj-win
+DIST_DIR := dist
+LIBRARY := $(DIST_DIR)/sn_runtime.lib
+
+# Core sources that are mostly portable; exclude Unix-only reactor/net/tls/async.
+CORE_SOURCES := \
+	src/alloc.c \
+	src/array.c \
+	src/bytes.c \
+	src/encoding.c \
+	src/exception.c \
+	src/gc.c \
+	src/map.c \
+	src/math.c \
+	src/path.c \
+	src/print.c \
+	src/process.c \
+	src/random.c \
+	src/string.c \
+	src/time.c \
+	src/timer.c \
+	src/typeinfo.c \
+	src/win_stubs.c
+
+OBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.obj,$(notdir $(CORE_SOURCES)))
+
+.PHONY: all clean
+
+all: $(LIBRARY)
+
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(OBJ_DIR)/%.obj: src/%.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) /c $< /Fo$@
+
+$(LIBRARY): $(OBJECTS)
+	$(AR) rcs $@ $(OBJECTS)
+	@echo "built $@"
+
+clean:
+	rm -rf $(OBJ_DIR) $(LIBRARY)

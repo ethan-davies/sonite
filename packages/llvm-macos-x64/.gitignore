@@ -1,0 +1,4 @@
+# Built native artifacts (produced by pnpm build:native / CI)
+native/
+lib/
+BUILD_INFO.json

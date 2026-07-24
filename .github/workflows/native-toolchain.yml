@@ -1,0 +1,138 @@
+name: Native Toolchain
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install deps
+        run: pnpm install
+      - name: Build native toolchain
+        run: pnpm build:native
+      - name: Build packages
+        run: pnpm --filter @sonite/compiler build && pnpm --filter @sonite/llvm build:ts && pnpm --filter @sonite/runtime build && pnpm --filter @sonite/cli build
+      - name: Validate native deps
+        run: |
+          node packages/llvm/scripts/validate-native-deps.js \
+            packages/llvm-linux-x64/native/sonite_llvm.node \
+            packages/llvm-linux-x64/lib
+      - name: Unit tests
+        run: pnpm --filter @sonite/llvm test && pnpm --filter @sonite/cli exec vitest run tests/native-toolchain.test.ts
+      - name: Clean PATH e2e
+        run: |
+          SCRUB=$(mktemp -d)
+          ln -s "$(command -v node)" "$SCRUB/node"
+          ln -s /bin/sh "$SCRUB/sh"
+          ln -s /usr/bin/env "$SCRUB/env"
+          env PATH="$SCRUB" HOME="$HOME" node packages/cli/dist/cli.js run examples/hello.sn
+          rm -rf "$SCRUB"
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm build:native
+      - run: pnpm --filter @sonite/compiler build && pnpm --filter @sonite/llvm build:ts && pnpm --filter @sonite/runtime build && pnpm --filter @sonite/cli build
+      - run: |
+          node packages/llvm/scripts/validate-native-deps.js \
+            packages/llvm-linux-arm64/native/sonite_llvm.node \
+            packages/llvm-linux-arm64/lib
+      - run: pnpm --filter @sonite/llvm test
+      - run: node packages/cli/dist/cli.js run examples/hello.sn
+
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm build:native
+      - run: pnpm --filter @sonite/compiler build && pnpm --filter @sonite/llvm build:ts && pnpm --filter @sonite/runtime build && pnpm --filter @sonite/cli build
+      - run: |
+          node packages/llvm/scripts/validate-native-deps.js \
+            packages/llvm-macos-arm64/native/sonite_llvm.node \
+            packages/llvm-macos-arm64/lib
+      - run: pnpm --filter @sonite/llvm test
+      - run: node packages/cli/dist/cli.js run examples/hello.sn
+
+  macos-x64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm build:native
+      - run: pnpm --filter @sonite/compiler build && pnpm --filter @sonite/llvm build:ts && pnpm --filter @sonite/runtime build && pnpm --filter @sonite/cli build
+      - run: |
+          node packages/llvm/scripts/validate-native-deps.js \
+            packages/llvm-macos-x64/native/sonite_llvm.node \
+            packages/llvm-macos-x64/lib
+      - run: pnpm --filter @sonite/llvm test
+      - run: node packages/cli/dist/cli.js run examples/hello.sn
+
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install
+      - name: Build native (Windows)
+        run: pnpm build:native
+        shell: bash
+      - name: Build runtime (Windows minimal)
+        run: |
+          pnpm --filter @sonite/runtime exec tsc -p tsconfig.build.json
+          cd packages/runtime && make -f Makefile.win
+          node dist/install-prebuilt.js
+        shell: bash
+      - run: pnpm --filter @sonite/compiler build && pnpm --filter @sonite/llvm build:ts && pnpm --filter @sonite/cli build
+        shell: bash
+      - name: E2E hello
+        run: node packages/cli/dist/cli.js run examples/hello.sn
+        shell: bash
+
+  win32-arm64-deferred:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "win32-arm64 native toolchain is deferred for this milestone."
+          echo "Package @sonite/llvm-win32-arm64 ships a clear not-available stub."

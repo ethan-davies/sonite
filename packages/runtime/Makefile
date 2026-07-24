@@ -7,7 +7,7 @@ DIST_DIR := dist
 OBJ_DIR := $(DIST_DIR)/obj
 TEST_DIR := tests
 
-SOURCES := $(wildcard $(SRC_DIR)/*.c)
+SOURCES := $(filter-out $(SRC_DIR)/win_stubs.c,$(wildcard $(SRC_DIR)/*.c))
 OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 LIBRARY := $(DIST_DIR)/libsn_runtime.a
 SMOKE_BIN := $(DIST_DIR)/runtime_smoke

@@ -1,11 +1,19 @@
-import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import { compileFile, formatDiagnostics } from "@sonite/compiler";
-import { getRuntimeLibraryPath } from "@sonite/runtime";
+import {
+  Backend,
+  Linker,
+  resolveOptLevel,
+  type OptLevel,
+} from "@sonite/llvm";
+import {
+  getRuntimeLibraryPath,
+  hostRuntimePlatformId,
+} from "@sonite/runtime";
 import { applyProjectPackageRoots } from "./deps/roots.js";
-import { resolveClang } from "./toolchain.js";
 
 export interface CompileToIrResult {
   readonly ir: string;
@@ -36,28 +44,28 @@ export interface LinkOptions {
   readonly outputPath: string;
   /** Also write the LLVM IR next to the binary (or to this path if absolute .ll). */
   readonly emitIrPath?: string;
+  readonly release?: boolean;
+  readonly optLevel?: OptLevel;
+  readonly triple?: string;
+}
+
+function formatNativeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
 }
 
 /**
- * Write IR to a temp file, invoke resolved clang with the runtime library, emit a native binary.
+ * Emit an object file via LLVM TargetMachine and link with LLD + runtime.
  */
 export async function linkNative(options: LinkOptions): Promise<number> {
-  let clangPath: string;
-  try {
-    const clang = await resolveClang();
-    clangPath = clang.path;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`error: ${message}`);
-    return 1;
-  }
-
   let runtimeLibrary: string;
   try {
-    runtimeLibrary = getRuntimeLibraryPath();
+    const platform = hostRuntimePlatformId();
+    runtimeLibrary = getRuntimeLibraryPath(platform);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`error: ${message}`);
+    console.error(`error: ${formatNativeError(error)}`);
     return 1;
   }
 
@@ -68,45 +76,43 @@ export async function linkNative(options: LinkOptions): Promise<number> {
     writeFileSync(options.emitIrPath, options.ir, "utf8");
   }
 
-  const dir = mkdtempSync(join(tmpdir(), "sn-"));
-  const llPath = join(dir, "program.ll");
   const binPath = resolve(options.outputPath);
+  const objPath = join(outDir, `${basename(binPath)}.o`);
+  const optLevel = resolveOptLevel({
+    ...(options.release !== undefined ? { release: options.release } : {}),
+    ...(options.optLevel !== undefined ? { optLevel: options.optLevel } : {}),
+  });
+
+  let backend: Backend | null = null;
+  let linker: Linker | null = null;
 
   try {
-    writeFileSync(llPath, options.ir, "utf8");
-
-    const clang = spawnSync(
-      clangPath,
-      [
-        llPath,
-        runtimeLibrary,
-        "-lm",
-        "-lpthread",
-        "-lssl",
-        "-lcrypto",
-        "-o",
-        binPath,
-        "-Wno-override-module",
-      ],
-      { encoding: "utf8" },
-    );
-
-    if (clang.error) {
-      console.error(`error: failed to invoke clang: ${clang.error.message}`);
-      return 1;
+    backend = Backend.fromIr(options.ir);
+    const targetConfig: {
+      optLevel: OptLevel;
+      triple?: string;
+    } = { optLevel };
+    if (options.triple) {
+      targetConfig.triple = options.triple;
     }
+    backend.target(targetConfig);
+    backend.verify();
+    backend.emitObject(objPath);
 
-    if (clang.status !== 0) {
-      if (clang.stderr) {
-        console.error(clang.stderr.trimEnd());
-      }
-      console.error("error: clang failed to build the program");
-      return clang.status ?? 1;
-    }
+    linker = Linker.forHost(options.triple ?? backend.getTriple());
+    linker.addObject(objPath);
+    linker.addLibrary(runtimeLibrary);
+    linker.addDefaultSystemLibraries();
+    linker.setOutput(binPath);
+    linker.link();
 
     return 0;
+  } catch (error) {
+    console.error(`error: ${formatNativeError(error)}`);
+    return 1;
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    backend?.dispose();
+    linker?.dispose();
   }
 }
 
@@ -116,7 +122,7 @@ export async function linkNative(options: LinkOptions): Promise<number> {
 export async function compileLinkAndRun(
   inputPath: string,
   args: readonly string[] = [],
-  options: { cwd?: string } = {},
+  options: { cwd?: string; release?: boolean } = {},
 ): Promise<number> {
   const compiled = compileSourceFile(inputPath);
   if (!compiled) {
@@ -130,6 +136,7 @@ export async function compileLinkAndRun(
     const status = await linkNative({
       ir: compiled.ir,
       outputPath: binPath,
+      ...(options.release !== undefined ? { release: options.release } : {}),
     });
     if (status !== 0) {
       return status;

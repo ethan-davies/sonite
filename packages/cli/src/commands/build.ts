@@ -2,12 +2,15 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { compileSourceFile, linkNative } from "../native.js";
 import { loadProject, ProjectError } from "../project.js";
+import type { OptLevel } from "@sonite/llvm";
 
 export interface BuildOptions {
   readonly output?: string;
   readonly emitIr?: boolean;
   /** When true, only emit IR and skip native linking. */
   readonly irOnly?: boolean;
+  readonly release?: boolean;
+  readonly optLevel?: OptLevel;
 }
 
 export async function runBuild(options: BuildOptions = {}): Promise<number> {
@@ -43,11 +46,15 @@ export async function runBuild(options: BuildOptions = {}): Promise<number> {
     return 0;
   }
 
-  const status = await linkNative({
+  const linkOpts: Parameters<typeof linkNative>[0] = {
     ir: compiled.ir,
     outputPath: binaryPath,
     ...(irPath !== undefined ? { emitIrPath: irPath } : {}),
-  });
+    ...(options.release !== undefined ? { release: options.release } : {}),
+    ...(options.optLevel !== undefined ? { optLevel: options.optLevel } : {}),
+  };
+
+  const status = await linkNative(linkOpts);
 
   if (status !== 0) {
     return status;

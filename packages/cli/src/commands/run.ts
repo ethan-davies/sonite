@@ -4,12 +4,21 @@ import { compileLinkAndRun } from "../native.js";
 import { loadProject, ProjectError } from "../project.js";
 import { runBuild } from "./build.js";
 
+export interface RunOptions {
+  readonly release?: boolean;
+}
+
 export async function runRun(
   input: string | undefined,
   args: readonly string[] = [],
+  options: RunOptions = {},
 ): Promise<number> {
   if (input) {
-    return compileLinkAndRun(input, args);
+    const runOpts: { release?: boolean } = {};
+    if (options.release !== undefined) {
+      runOpts.release = options.release;
+    }
+    return compileLinkAndRun(input, args, runOpts);
   }
 
   let project;
@@ -23,7 +32,11 @@ export async function runRun(
     throw error;
   }
 
-  const status = await runBuild();
+  const buildOpts: { release?: boolean } = {};
+  if (options.release !== undefined) {
+    buildOpts.release = options.release;
+  }
+  const status = await runBuild(buildOpts);
   if (status !== 0) {
     return status;
   }

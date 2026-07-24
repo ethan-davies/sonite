@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { isNativeBindingAvailable } from "@sonite/llvm";
 import { compileLinkAndRun } from "../src/native.js";
 
 const repoRoot = join(
@@ -12,12 +12,7 @@ const repoRoot = join(
 );
 const examples = join(repoRoot, "examples");
 
-function clangAvailable(): boolean {
-  const r = spawnSync("clang", ["--version"], { encoding: "utf8" });
-  return r.status === 0;
-}
-
-describe.runIf(clangAvailable())("async sn run integration", () => {
+describe.runIf(isNativeBindingAvailable())("async sn run integration", () => {
   it(
     "runs async-sleep.sn",
     async () => {

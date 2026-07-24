@@ -8,8 +8,21 @@ Please read the [Code of Conduct](./CODE_OF_CONDUCT.md) before participating. Se
 
 - [Node.js](https://nodejs.org/) 20+
 - [pnpm](https://pnpm.io/) 10+
+- A C++17 compiler and Node headers (to build `@sonite/llvm` from source)
+- OpenSSL development libraries (linked into Sonite programs on Unix)
+- On Windows: Windows SDK / MSVC tools for system libraries when linking
 
-Native `sn build` / `sn run` link with clang. The CLI resolves clang from `SN_CLANG`, then `PATH`, then a cached LLVM download under `~/.cache/sonite/` (no manual clang install required). Override the cache root with `SN_CACHE_DIR` if needed.
+**End users** do not need LLVM, clang, llc, or ld.lld. The `@sonite/llvm` package installs a platform-specific optional dependency (`@sonite/llvm-linux-x64`, …) that bundles the native addon and LLVM/LLD shared libraries.
+
+**Contributors** building the native binding:
+
+```bash
+pnpm build:native
+```
+
+This downloads the pinned LLVM **22.1.8** SDK into `~/.cache/sonite/` (override with `SONITE_LLVM_SDK` or `SN_CACHE_DIR`). For emergency local iteration only: `SONITE_BUNDLE_FROM_SYSTEM=1` (still copies libs into the platform package).
+
+Runtime C sources are still built with `clang`/`make` for maintainers; `sn build` / `sn run` never invoke clang — they link `prebuilt/<platform>/libsn_runtime.a` (or `sn_runtime.lib` on Windows).
 
 ## Setup
 
@@ -51,7 +64,9 @@ This is a pnpm workspace. Most contributions land in one of these packages:
 | Package | Role |
 | --- | --- |
 | [`packages/compiler`](./packages/compiler) | Lexer, parser, validation, typecheck, LLVM codegen |
-| [`packages/runtime`](./packages/runtime) | C runtime (`libsn_runtime.a`) |
+| [`packages/llvm`](./packages/llvm) | TypeScript LLVM/LLD API + reproducible native build |
+| [`packages/llvm-linux-x64`](./packages/llvm-linux-x64) (and siblings) | Platform-bundled `.node` + LLVM/LLD libs |
+| [`packages/runtime`](./packages/runtime) | C runtime (`libsn_runtime.a` / `sn_runtime.lib`) |
 | [`packages/std`](./packages/std) | Standard library written in SN (`.sn`) |
 | [`packages/cli`](./packages/cli) | `sn` CLI |
 | [`packages/lsp`](./packages/lsp) | Language server |

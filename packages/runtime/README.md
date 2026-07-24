@@ -30,7 +30,7 @@ Single-threaded cooperative concurrency:
 
 See `src/async.c`, `reactor.c`, `timer.c`, `net.c`, `udp.c`, `dns.c`, `tls.c`, `bytes.c`, and `tests/async_smoke.c`.
 
-Linking native programs requires `-lpthread -lssl -lcrypto` in addition to `libsn_runtime.a` (the `sn` CLI adds these automatically).
+Linking native programs requires system libraries such as `pthread`, `ssl`, and `crypto` in addition to `libsn_runtime.a` (the `sn` CLI adds these automatically via the target toolchain config).
 
 ## Heap & GC
 
@@ -45,7 +45,13 @@ pnpm --filter @sonite/runtime build
 pnpm --filter @sonite/runtime test
 ```
 
-Produces `dist/libsn_runtime.a`.
+Produces `dist/libsn_runtime.a` and copies it to `prebuilt/<host-platform>/libsn_runtime.a` for packaging.
+
+On Windows, use `make -f Makefile.win` to produce `sn_runtime.lib` (minimal runtime; async/net/TLS deferred).
+
+**Maintainer note:** building the C sources still uses `clang` (or `CC`) via the Makefile. End-user `sn build` / `sn run` never invoke clang; they link the prebuilt archive through `@sonite/llvm`.
+
+Supported prebuilt platform ids: `linux-x64`, `linux-arm64`, `macos-x64`, `macos-arm64`, `win32-x64`.
 
 ## Public API
 

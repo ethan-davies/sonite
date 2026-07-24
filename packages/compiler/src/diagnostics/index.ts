@@ -16,3 +16,11 @@ export {
   resolveDiagnosticsConfig,
 } from "./config.js";
 export type { DiagnosticLevel, DiagnosticsConfig } from "./config.js";
+export {
+  editDistance,
+  formatDidYouMean,
+  maxSuggestionDistance,
+  suggestClosest,
+} from "./suggest.js";
+export type { SuggestOptions } from "./suggest.js";
+export { InternalError, isInternalError } from "./internal-error.js";

@@ -13,6 +13,8 @@
     "dev": "pnpm --filter @sonite/compiler build && pnpm --filter @sonite/llvm build && pnpm --filter @sonite/runtime build && pnpm --filter @sonite/std build && tsx packages/cli/src/cli.ts",
     "typecheck": "pnpm --filter @sonite/compiler build && pnpm -r run typecheck",
     "test": "pnpm --filter @sonite/compiler test && pnpm --filter @sonite/llvm test && pnpm --filter @sonite/runtime test && pnpm --filter @sonite/cli test && pnpm --filter @sonite/lsp test && pnpm --filter sonite-vscode test",
+    "test:fuzz": "pnpm --filter @sonite/compiler test:fuzz",
+    "test:fuzz:long": "pnpm --filter @sonite/compiler test:fuzz:long",
     "test:watch": "pnpm --filter @sonite/compiler test:watch",
     "test:coverage": "pnpm --filter @sonite/compiler test:coverage"
   },

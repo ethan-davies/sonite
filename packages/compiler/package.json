@@ -21,7 +21,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "test:fuzz": "vitest run tests/fuzz.test.ts",
+    "test:fuzz:long": "FUZZ_ITERS=10000 vitest run tests/fuzz.test.ts",
+    "test:crash-regressions": "vitest run tests/crash-regressions.test.ts"
   },
   "engines": {
     "node": ">=20"

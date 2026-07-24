@@ -8,6 +8,7 @@ import {
   DiagnosticCollector,
   type Diagnostic,
 } from "./diagnostics/diagnostic.js";
+import { InternalError } from "./diagnostics/internal-error.js";
 import {
   applyDiagnosticsConfig,
   diagnosticsHaveErrors,
@@ -131,6 +132,8 @@ export interface CompileOptions {
   readonly fileName?: string;
   readonly diagnosticsConfig?: DiagnosticsConfig;
   readonly warningsAsErrors?: boolean;
+  /** Emit LLVM debug metadata (default true). Omit under release builds. */
+  readonly debugInfo?: boolean;
 }
 
 export interface CompileResult {
@@ -149,6 +152,17 @@ export interface CompileResult {
 export function compile(
   source: string,
   options: CompileOptions = {},
+): CompileResult {
+  try {
+    return compileInner(source, options);
+  } catch (error) {
+    throw InternalError.fromUnknown(error, inferPhase(error));
+  }
+}
+
+function compileInner(
+  source: string,
+  options: CompileOptions,
 ): CompileResult {
   const diagnostics = new DiagnosticCollector();
   const fileName = options.fileName ?? "<source>";
@@ -191,10 +205,9 @@ export function compile(
     const inst = typecheckModules(modules, diagnostics);
     if (!diagnostics.hasErrors) {
       monoModules = monomorphizeModules(modules, inst.instantiations);
-      const ir = new LlvmCodegen().emitModules(
-        monoModules,
-        inst.instantiations,
-      );
+      const ir = new LlvmCodegen({
+        debugInfo: options.debugInfo !== false,
+      }).emitModules(monoModules, inst.instantiations);
       const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, fileName === "<source>" ? process.cwd() : fileName,));
       return {
         ast: monoModules.find((m) => m.isEntry)?.ast ?? ast,
@@ -217,7 +230,9 @@ export function compile(
     };
   }
 
-  const ir = new LlvmCodegen().emitModules(monoModules);
+  const ir = new LlvmCodegen({
+    debugInfo: options.debugInfo !== false,
+  }).emitModules(monoModules);
   const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, fileName === "<source>" ? process.cwd() : fileName,));
   return {
     ast: monoModules.find((m) => m.isEntry)?.ast ?? ast,
@@ -228,10 +243,32 @@ export function compile(
   };
 }
 
+function inferPhase(error: unknown): string {
+  if (error instanceof InternalError) {
+    return error.phase;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("Codegen:")) {
+    return "codegen";
+  }
+  if (/typecheck|Typecheck/i.test(message)) {
+    return "typecheck";
+  }
+  if (/parse|Parse/i.test(message)) {
+    return "parser";
+  }
+  if (/lex|Lex|token/i.test(message)) {
+    return "scanner";
+  }
+  return "compiler";
+}
+
 export interface CompileFileOptions {
   readonly readFile?: (absolutePath: string) => string;
   readonly diagnosticsConfig?: DiagnosticsConfig;
   readonly warningsAsErrors?: boolean;
+  /** Emit LLVM debug metadata (default true). Omit under release builds. */
+  readonly debugInfo?: boolean;
 }
 
 /**
@@ -240,6 +277,17 @@ export interface CompileFileOptions {
 export function compileFile(
   entryPath: string,
   options: CompileFileOptions = {},
+): CompileResult {
+  try {
+    return compileFileInner(entryPath, options);
+  } catch (error) {
+    throw InternalError.fromUnknown(error, inferPhase(error));
+  }
+}
+
+function compileFileInner(
+  entryPath: string,
+  options: CompileFileOptions,
 ): CompileResult {
   const diagnostics = new DiagnosticCollector();
   const readFile =
@@ -294,7 +342,9 @@ export function compileFile(
     };
   }
 
-  const ir = new LlvmCodegen().emitModules(monoModules, inst);
+  const ir = new LlvmCodegen({
+    debugInfo: options.debugInfo !== false,
+  }).emitModules(monoModules, inst);
   const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, absoluteEntry,));
   return {
     ast: monoModules.find((m) => m.isEntry)?.ast ?? entry.ast,

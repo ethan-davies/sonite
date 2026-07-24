@@ -21,6 +21,7 @@ import type {
 } from "./ast/nodes.js";
 import type { SourceSpan } from "./diagnostics/diagnostic.js";
 import { DiagnosticCollector } from "./diagnostics/diagnostic.js";
+import { suggestClosest } from "./diagnostics/suggest.js";
 import {
   SemanticCollector,
   emptySemanticModel,
@@ -369,6 +370,84 @@ const EQUALITY_PRIMITIVES = new Set<PrimitiveValueType>([
   "string",
   "null",
 ]);
+
+const PRIMITIVE_TYPE_NAMES: readonly string[] = [
+  "i32",
+  "i64",
+  "f32",
+  "f64",
+  "bool",
+  "string",
+  "char",
+  "void",
+  "null",
+];
+
+function suggestIdentifierName(
+  name: string,
+  scope: Map<string, Binding>,
+  functions: Map<string, FunctionSig>,
+): readonly string[] {
+  const candidates: string[] = [];
+  for (const key of scope.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeValues.keys()) {
+    candidates.push(key);
+  }
+  for (const key of functions.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeNamespaces.keys()) {
+    candidates.push(key);
+  }
+  return suggestClosest(name, candidates);
+}
+
+function suggestTypeName(
+  name: string,
+  structs: Map<string, StructDef>,
+  enums: Map<string, EnumDef>,
+): readonly string[] {
+  const candidates: string[] = [...PRIMITIVE_TYPE_NAMES];
+  for (const key of structs.keys()) {
+    candidates.push(key);
+  }
+  for (const key of enums.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeClasses.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeInterfaces.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeTypeAliases.keys()) {
+    candidates.push(key);
+  }
+  for (const key of specializedStructs.keys()) {
+    candidates.push(key);
+  }
+  for (const key of specializedClasses.keys()) {
+    candidates.push(key);
+  }
+  for (const key of specializedInterfaces.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeTypeParams.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeGenericStructs.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeGenericClasses.keys()) {
+    candidates.push(key);
+  }
+  for (const key of activeGenericInterfaces.keys()) {
+    candidates.push(key);
+  }
+  return suggestClosest(name, candidates);
+}
 
 /** Active extension methods available while type-checking a module (concrete + generic). */
 let activeExtensions: ExtensionEntry[] = [];
@@ -4271,6 +4350,13 @@ function resolveNamedType(
       `Unknown type '${ann.namespace}.${ann.name}'`,
       ann.span,
       "E0104",
+      suggestClosest(ann.name, [
+        ...ns.enums.keys(),
+        ...ns.structs.keys(),
+        ...ns.classes.keys(),
+        ...ns.interfaces.keys(),
+        ...ns.typeAliases.keys(),
+      ]),
     );
     return null;
   }
@@ -4331,7 +4417,12 @@ function resolveNamedType(
     );
     return null;
   }
-  diagnostics.error(`Unknown type '${ann.name}'`, ann.span, "E0104");
+  diagnostics.error(
+    `Unknown type '${ann.name}'`,
+    ann.span,
+    "E0104",
+    suggestTypeName(ann.name, structs, enums),
+  );
   return null;
 }
 
@@ -6790,6 +6881,7 @@ function checkStatement(
           `Undefined variable '${stmt.name.name}'`,
           stmt.name.span,
           "E0304",
+          suggestIdentifierName(stmt.name.name, scope, functions),
         );
         return false;
       }
@@ -7326,6 +7418,7 @@ function checkAssignment(
         `Undefined variable '${stmt.target.name}'`,
         stmt.target.span,
         "E0304",
+        suggestIdentifierName(stmt.target.name, scope, functions),
       );
       return;
     }
@@ -9272,6 +9365,7 @@ function checkExpressionInner(
         `Undefined variable '${expr.name}'`,
         expr.span,
         "E0304",
+        suggestIdentifierName(expr.name, scope, functions),
       );
       return null;
     }

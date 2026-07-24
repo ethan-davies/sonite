@@ -53,10 +53,14 @@ export {
   applyDiagnosticsConfig,
   DEFAULT_DIAGNOSTICS_CONFIG,
   DIAGNOSTIC_CODES,
+  editDistance,
+  InternalError,
+  isInternalError,
   loadDiagnosticsOptions,
   parseDiagnosticsSection,
   promoteWarningsAsErrors,
   resolveDiagnosticsConfig,
+  suggestClosest,
 } from "./diagnostics/index.js";
 
 export {

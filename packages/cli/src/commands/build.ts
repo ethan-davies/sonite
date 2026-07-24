@@ -26,10 +26,10 @@ export async function runBuild(options: BuildOptions = {}): Promise<number> {
     throw error;
   }
 
-  const compiled = compileSourceFile(
-    project.entryPath,
-    options.warningsAsErrors ? { warningsAsErrors: true } : {},
-  );
+  const compiled = compileSourceFile(project.entryPath, {
+    ...(options.warningsAsErrors ? { warningsAsErrors: true } : {}),
+    ...(options.release !== undefined ? { release: options.release } : {}),
+  });
   if (!compiled) {
     return 1;
   }

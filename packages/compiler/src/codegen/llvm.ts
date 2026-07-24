@@ -38,8 +38,13 @@ import type {
 } from "../ast/nodes.js";
 import type { TypecheckInstantiations } from "../generics/monomorphize.js";
 import { mangleTypeAnnotation } from "../generics/mangle.js";
+import {
+  attachDbg,
+  attachDbgToDefine,
+  DebugInfoBuilder,
+} from "./debug-info.js";
 import { valueTypeToAnnotation } from "../generics/value-type.js";
-import { DiagnosticCollector } from "../diagnostics/diagnostic.js";
+import { DiagnosticCollector, type SourceSpan } from "../diagnostics/diagnostic.js";
 import { buildExportTables } from "../modules/exports.js";
 import { mangleSymbol } from "../modules/mangle.js";
 import type { ResolvedModule } from "../modules/resolve.js";
@@ -458,6 +463,10 @@ export class LlvmCodegen {
   /** Return type of the function/method currently being emitted. */
   private currentReturnType: ValueType | "void" | null = null;
   private currentModuleId = "";
+  private currentSourcePath = "sonite";
+  private debugBuilder: DebugInfoBuilder | null = null;
+  private currentDbgScope: number | null = null;
+  private readonly emitDebugInfo: boolean;
   private lambdaCaptures = new Map<
     number,
     readonly { readonly name: string; readonly mutable: boolean }[]
@@ -476,6 +485,10 @@ export class LlvmCodegen {
   /** Extern symbols that need `declare` in the module. */
   private readonly externDeclares = new Set<string>();
   private needsSnStrExtras = false;
+
+  constructor(options: { readonly debugInfo?: boolean } = {}) {
+    this.emitDebugInfo = options.debugInfo !== false;
+  }
 
   emit(program: Program): string {
     return this.emitModules([
@@ -499,6 +512,12 @@ export class LlvmCodegen {
     this.stringCounter = 0;
     this.tempCounter = 0;
     this.labelCounter = 0;
+    this.debugBuilder = this.emitDebugInfo ? new DebugInfoBuilder() : null;
+    this.currentDbgScope = null;
+    this.currentSourcePath = modules.find((m) => m.isEntry)?.path ?? modules[0]?.path ?? "sonite";
+    if (this.debugBuilder) {
+      this.debugBuilder.ensureCompileUnit(this.currentSourcePath);
+    }
     this.stringGlobals.clear();
     this.locals = new Map();
     this.functions.clear();
@@ -974,6 +993,10 @@ export class LlvmCodegen {
       const localInterfaces = new Map(symbols.interfaces);
       const localValues = new Map(symbols.values);
       this.currentModuleId = mod.moduleId;
+      this.currentSourcePath = mod.path;
+      if (this.debugBuilder) {
+        this.debugBuilder.file(mod.path);
+      }
 
       const namespaces = new Map<string, NamespaceInfo>();
       const exportTables = buildExportTables(
@@ -1176,10 +1199,12 @@ export class LlvmCodegen {
     ];
     const globalLines = [...this.globalDefs, ...this.emitStringGlobals()];
     const declares = this.emitRuntimeDeclares();
+    const sourceFile = this.currentSourcePath.replace(/\\/g, "/");
+    const debugFooter = this.debugBuilder?.emitFooter() ?? [];
 
     const ir = [
       "; ModuleID = 'sonite'",
-      'source_filename = "sonite"',
+      `source_filename = "${sourceFile.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`,
       "",
       ...typeLines,
       typeLines.length > 0 ? "" : null,
@@ -1188,11 +1213,14 @@ export class LlvmCodegen {
       ...declares,
       declares.length > 0 ? "" : null,
       ...this.functionBodies,
+      ...debugFooter,
       "",
     ]
       .filter((line): line is string => line !== null)
       .join("\n");
     activeTupleRegistry = null;
+    this.debugBuilder = null;
+    this.currentDbgScope = null;
     return ir;
   }
 
@@ -3949,9 +3977,21 @@ export class LlvmCodegen {
 
     const isMain = fn.name.name === "main";
     const isExtension = fn.params[0]?.isReceiver === true;
-    const header = isMain
+    let header = isMain
       ? "define i32 @main(i32 %argc, ptr %argv) {"
       : this.emitFunctionHeader(fn);
+
+    const dbg = this.debugBuilder;
+    let fnDbgScope: number | null = null;
+    if (dbg) {
+      fnDbgScope = dbg.subprogram(
+        fn.name.name,
+        this.currentSourcePath,
+        fn.name.span.start.line,
+      );
+      header = attachDbgToDefine(header, fnDbgScope);
+      this.currentDbgScope = fnDbgScope;
+    }
 
     lines.push(header);
     lines.push("entry:");
@@ -3990,7 +4030,9 @@ export class LlvmCodegen {
       if (terminated) {
         break;
       }
+      const before = lines.length;
       terminated = this.emitStatement(stmt, lines);
+      this.attachStatementDebug(lines, before, stmt.span);
     }
 
     if (!terminated) {
@@ -4012,8 +4054,10 @@ export class LlvmCodegen {
     this.thisPtr = null;
     this.thisType = null;
     this.boxedNames = new Set();
+    this.currentDbgScope = null;
     this.endGcFunctionScope(gcScope);
     void isExtension;
+    void fnDbgScope;
   }
 
   /**
@@ -4474,6 +4518,40 @@ export class LlvmCodegen {
         return this.emitThrowStatement(stmt, lines);
       case "TryStatement":
         return this.emitTryStatement(stmt, lines);
+    }
+  }
+
+  /** Tag instructions emitted for a statement with `!dbg` locations. */
+  private attachStatementDebug(
+    lines: string[],
+    startIndex: number,
+    span: SourceSpan,
+  ): void {
+    const dbg = this.debugBuilder;
+    const scope = this.currentDbgScope;
+    if (!dbg || scope === null) {
+      return;
+    }
+    const locId = dbg.location(scope, span);
+    for (let i = startIndex; i < lines.length; i += 1) {
+      lines[i] = attachDbg(lines[i]!, locId);
+    }
+  }
+
+  /** Push a lexical block scope for nested statement lists when debug info is on. */
+  private withLexicalScope<T>(span: SourceSpan, fn: () => T): T {
+    const dbg = this.debugBuilder;
+    const parent = this.currentDbgScope;
+    if (!dbg || parent === null) {
+      return fn();
+    }
+    const block = dbg.lexicalBlock(parent, this.currentSourcePath, span);
+    const prev = this.currentDbgScope;
+    this.currentDbgScope = block;
+    try {
+      return fn();
+    } finally {
+      this.currentDbgScope = prev;
     }
   }
 
@@ -5227,12 +5305,16 @@ export class LlvmCodegen {
 
     lines.push(`${thenLabel}:`);
     let thenTerminated = false;
-    for (const s of stmt.consequent) {
-      if (thenTerminated) {
-        break;
+    this.withLexicalScope(stmt.span, () => {
+      for (const s of stmt.consequent) {
+        if (thenTerminated) {
+          break;
+        }
+        const before = lines.length;
+        thenTerminated = this.emitStatement(s, lines);
+        this.attachStatementDebug(lines, before, s.span);
       }
-      thenTerminated = this.emitStatement(s, lines);
-    }
+    });
     if (!thenTerminated) {
       lines.push(`  br label %${mergeLabel}`);
     }
@@ -5241,12 +5323,16 @@ export class LlvmCodegen {
     if (hasElse) {
       lines.push(`${elseLabel}:`);
       if (Array.isArray(stmt.alternate)) {
-        for (const s of stmt.alternate) {
-          if (elseTerminated) {
-            break;
+        this.withLexicalScope(stmt.span, () => {
+          for (const s of stmt.alternate as Statement[]) {
+            if (elseTerminated) {
+              break;
+            }
+            const before = lines.length;
+            elseTerminated = this.emitStatement(s, lines);
+            this.attachStatementDebug(lines, before, s.span);
           }
-          elseTerminated = this.emitStatement(s, lines);
-        }
+        });
       } else if (stmt.alternate) {
         elseTerminated = this.emitIfStatement(stmt.alternate, lines);
       }

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative, resolve as resolvePath } from "node:path";
 import type {
   ExportAllFromDeclaration,
@@ -10,6 +10,7 @@ import type {
   DiagnosticCollector,
   SourceSpan,
 } from "../diagnostics/diagnostic.js";
+import { suggestClosest } from "../diagnostics/suggest.js";
 import { Lexer } from "../lexer/lexer.js";
 import { Parser } from "../parser/parser.js";
 import { collectReExportSpecifiers } from "./exports.js";
@@ -637,6 +638,84 @@ function formatCycle(cycle: readonly string[]): string {
   return cycle.map((p) => relative(process.cwd(), p) || p).join(" → ");
 }
 
+const STD_PUBLIC_MODULES = [
+  "math",
+  "collections",
+  "random",
+  "io",
+  "fs",
+  "process",
+  "time",
+  "encoding",
+  "os",
+  "errors",
+  "net",
+  "tls",
+  "http",
+  "async",
+  "bytes",
+  "json",
+] as const;
+
+/** Nearby module path candidates for high-confidence "did you mean?" suggestions. */
+function moduleSuggestionCandidates(
+  importerDir: string,
+  specifier: string,
+): string[] {
+  const candidates: string[] = [];
+  const spec = specifier.trim();
+
+  if (spec.startsWith("std/") || spec === "std") {
+    for (const name of STD_PUBLIC_MODULES) {
+      candidates.push(`std/${name}`);
+    }
+    candidates.push("std");
+    return candidates;
+  }
+
+  if (spec.startsWith("./") || spec.startsWith("../")) {
+    const lastSlash = spec.lastIndexOf("/");
+    const dirPart = lastSlash >= 0 ? spec.slice(0, lastSlash + 1) : "./";
+    const absDir = resolvePath(importerDir, dirPart);
+    if (existsSync(absDir)) {
+      try {
+        for (const entry of readdirSync(absDir)) {
+          if (entry.toLowerCase().endsWith(".sn")) {
+            const withoutExt = entry.slice(0, -".sn".length);
+            candidates.push(`${dirPart}${withoutExt}`);
+          }
+        }
+      } catch {
+        // ignore unreadable dirs
+      }
+    }
+    return candidates;
+  }
+
+  // Bare package / typo of std
+  for (const name of STD_PUBLIC_MODULES) {
+    candidates.push(`std/${name}`);
+  }
+  candidates.push("std");
+  const roots = getPackageRoots();
+  if (roots) {
+    for (const name of roots.keys()) {
+      candidates.push(name);
+    }
+  }
+  return candidates;
+}
+
+function suggestModuleSpecifier(
+  importerDir: string,
+  specifier: string,
+): readonly string[] {
+  return suggestClosest(
+    specifier.trim(),
+    moduleSuggestionCandidates(importerDir, specifier),
+  );
+}
+
 /**
  * Load the entry file and transitively resolve all imports into a compilation unit.
  * Modules are returned with the entry first, then dependencies in discovery order.
@@ -726,6 +805,7 @@ export function resolveModules(
           `Cannot find module "${specifier}".`,
           span,
           "E0401",
+          suggestModuleSpecifier(importerDir, specifier),
         );
       }
       return null;
@@ -743,6 +823,7 @@ export function resolveModules(
           `Cannot find module "${specifier}".`,
           span,
           "E0401",
+          suggestModuleSpecifier(importerDir, specifier),
         );
         return null;
       }
@@ -756,6 +837,7 @@ export function resolveModules(
           `Cannot find module "${specifier}".`,
           span,
           "E0401",
+          suggestModuleSpecifier(importerDir, specifier),
         );
         return null;
       }
@@ -764,6 +846,7 @@ export function resolveModules(
         `Module "${specifier}" does not exist.`,
         span,
         "E0411",
+        suggestModuleSpecifier(importerDir, specifier),
       );
       return null;
     }

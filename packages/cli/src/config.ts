@@ -64,6 +64,18 @@ export function getPackagesStoreDir(): string {
   return join(getConfigDir(), "packages");
 }
 
+/**
+ * Crash report directory (`~/.sonite/crashes` on all platforms).
+ * Override with `SN_CRASHES_DIR`.
+ */
+export function getCrashesDir(): string {
+  const override = process.env.SN_CRASHES_DIR?.trim();
+  if (override) {
+    return override;
+  }
+  return join(homedir(), ".sonite", "crashes");
+}
+
 export function getRegistryUrl(): string {
   const override = process.env.SN_REGISTRY_URL?.trim();
   if (override) {

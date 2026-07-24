@@ -2,7 +2,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { compileFile, formatDiagnostics } from "@sonite/compiler";
+import {
+  compileFile,
+  formatDiagnostics,
+  isInternalError,
+} from "@sonite/compiler";
 import {
   Backend,
   Linker,
@@ -14,6 +18,7 @@ import {
   getRuntimeLibraryPath,
   hostRuntimePlatformId,
 } from "@sonite/runtime";
+import { reportInternalError } from "./crash-report.js";
 import { applyProjectPackageRoots } from "./deps/roots.js";
 
 export interface CompileToIrResult {
@@ -23,6 +28,9 @@ export interface CompileToIrResult {
 
 export interface CompileSourceOptions {
   readonly warningsAsErrors?: boolean;
+  /** When true (default), emit LLVM debug metadata. Disabled for release builds. */
+  readonly debugInfo?: boolean;
+  readonly release?: boolean;
 }
 
 export function compileSourceFile(
@@ -32,10 +40,24 @@ export function compileSourceFile(
   const absoluteInput = resolve(inputPath);
   applyProjectPackageRoots(dirname(absoluteInput));
   const fileName = basename(absoluteInput);
-  const result = compileFile(
-    absoluteInput,
-    options.warningsAsErrors ? { warningsAsErrors: true } : {},
-  );
+  const debugInfo =
+    options.debugInfo !== undefined
+      ? options.debugInfo
+      : options.release !== true;
+
+  let result;
+  try {
+    result = compileFile(absoluteInput, {
+      ...(options.warningsAsErrors ? { warningsAsErrors: true } : {}),
+      debugInfo,
+    });
+  } catch (error) {
+    reportInternalError(error, {
+      sourcePath: absoluteInput,
+      phase: isInternalError(error) ? error.phase : "compiler",
+    });
+    return null;
+  }
 
   if (!result.success || result.ir === null) {
     const formatted = formatDiagnostics(result.diagnostics, fileName);
@@ -163,10 +185,10 @@ export async function compileLinkAndRun(
     warningsAsErrors?: boolean;
   } = {},
 ): Promise<number> {
-  const compiled = compileSourceFile(
-    inputPath,
-    options.warningsAsErrors ? { warningsAsErrors: true } : {},
-  );
+  const compiled = compileSourceFile(inputPath, {
+    ...(options.warningsAsErrors ? { warningsAsErrors: true } : {}),
+    ...(options.release !== undefined ? { release: options.release } : {}),
+  });
   if (!compiled) {
     return 1;
   }

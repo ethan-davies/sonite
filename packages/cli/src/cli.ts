@@ -9,6 +9,8 @@ import { runLogin, runLogout } from "./commands/login.js";
 import { runPublish } from "./commands/publish.js";
 import { runInfo, runSearch } from "./commands/search.js";
 import { runRun } from "./commands/run.js";
+import { reportInternalError } from "./crash-report.js";
+import { isInternalError } from "@sonite/compiler";
 
 const program = new Command();
 
@@ -224,6 +226,10 @@ program
   });
 
 program.parseAsync(process.argv).catch((error: unknown) => {
+  if (isInternalError(error) || (error instanceof Error && error.message.startsWith("Codegen:"))) {
+    process.exitCode = reportInternalError(error);
+    return;
+  }
   const message = error instanceof Error ? error.message : String(error);
   console.error(`error: ${message}`);
   process.exitCode = 1;

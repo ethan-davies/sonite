@@ -20,6 +20,8 @@ export interface Diagnostic {
   readonly code?: string;
   /** Absolute or logical path of the file this diagnostic belongs to. */
   readonly file?: string;
+  /** High-confidence "did you mean?" replacements. */
+  readonly suggestions?: readonly string[];
 }
 
 export class DiagnosticCollector {
@@ -39,16 +41,31 @@ export class DiagnosticCollector {
     return this.activeFile;
   }
 
-  error(message: string, span?: SourceSpan, code?: string): void {
-    this.push("error", message, span, code);
+  error(
+    message: string,
+    span?: SourceSpan,
+    code?: string,
+    suggestions?: readonly string[],
+  ): void {
+    this.push("error", message, span, code, suggestions);
   }
 
-  warning(message: string, span?: SourceSpan, code?: string): void {
-    this.push("warning", message, span, code);
+  warning(
+    message: string,
+    span?: SourceSpan,
+    code?: string,
+    suggestions?: readonly string[],
+  ): void {
+    this.push("warning", message, span, code, suggestions);
   }
 
-  info(message: string, span?: SourceSpan, code?: string): void {
-    this.push("info", message, span, code);
+  info(
+    message: string,
+    span?: SourceSpan,
+    code?: string,
+    suggestions?: readonly string[],
+  ): void {
+    this.push("info", message, span, code, suggestions);
   }
 
   private push(
@@ -56,6 +73,7 @@ export class DiagnosticCollector {
     message: string,
     span?: SourceSpan,
     code?: string,
+    suggestions?: readonly string[],
   ): void {
     this.items.push({
       severity,
@@ -63,6 +81,7 @@ export class DiagnosticCollector {
       ...(span ? { span } : {}),
       ...(code ? { code } : {}),
       ...(this.activeFile !== undefined ? { file: this.activeFile } : {}),
+      ...(suggestions && suggestions.length > 0 ? { suggestions } : {}),
     });
   }
 
@@ -89,7 +108,15 @@ export class DiagnosticCollector {
           ? `${path}:${d.span.start.line}:${d.span.start.column}`
           : path;
         const code = d.code ? ` [${d.code}]` : "";
-        return `${loc}: ${d.severity}${code}: ${d.message}`;
+        let line = `${loc}: ${d.severity}${code}: ${d.message}`;
+        if (d.suggestions && d.suggestions.length > 0) {
+          const hint =
+            d.suggestions.length === 1
+              ? `Did you mean '${d.suggestions[0]}'?`
+              : `Did you mean ${d.suggestions.map((s) => `'${s}'`).join(", ")}?`;
+          line += `\n${loc}: note: ${hint}`;
+        }
+        return line;
       })
       .join("\n");
   }

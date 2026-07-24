@@ -14,11 +14,9 @@ jobs:
   linux-x64:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: pnpm
@@ -58,7 +56,7 @@ jobs:
           env PATH="$SCRUB" HOME="$HOME" node packages/cli/dist/cli.js run examples/hello.sn
           rm -rf "$SCRUB"
       - name: Upload runtime prebuilt
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: runtime-linux-x64
           path: |
@@ -68,11 +66,9 @@ jobs:
   linux-arm64:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: pnpm
@@ -101,7 +97,7 @@ jobs:
           ln -s /usr/bin/env "$SCRUB/env"
           env PATH="$SCRUB" HOME="$HOME" node packages/cli/dist/cli.js run examples/hello.sn
           rm -rf "$SCRUB"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: runtime-linux-arm64
           path: packages/runtime/prebuilt/linux-arm64/
@@ -110,11 +106,9 @@ jobs:
   macos-arm64:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: pnpm
@@ -143,7 +137,7 @@ jobs:
           ln -s /usr/bin/env "$SCRUB/env"
           env PATH="$SCRUB" HOME="$HOME" node packages/cli/dist/cli.js run examples/hello.sn
           rm -rf "$SCRUB"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: runtime-macos-arm64
           path: packages/runtime/prebuilt/macos-arm64/
@@ -152,11 +146,9 @@ jobs:
   macos-x64:
     runs-on: macos-13
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: pnpm
@@ -185,7 +177,7 @@ jobs:
           ln -s /usr/bin/env "$SCRUB/env"
           env PATH="$SCRUB" HOME="$HOME" node packages/cli/dist/cli.js run examples/hello.sn
           rm -rf "$SCRUB"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: runtime-macos-x64
           path: packages/runtime/prebuilt/macos-x64/
@@ -194,11 +186,9 @@ jobs:
   windows-x64:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: pnpm
@@ -229,7 +219,7 @@ jobs:
       - name: FS / path e2e
         run: pnpm --filter @sonite/cli exec vitest run tests/fs-path-run.test.ts
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: runtime-win32-x64
           path: packages/runtime/prebuilt/win32-x64/

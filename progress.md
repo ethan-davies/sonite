@@ -182,7 +182,7 @@ This should be a dedicated milestone because a formatter becomes important once 
 * [x] Struct/class formatting
 * [x] Interface formatting
 * [x] Async/await formatting
-* [ ] Error recovery on incomplete source
+* [x] Error recovery on incomplete source
 
 ### CLI
 
@@ -190,22 +190,22 @@ This should be a dedicated milestone because a formatter becomes important once 
 * [x] `sn fmt --check`
 * [x] Format individual files
 * [x] Format entire projects
-* [ ] Format only changed files where practical
+* [x] Format only changed files where practical
 * [x] CI-friendly exit codes
 
 ### LSP
 
 * [x] Document formatting
 * [x] Format on save
-* [ ] Range formatting if practical
+* [x] Range formatting if practical
 
 ### Code quality
 
 * [x] Compiler warnings framework
-* [ ] Unused-variable diagnostics
-* [ ] Unreachable-code diagnostics
-* [ ] Other useful static diagnostics
-* [ ] Configurable warning levels
+* [x] Unused-variable diagnostics
+* [x] Unreachable-code diagnostics
+* [x] Other useful static diagnostics
+* [x] Configurable warning levels
 
 ---
 

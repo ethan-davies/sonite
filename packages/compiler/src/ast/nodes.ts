@@ -96,11 +96,20 @@ export type AstNode =
   | BooleanLiteral
   | CharLiteral
   | NullLiteral
+  | MissingExpression
   | TypeAnnotation;
+
+/** Closing delimiter that was missing during error recovery. */
+export type IncompleteCloser = ")" | "]" | "}" | ">";
 
 interface AstNodeBase {
   readonly kind: string;
   readonly span: SourceSpan;
+  /**
+   * Present when a required closing delimiter was missing (parse recovery).
+   * The formatter must omit these closers rather than inventing them.
+   */
+  readonly incomplete?: readonly IncompleteCloser[];
 }
 
 export type TopLevelDeclaration =
@@ -227,9 +236,20 @@ export interface FunctionDeclaration extends AstNodeBase {
   readonly name: Identifier;
   readonly typeParams: TypeParameter[];
   readonly params: Parameter[];
+  /**
+   * Return type annotation. `MissingType` when the header is incomplete
+   * (e.g. `function foo(` with no `: T` yet).
+   */
   readonly returnType: TypeAnnotation;
-  /** null when `isExtern`. */
+  /**
+   * null when `isExtern`, or when the body `{` was never opened during recovery.
+   */
   readonly body: Statement[] | null;
+  /**
+   * True when a body `{` was opened (even if `}` is missing). Distinguishes
+   * `function f(): void` (incomplete, no body) from `function f(): void {}`.
+   */
+  readonly bodyOpened?: boolean;
 }
 
 /** Module-level `export const` / `export let` / `const` / `let` (simple name only). */
@@ -502,7 +522,13 @@ export type Expression =
   | FloatLiteral
   | BooleanLiteral
   | CharLiteral
-  | NullLiteral;
+  | NullLiteral
+  | MissingExpression;
+
+/** Placeholder for an unfinished expression (e.g. `const x =`). Prints as empty. */
+export interface MissingExpression extends AstNodeBase {
+  readonly kind: "MissingExpression";
+}
 
 export type CallCallee = Expression;
 
@@ -690,7 +716,13 @@ export type TypeAnnotation =
   | ConditionalType
   | MappedType
   | IndexedAccessType
-  | FunctionType;
+  | FunctionType
+  | MissingType;
+
+/** Placeholder for an unfinished type annotation. Prints as empty. */
+export interface MissingType extends AstNodeBase {
+  readonly kind: "MissingType";
+}
 
 export interface FunctionType extends AstNodeBase {
   readonly kind: "FunctionType";

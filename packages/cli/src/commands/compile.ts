@@ -6,6 +6,7 @@ import { loadProject, ProjectError } from "../project.js";
 export function runCompile(
   input: string | undefined,
   output: string | undefined,
+  options: { warningsAsErrors?: boolean } = {},
 ): number {
   let inputPath = input;
   if (!inputPath) {
@@ -20,7 +21,10 @@ export function runCompile(
     }
   }
 
-  const compiled = compileSourceFile(inputPath);
+  const compiled = compileSourceFile(
+    inputPath,
+    options.warningsAsErrors ? { warningsAsErrors: true } : {},
+  );
   if (!compiled) {
     return 1;
   }

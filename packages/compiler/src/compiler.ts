@@ -9,6 +9,13 @@ import {
   type Diagnostic,
 } from "./diagnostics/diagnostic.js";
 import {
+  applyDiagnosticsConfig,
+  diagnosticsHaveErrors,
+  loadDiagnosticsOptions,
+  promoteWarningsAsErrors,
+  type DiagnosticsConfig,
+} from "./diagnostics/config.js";
+import {
   monomorphizeModules,
   type TypecheckInstantiations,
 } from "./generics/monomorphize.js";
@@ -24,6 +31,52 @@ import { Parser } from "./parser/parser.js";
 import { typecheckModules } from "./typecheck.js";
 import { validateModules, validateModulesLoose } from "./validate.js";
 import { emptySemanticModel, type SemanticModel } from "./analysis/semantic.js";
+
+function finalizeDiagnostics(
+  raw: readonly Diagnostic[],
+  options: {
+    readonly diagnosticsConfig?: DiagnosticsConfig;
+    readonly warningsAsErrors?: boolean;
+    readonly configPath?: string;
+  },
+): { diagnostics: readonly Diagnostic[]; hasErrors: boolean } {
+  const config =
+    options.diagnosticsConfig ??
+    loadDiagnosticsOptions(options.configPath ?? process.cwd());
+  let diagnostics = applyDiagnosticsConfig(raw, config);
+  if (options.warningsAsErrors) {
+    diagnostics = promoteWarningsAsErrors(diagnostics);
+  }
+  return {
+    diagnostics,
+    hasErrors: diagnosticsHaveErrors(diagnostics),
+  };
+}
+
+function finalizeOpts(
+  options: {
+    readonly diagnosticsConfig?: DiagnosticsConfig;
+    readonly warningsAsErrors?: boolean;
+  },
+  configPath: string,
+): {
+  diagnosticsConfig?: DiagnosticsConfig;
+  warningsAsErrors?: boolean;
+  configPath: string;
+} {
+  const out: {
+    diagnosticsConfig?: DiagnosticsConfig;
+    warningsAsErrors?: boolean;
+    configPath: string;
+  } = { configPath };
+  if (options.diagnosticsConfig !== undefined) {
+    out.diagnosticsConfig = options.diagnosticsConfig;
+  }
+  if (options.warningsAsErrors !== undefined) {
+    out.warningsAsErrors = options.warningsAsErrors;
+  }
+  return out;
+}
 
 function discoverStdRoot(): string | null {
   const fromEnv = process.env.SONITE_STD_ROOT;
@@ -76,6 +129,8 @@ setPreludePathsProvider(discoverPreludePaths);
 export interface CompileOptions {
   /** Source file name used in diagnostics. */
   readonly fileName?: string;
+  readonly diagnosticsConfig?: DiagnosticsConfig;
+  readonly warningsAsErrors?: boolean;
 }
 
 export interface CompileResult {
@@ -140,38 +195,43 @@ export function compile(
         monoModules,
         inst.instantiations,
       );
+      const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, fileName === "<source>" ? process.cwd() : fileName,));
       return {
         ast: monoModules.find((m) => m.isEntry)?.ast ?? ast,
         modules: monoModules,
-        ir,
-        diagnostics: diagnostics.diagnostics,
-        success: true,
+        ir: finalized.hasErrors ? null : ir,
+        diagnostics: finalized.diagnostics,
+        success: !finalized.hasErrors,
       };
     }
   }
 
   if (diagnostics.hasErrors) {
+    const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, fileName === "<source>" ? process.cwd() : fileName,));
     return {
       ast,
       modules,
       ir: null,
-      diagnostics: diagnostics.diagnostics,
+      diagnostics: finalized.diagnostics,
       success: false,
     };
   }
 
   const ir = new LlvmCodegen().emitModules(monoModules);
+  const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, fileName === "<source>" ? process.cwd() : fileName,));
   return {
     ast: monoModules.find((m) => m.isEntry)?.ast ?? ast,
     modules: monoModules,
-    ir,
-    diagnostics: diagnostics.diagnostics,
-    success: true,
+    ir: finalized.hasErrors ? null : ir,
+    diagnostics: finalized.diagnostics,
+    success: !finalized.hasErrors,
   };
 }
 
 export interface CompileFileOptions {
   readonly readFile?: (absolutePath: string) => string;
+  readonly diagnosticsConfig?: DiagnosticsConfig;
+  readonly warningsAsErrors?: boolean;
 }
 
 /**
@@ -201,11 +261,12 @@ export function compileFile(
   };
 
   if (!resolved.success || diagnostics.hasErrors || !entry) {
+    const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, absoluteEntry,));
     return {
       ast: entry?.ast ?? emptyAst,
       modules,
       ir: null,
-      diagnostics: diagnostics.diagnostics,
+      diagnostics: finalized.diagnostics,
       success: false,
     };
   }
@@ -223,27 +284,31 @@ export function compileFile(
   }
 
   if (diagnostics.hasErrors) {
+    const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, absoluteEntry,));
     return {
       ast: entry.ast,
       modules,
       ir: null,
-      diagnostics: diagnostics.diagnostics,
+      diagnostics: finalized.diagnostics,
       success: false,
     };
   }
 
   const ir = new LlvmCodegen().emitModules(monoModules, inst);
+  const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, absoluteEntry,));
   return {
     ast: monoModules.find((m) => m.isEntry)?.ast ?? entry.ast,
     modules: monoModules,
-    ir,
-    diagnostics: diagnostics.diagnostics,
-    success: true,
+    ir: finalized.hasErrors ? null : ir,
+    diagnostics: finalized.diagnostics,
+    success: !finalized.hasErrors,
   };
 }
 
 export interface AnalyzeFileOptions {
   readonly readFile?: (absolutePath: string) => string;
+  readonly diagnosticsConfig?: DiagnosticsConfig;
+  readonly warningsAsErrors?: boolean;
 }
 
 export interface AnalyzeResult {
@@ -274,9 +339,10 @@ export function analyzeFile(
   const modules = attachPrelude(resolved.modules, diagnostics, readFile);
 
   if (modules.length === 0) {
+    const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, absoluteEntry,));
     return {
       modules,
-      diagnostics: diagnostics.diagnostics,
+      diagnostics: finalized.diagnostics,
       semantic: emptySemanticModel(modules),
       success: false,
     };
@@ -284,12 +350,13 @@ export function analyzeFile(
 
   validateModulesLoose(modules, diagnostics);
   const checked = typecheckModules(modules, diagnostics);
+  const finalized = finalizeDiagnostics(diagnostics.diagnostics, finalizeOpts(options, absoluteEntry,));
 
   return {
     modules,
-    diagnostics: diagnostics.diagnostics,
+    diagnostics: finalized.diagnostics,
     semantic: checked.semantic,
-    success: !diagnostics.hasErrors,
+    success: !finalized.hasErrors,
   };
 }
 

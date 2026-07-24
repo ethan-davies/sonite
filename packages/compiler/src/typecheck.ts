@@ -286,6 +286,11 @@ interface Binding {
   readonly defFile?: string;
   /** How this binding was introduced (for completion icons). */
   readonly bindingKind?: "parameter" | "let" | "const";
+  /**
+   * When `false`, the binding is tracked for unused warnings and not yet read.
+   * When `true` or omitted, do not emit unused warnings.
+   */
+  used?: boolean;
 }
 
 interface FunctionSig {
@@ -1849,6 +1854,14 @@ function collectModuleSymbols(
     }
     const fn = decl;
 
+    // Incomplete recovered functions are not entered into the symbol table.
+    if (!fn.isExtern && (fn.body === null || fn.bodyOpened === false)) {
+      continue;
+    }
+    if (fn.returnType.kind === "MissingType") {
+      continue;
+    }
+
     if (fn.name.name === "print" || fn.name.name === "createMap") {
       diagnostics.error(
         `Cannot redefine builtin function '${fn.name.name}'`,
@@ -3411,6 +3424,40 @@ function noteImportUse(name: string): void {
   }
 }
 
+function noteBindingUse(binding: Binding | undefined): void {
+  if (binding) {
+    binding.used = true;
+  }
+}
+
+function isIntentionallyUnusedName(name: string): boolean {
+  return name.startsWith("_");
+}
+
+function warnUnusedBinding(
+  name: string,
+  binding: Binding,
+  diagnostics: DiagnosticCollector,
+): void {
+  if (binding.used !== false || isIntentionallyUnusedName(name)) {
+    return;
+  }
+  const span = binding.defSpan;
+  if (binding.bindingKind === "parameter") {
+    diagnostics.warning(
+      `'${name}' is declared but never used`,
+      span,
+      "E0415",
+    );
+  } else {
+    diagnostics.warning(
+      `'${name}' is declared but never used`,
+      span,
+      "E0414",
+    );
+  }
+}
+
 function returnTypeDisplay(returnType: ReturnType): string {
   if (returnType === "void") {
     return "void";
@@ -3728,6 +3775,8 @@ export function annotationToValueType(
       }
       return { kind: "function", isAsync: ann.isAsync, params, returnType };
     }
+    case "MissingType":
+      return null;
     default:
       return null;
   }
@@ -3976,6 +4025,9 @@ function resolveAnnotation(
     }
     case "NamedType":
       return resolveNamedType(ann, structs, enums, diagnostics);
+    case "MissingType":
+      // Incomplete annotation (recovery AST). Soft-fail without crashing.
+      return null;
   }
 }
 
@@ -5010,7 +5062,14 @@ function checkGenericStructTemplate(
         diagnostics,
       );
       if (pt) {
-        scope.set(p.name.name, { type: pt, mutable: false });
+        scope.set(p.name.name, {
+          type: pt,
+          mutable: false,
+          defSpan: p.name.span,
+          defFile: activeModulePath,
+          bindingKind: "parameter",
+          used: false,
+        });
       }
     }
     const returnType = resolveReturnType(
@@ -5035,9 +5094,9 @@ function checkGenericStructTemplate(
       };
       // Use a synthetic struct this-type via type param — for template check, bind this as opaque.
       // Better: treat this as having the template's fields. Skip full this checking for MVP of methods.
-      for (const stmt of method.body) {
-        checkStatement(
-          stmt,
+      if (returnType !== undefined) {
+        checkStatements(
+          method.body,
           scope,
           functions,
           structs,
@@ -5047,6 +5106,11 @@ function checkGenericStructTemplate(
           0,
           0,
         );
+        for (const [name, binding] of scope) {
+          if (binding.bindingKind === "parameter") {
+            warnUnusedBinding(name, binding, diagnostics);
+          }
+        }
       }
     }
     activeTypeParams = bound;
@@ -5597,7 +5661,13 @@ function checkFunction(
   enums: Map<string, EnumDef>,
   diagnostics: DiagnosticCollector,
 ): void {
-  if (fn.isExtern || !fn.body) {
+  // Skip incomplete recovered functions (no body / missing return type).
+  if (
+    fn.isExtern ||
+    !fn.body ||
+    fn.bodyOpened === false ||
+    fn.returnType.kind === "MissingType"
+  ) {
     return;
   }
 
@@ -5677,6 +5747,7 @@ function checkFunction(
       defSpan: param.name.span,
       defFile: activeModulePath,
       bindingKind: "parameter",
+      used: false,
     });
     if (activeSemantic && activeModulePath) {
       activeSemantic.recordDeclaration(activeModulePath, param.name.span);
@@ -5714,18 +5785,26 @@ function checkFunction(
     );
   }
 
-  for (const stmt of fn.body) {
-    checkStatement(
-      stmt,
-      scope,
-      functions,
-      structs,
-      enums,
-      returnType,
-      diagnostics,
-      0,
-      0,
-    );
+  checkStatements(
+    fn.body,
+    scope,
+    functions,
+    structs,
+    enums,
+    returnType,
+    diagnostics,
+    0,
+    0,
+  );
+
+  for (const param of fn.params) {
+    if (param.isReceiver) {
+      continue;
+    }
+    const binding = scope.get(param.name.name);
+    if (binding) {
+      warnUnusedBinding(param.name.name, binding, diagnostics);
+    }
   }
 
   if (activeSemantic && activeModulePath) {
@@ -5803,7 +5882,14 @@ function checkStructMethods(
         );
         continue;
       }
-      scope.set(param.name.name, { type: paramType, mutable: false });
+      scope.set(param.name.name, {
+        type: paramType,
+        mutable: false,
+        defSpan: param.name.span,
+        defFile: activeModulePath,
+        bindingKind: "parameter",
+        used: false,
+      });
     }
     checkParameterDefaultValues(
       method.decl.params,
@@ -5814,18 +5900,21 @@ function checkStructMethods(
       enums,
       diagnostics,
     );
-    for (const stmt of method.decl.body) {
-      checkStatement(
-        stmt,
-        scope,
-        functions,
-        structs,
-        enums,
-        method.returnType,
-        diagnostics,
-        0,
-        0,
-      );
+    checkStatements(
+      method.decl.body,
+      scope,
+      functions,
+      structs,
+      enums,
+      method.returnType,
+      diagnostics,
+      0,
+      0,
+    );
+    for (const [name, binding] of scope) {
+      if (binding.bindingKind === "parameter") {
+        warnUnusedBinding(name, binding, diagnostics);
+      }
     }
     if (method.returnType !== "void") {
       const last = method.decl.body[method.decl.body.length - 1];
@@ -5903,7 +5992,14 @@ function checkClassMembers(
         );
         continue;
       }
-      scope.set(param.name.name, { type: paramType, mutable: false });
+      scope.set(param.name.name, {
+        type: paramType,
+        mutable: false,
+        defSpan: param.name.span,
+        defFile: activeModulePath,
+        bindingKind: "parameter",
+        used: false,
+      });
     }
     checkParameterDefaultValues(
       def.constructorDecl.params,
@@ -5999,7 +6095,14 @@ function checkClassMembers(
         );
         continue;
       }
-      scope.set(param.name.name, { type: paramType, mutable: false });
+      scope.set(param.name.name, {
+        type: paramType,
+        mutable: false,
+        defSpan: param.name.span,
+        defFile: activeModulePath,
+        bindingKind: "parameter",
+        used: false,
+      });
     }
     checkParameterDefaultValues(
       method.decl.params,
@@ -6080,7 +6183,14 @@ function checkClassMembers(
       if (paramType === null) {
         continue;
       }
-      scope.set(param.name.name, { type: paramType, mutable: false });
+      scope.set(param.name.name, {
+        type: paramType,
+        mutable: false,
+        defSpan: param.name.span,
+        defFile: activeModulePath,
+        bindingKind: "parameter",
+        used: false,
+      });
     }
     const returnType = resolveReturnType(
       member.returnType,
@@ -6091,18 +6201,21 @@ function checkClassMembers(
     if (returnType !== undefined && member.body) {
       const prevAsync = inAsyncFunction;
       inAsyncFunction = member.isAsync;
-      for (const stmt of member.body) {
-        checkStatement(
-          stmt,
-          scope,
-          functions,
-          structs,
-          enums,
-          returnType,
-          diagnostics,
-          0,
-          0,
-        );
+      checkStatements(
+        member.body,
+        scope,
+        functions,
+        structs,
+        enums,
+        returnType,
+        diagnostics,
+        0,
+        0,
+      );
+      for (const [name, binding] of scope) {
+        if (binding.bindingKind === "parameter") {
+          warnUnusedBinding(name, binding, diagnostics);
+        }
       }
       inAsyncFunction = prevAsync;
     }
@@ -6403,6 +6516,10 @@ function checkDestructuringDeclaration(
     scope.set(el.name.name, {
       type: tupleType.elements[i]!,
       mutable,
+      defSpan: el.name.span,
+      defFile: activeModulePath,
+      bindingKind: mutable ? "let" : "const",
+      used: false,
     });
   }
   return false;
@@ -6420,9 +6537,15 @@ function checkStatements(
   loopDepth: number,
   switchDepth: number,
 ): boolean {
+  const priorKeys = new Set(scope.keys());
   let exits = false;
+  let unreachableReported = false;
   for (const s of stmts) {
     if (exits) {
+      if (!unreachableReported) {
+        diagnostics.warning("Unreachable code", s.span, "E0416");
+        unreachableReported = true;
+      }
       // Still typecheck unreachable code for errors, but don't apply further CFA
       checkStatement(
         s,
@@ -6448,6 +6571,12 @@ function checkStatements(
       loopDepth,
       switchDepth,
     );
+  }
+  for (const [name, binding] of scope) {
+    if (priorKeys.has(name)) {
+      continue;
+    }
+    warnUnusedBinding(name, binding, diagnostics);
   }
   return exits;
 }
@@ -6550,6 +6679,7 @@ function checkStatement(
           defSpan: name.span,
           defFile: activeModulePath,
           bindingKind: stmt.mutability === "const" ? "const" : "let",
+          used: false,
         });
         if (activeSemantic && activeModulePath) {
           activeSemantic.recordType(
@@ -6606,6 +6736,7 @@ function checkStatement(
         defSpan: name.span,
         defFile: activeModulePath,
         bindingKind: stmt.mutability === "const" ? "const" : "let",
+        used: false,
       };
       if (stmt.mutability === "const" && stmt.initializer) {
         const constantExpr = constantInitializerExpr(stmt.initializer);
@@ -6941,6 +7072,10 @@ function checkStatement(
       scope.set(stmt.name.name, {
         type: iterableType.element,
         mutable,
+        defSpan: stmt.name.span,
+        defFile: activeModulePath,
+        bindingKind: mutable ? "let" : "const",
+        used: false,
       });
 
       checkStatements(
@@ -7128,6 +7263,10 @@ function checkStatement(
         catchScope.set(stmt.catchClause.parameter.name, {
           type: { kind: "class", name: BUILTIN_ERROR_MANGLED },
           mutable: false,
+          defSpan: stmt.catchClause.parameter.span,
+          defFile: activeModulePath,
+          bindingKind: "parameter",
+          used: false,
         });
         checkStatements(
           stmt.catchClause.body,
@@ -7140,6 +7279,7 @@ function checkStatement(
           loopDepth,
           switchDepth,
         );
+        // Catch params are reported by checkStatements as new keys.
       }
       if (stmt.finallyBlock) {
         checkStatements(
@@ -9069,6 +9209,7 @@ function checkExpressionInner(
       const binding = scope.get(expr.name);
       if (binding) {
         noteImportUse(expr.name);
+        noteBindingUse(binding);
         if (
           activeSemantic &&
           activeModulePath &&
@@ -9824,6 +9965,9 @@ function checkExpressionInner(
         allowVoidCall,
       );
     }
+    case "MissingExpression":
+      diagnostics.error("Expected expression", expr.span, "E0103");
+      return null;
   }
 }
 
@@ -9982,7 +10126,14 @@ function checkLambdaExpression(
     if (childScope.has(param.name.name)) {
       // Shadow outer binding inside the lambda.
     }
-    childScope.set(param.name.name, { type: paramType, mutable: false });
+    childScope.set(param.name.name, {
+      type: paramType,
+      mutable: false,
+      defSpan: param.name.span,
+      defFile: activeModulePath,
+      bindingKind: "parameter",
+      used: false,
+    });
   }
 
   let declaredReturn: ReturnType | null = null;
@@ -10107,6 +10258,13 @@ function checkLambdaExpression(
 
   lambdaDepth -= 1;
   inAsyncFunction = prevAsync;
+
+  for (const param of expr.params) {
+    const binding = childScope.get(param.name.name);
+    if (binding) {
+      warnUnusedBinding(param.name.name, binding, diagnostics);
+    }
+  }
 
   if (bodyReturn === null) {
     return null;

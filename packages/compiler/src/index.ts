@@ -15,6 +15,7 @@ export type {
 export {
   formatSource,
   formatFile,
+  formatRange,
   printProgram,
   loadFormatOptions,
   parseFormatSection,
@@ -25,6 +26,9 @@ export {
 export type {
   FormatResult,
   FormatSourceOptions,
+  FormatRange,
+  FormatRangeEdit,
+  FormatRangeResult,
   FormatOptions,
   SourceComment,
   CommentAttachments,
@@ -40,8 +44,19 @@ export { LlvmCodegen, encodeLlvmString } from "./codegen/index.js";
 export { DiagnosticCollector } from "./diagnostics/index.js";
 export type {
   Diagnostic,
+  DiagnosticLevel,
+  DiagnosticsConfig,
   SourceLocation,
   SourceSpan,
+} from "./diagnostics/index.js";
+export {
+  applyDiagnosticsConfig,
+  DEFAULT_DIAGNOSTICS_CONFIG,
+  DIAGNOSTIC_CODES,
+  loadDiagnosticsOptions,
+  parseDiagnosticsSection,
+  promoteWarningsAsErrors,
+  resolveDiagnosticsConfig,
 } from "./diagnostics/index.js";
 
 export {

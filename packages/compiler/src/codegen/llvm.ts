@@ -2252,6 +2252,8 @@ export class LlvmCodegen {
         }
         return null;
       }
+      case "MissingType":
+        return null;
     }
   }
 
@@ -6367,6 +6369,8 @@ export class LlvmCodegen {
         }
         return { kind: "function", isAsync: expr.isAsync, params, returnType };
       }
+      case "MissingExpression":
+        throw new Error("Codegen: MissingExpression (typecheck should have rejected)");
     }
   }
 
@@ -6707,6 +6711,10 @@ export class LlvmCodegen {
           return this.emitCreateMap(lines, expected);
         }
         return this.emitUserCall(expr, lines, false);
+      case "MissingExpression":
+        throw new Error(
+          "Codegen: MissingExpression (typecheck should have rejected)",
+        );
     }
   }
 

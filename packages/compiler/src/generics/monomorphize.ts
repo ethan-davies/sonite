@@ -182,6 +182,8 @@ function rewriteType(
         returnType: rewriteType(ann.returnType, typeRewrites),
         span: ann.span,
       };
+    case "MissingType":
+      return ann;
   }
 }
 

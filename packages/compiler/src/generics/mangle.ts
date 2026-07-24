@@ -48,6 +48,8 @@ export function mangleTypeAnnotation(ann: TypeAnnotation): string {
       return `idxacc__${mangleTypeAnnotation(ann.objectType)}__${mangleTypeAnnotation(ann.indexType)}`;
     case "FunctionType":
       return `fn__${ann.params.map(mangleTypeAnnotation).join("__")}__to__${mangleTypeAnnotation(ann.returnType)}`;
+    case "MissingType":
+      return "missing";
   }
 }
 

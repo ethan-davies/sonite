@@ -5,6 +5,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join, resolve, relative, sep } from "node:path";
 import {
   formatDiagnostics,
@@ -17,16 +18,40 @@ export interface FmtOptions {
   readonly paths: readonly string[];
   readonly check: boolean;
   readonly write: boolean;
+  readonly changed?: boolean;
 }
 
 export function runFmt(options: FmtOptions): number {
   if (options.paths.length === 1 && options.paths[0] === "-") {
+    if (options.changed) {
+      console.error("error: --changed cannot be used with stdin");
+      return 1;
+    }
     return formatStdin(options);
   }
 
   const formatOpts = loadFormatOptions(process.cwd());
-  const files = collectFiles(options.paths);
+  let files: string[];
+  if (options.changed) {
+    const changed = collectChangedSnFiles();
+    if (changed === null) {
+      return 1;
+    }
+    if (options.paths.length > 0) {
+      const explicit = new Set(collectFiles(options.paths));
+      files = changed.filter((f) => explicit.has(f));
+    } else {
+      files = changed;
+    }
+  } else {
+    files = collectFiles(options.paths);
+  }
+
   if (files.length === 0) {
+    if (options.changed) {
+      console.log("no changed .sn files to format");
+      return 0;
+    }
     console.error("error: no .sn files to format");
     return 1;
   }
@@ -42,7 +67,7 @@ export function runFmt(options: FmtOptions): number {
       if (formatted) {
         console.error(formatted);
       } else {
-        console.error(`error: failed to parse ${file}`);
+        console.error(`error: failed to format ${file}`);
       }
       failures++;
       continue;
@@ -225,4 +250,71 @@ function walk(dir: string, out: string[]): void {
       out.push(full);
     }
   }
+}
+
+/**
+ * Collect `.sn` files changed in the Git working tree (staged, unstaged, untracked).
+ * Respects `.gitignore` via `git status`. Returns null on Git errors.
+ */
+function collectChangedSnFiles(): string[] | null {
+  const rootProbe = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+    encoding: "utf8",
+  });
+  if (rootProbe.error) {
+    console.error(
+      `error: git is required for --changed (${rootProbe.error.message})`,
+    );
+    return null;
+  }
+  if (rootProbe.status !== 0) {
+    const err = (rootProbe.stderr || rootProbe.stdout || "").trim();
+    console.error(
+      `error: not a git repository${err ? `: ${err}` : " (git rev-parse failed)"}`,
+    );
+    return null;
+  }
+  const gitRoot = rootProbe.stdout.trim();
+
+  const status = spawnSync(
+    "git",
+    ["status", "--porcelain", "-z", "--untracked-files=all"],
+    { encoding: "utf8", cwd: gitRoot },
+  );
+  if (status.status !== 0) {
+    console.error(
+      `error: git status failed${status.stderr ? `: ${status.stderr.trim()}` : ""}`,
+    );
+    return null;
+  }
+
+  const projectSn = new Set(collectSnFiles(process.cwd()));
+  const out: string[] = [];
+  const entries = status.stdout.split("\0").filter((e) => e.length > 0);
+  for (const entry of entries) {
+    // porcelain -z: XY PATH or XY ORIG\0PATH for renames
+    if (entry.length < 4) {
+      continue;
+    }
+    let pathPart = entry.slice(3);
+    // Rename/copy records may include " -> "
+    const arrow = pathPart.lastIndexOf(" -> ");
+    if (arrow >= 0) {
+      pathPart = pathPart.slice(arrow + 4);
+    }
+    if (!pathPart.toLowerCase().endsWith(".sn")) {
+      continue;
+    }
+    const absolute = resolve(gitRoot, pathPart);
+    if (projectSn.has(absolute) || absolute.toLowerCase().endsWith(".sn")) {
+      // Prefer files under the current walk roots; still allow any .sn in repo.
+      if (
+        SKIP_DIRS.has(pathPart.split(/[/\\]/)[0] ?? "") ||
+        pathPart.split(/[/\\]/).some((p) => SKIP_DIRS.has(p))
+      ) {
+        continue;
+      }
+      out.push(absolute);
+    }
+  }
+  return [...new Set(out)].sort();
 }

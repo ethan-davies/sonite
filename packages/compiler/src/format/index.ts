@@ -1,6 +1,16 @@
-export { formatSource, formatFile } from "./format.js";
-export type { FormatResult, FormatSourceOptions } from "./format.js";
-export { printProgram } from "./printer.js";
+export { formatSource, formatFile, formatRange } from "./format.js";
+export type {
+  FormatResult,
+  FormatSourceOptions,
+  FormatRange,
+  FormatRangeEdit,
+  FormatRangeResult,
+} from "./format.js";
+export {
+  printProgram,
+  printStatementNode,
+  printTopLevelDecl,
+} from "./printer.js";
 export {
   DEFAULT_FORMAT_OPTIONS,
   resolveFormatOptions,

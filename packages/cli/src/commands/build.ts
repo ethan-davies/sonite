@@ -11,6 +11,7 @@ export interface BuildOptions {
   readonly irOnly?: boolean;
   readonly release?: boolean;
   readonly optLevel?: OptLevel;
+  readonly warningsAsErrors?: boolean;
 }
 
 export async function runBuild(options: BuildOptions = {}): Promise<number> {
@@ -25,7 +26,10 @@ export async function runBuild(options: BuildOptions = {}): Promise<number> {
     throw error;
   }
 
-  const compiled = compileSourceFile(project.entryPath);
+  const compiled = compileSourceFile(
+    project.entryPath,
+    options.warningsAsErrors ? { warningsAsErrors: true } : {},
+  );
   if (!compiled) {
     return 1;
   }

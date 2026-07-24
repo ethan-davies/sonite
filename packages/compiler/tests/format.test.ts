@@ -138,11 +138,23 @@ function main(): void {
     expect(out).toContain('"hello\\nworld"');
   });
 
-  it("reports parse errors without rewriting", () => {
-    const result = formatSource(`function main(: void {`);
-    expect(result.success).toBe(false);
-    expect(result.code).toBeNull();
+  it("formats incomplete source without inventing tokens", () => {
+    const result = formatSource(`function greet(`);
+    expect(result.success).toBe(true);
+    expect(result.code).not.toBeNull();
+    expect(result.code!).toContain("function greet(");
+    expect(result.code!).not.toMatch(/\):\s*void/);
+    expect(result.code!).not.toContain("{}");
     expect(result.diagnostics.length).toBeGreaterThan(0);
+  });
+
+  it("formats incomplete const without inventing an initializer", () => {
+    const result = formatSource(`function main(): void {
+    const user =
+}`);
+    expect(result.success).toBe(true);
+    expect(result.code).toContain("const user =");
+    expect(result.code!).not.toMatch(/const user =\s*0/);
   });
 
   it("honors format options", () => {

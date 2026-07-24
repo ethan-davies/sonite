@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { FunctionDeclaration, Program } from "../src/ast/nodes.js";
+import type {
+  FunctionDeclaration,
+  Program,
+  Statement,
+} from "../src/ast/nodes.js";
 import { DiagnosticCollector } from "../src/diagnostics/index.js";
 import { Lexer } from "../src/lexer/index.js";
 import { Parser } from "../src/parser/index.js";
@@ -11,13 +15,27 @@ function parse(source: string) {
   return { ast, diagnostics };
 }
 
-function functionAt(ast: Program, index: number): FunctionDeclaration {
+type FunctionWithBody = FunctionDeclaration & { readonly body: Statement[] };
+
+function functionAt(ast: Program, index: number): FunctionWithBody {
   const decl = ast.body[index];
   expect(decl?.kind).toBe("FunctionDeclaration");
   if (decl?.kind !== "FunctionDeclaration") {
     throw new Error(`expected FunctionDeclaration at index ${index}`);
   }
-  return decl;
+  expect(decl.body).not.toBeNull();
+  if (!decl.body) {
+    throw new Error(`expected function body at index ${index}`);
+  }
+  return decl as FunctionWithBody;
+}
+
+function requireBody(fn: FunctionDeclaration): Statement[] {
+  expect(fn.body).not.toBeNull();
+  if (!fn.body) {
+    throw new Error("expected function body");
+  }
+  return fn.body;
 }
 
 describe("Parser", () => {
@@ -180,7 +198,7 @@ describe("Parser", () => {
     if (ast.body[1]?.kind !== "FunctionDeclaration") {
       return;
     }
-    const body = ast.body[1].body;
+    const body = requireBody(ast.body[1]);
     expect(body[0]?.kind).toBe("VariableDeclaration");
     if (body[0]?.kind === "VariableDeclaration") {
       expect(body[0].initializer?.kind).toBe("StructLiteral");
@@ -226,7 +244,7 @@ describe("Parser", () => {
     if (ast.body[1]?.kind !== "FunctionDeclaration") {
       return;
     }
-    const decl = ast.body[1].body[0];
+    const decl = requireBody(ast.body[1])[0];
     expect(decl?.kind).toBe("VariableDeclaration");
     if (decl?.kind === "VariableDeclaration") {
       expect(decl.typeAnnotation).toMatchObject({
@@ -613,7 +631,7 @@ describe("Parser", () => {
     if (ast.body[5]?.kind !== "FunctionDeclaration") {
       return;
     }
-    const body = ast.body[5].body;
+    const body = requireBody(ast.body[5]);
     expect(body[2]?.kind).toBe("VariableDeclaration");
     if (body[2]?.kind === "VariableDeclaration") {
       expect(body[2].typeAnnotation).toMatchObject({
@@ -771,7 +789,8 @@ describe("Parser", () => {
     const main = ast.body[4];
     expect(main?.kind).toBe("FunctionDeclaration");
     if (main?.kind === "FunctionDeclaration") {
-      const letStmt = main.body[0];
+      const body = requireBody(main);
+      const letStmt = body[0];
       expect(letStmt?.kind).toBe("VariableDeclaration");
       if (letStmt?.kind === "VariableDeclaration") {
         expect(letStmt.typeAnnotation).toMatchObject({
@@ -785,7 +804,7 @@ describe("Parser", () => {
           typeArgs: [{ kind: "PrimitiveType", name: "i32" }],
         });
       }
-      const printStmt = main.body[1];
+      const printStmt = body[1];
       expect(printStmt?.kind).toBe("ExpressionStatement");
       if (printStmt?.kind === "ExpressionStatement") {
         expect(printStmt.expression).toMatchObject({
@@ -818,7 +837,7 @@ describe("Parser", () => {
     const main = ast.body[0];
     expect(main?.kind).toBe("FunctionDeclaration");
     if (main?.kind === "FunctionDeclaration") {
-      const ifStmt = main.body[2];
+      const ifStmt = requireBody(main)[2];
       expect(ifStmt?.kind).toBe("IfStatement");
       if (ifStmt?.kind === "IfStatement") {
         expect(ifStmt.condition).toMatchObject({
@@ -915,7 +934,7 @@ describe("Parser", () => {
     const main = ast.body[1];
     expect(main?.kind).toBe("FunctionDeclaration");
     if (main?.kind === "FunctionDeclaration") {
-      const decl = main.body[1];
+      const decl = requireBody(main)[1];
       expect(decl?.kind).toBe("VariableDeclaration");
       if (decl?.kind === "VariableDeclaration") {
         expect(decl.initializer).toMatchObject({ kind: "TypeofExpression" });

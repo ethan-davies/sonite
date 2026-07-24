@@ -6,6 +6,7 @@ import { runBuild } from "./build.js";
 
 export interface RunOptions {
   readonly release?: boolean;
+  readonly warningsAsErrors?: boolean;
 }
 
 export async function runRun(
@@ -14,9 +15,12 @@ export async function runRun(
   options: RunOptions = {},
 ): Promise<number> {
   if (input) {
-    const runOpts: { release?: boolean } = {};
+    const runOpts: { release?: boolean; warningsAsErrors?: boolean } = {};
     if (options.release !== undefined) {
       runOpts.release = options.release;
+    }
+    if (options.warningsAsErrors) {
+      runOpts.warningsAsErrors = true;
     }
     return compileLinkAndRun(input, args, runOpts);
   }
@@ -32,9 +36,12 @@ export async function runRun(
     throw error;
   }
 
-  const buildOpts: { release?: boolean } = {};
+  const buildOpts: { release?: boolean; warningsAsErrors?: boolean } = {};
   if (options.release !== undefined) {
     buildOpts.release = options.release;
+  }
+  if (options.warningsAsErrors) {
+    buildOpts.warningsAsErrors = true;
   }
   const status = await runBuild(buildOpts);
   if (status !== 0) {

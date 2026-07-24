@@ -21,11 +21,21 @@ export interface CompileToIrResult {
   readonly fileName: string;
 }
 
-export function compileSourceFile(inputPath: string): CompileToIrResult | null {
+export interface CompileSourceOptions {
+  readonly warningsAsErrors?: boolean;
+}
+
+export function compileSourceFile(
+  inputPath: string,
+  options: CompileSourceOptions = {},
+): CompileToIrResult | null {
   const absoluteInput = resolve(inputPath);
   applyProjectPackageRoots(dirname(absoluteInput));
   const fileName = basename(absoluteInput);
-  const result = compileFile(absoluteInput);
+  const result = compileFile(
+    absoluteInput,
+    options.warningsAsErrors ? { warningsAsErrors: true } : {},
+  );
 
   if (!result.success || result.ir === null) {
     const formatted = formatDiagnostics(result.diagnostics, fileName);
@@ -35,6 +45,15 @@ export function compileSourceFile(inputPath: string): CompileToIrResult | null {
       console.error("error: compilation failed");
     }
     return null;
+  }
+
+  // Print remaining warnings even on success.
+  const warnings = result.diagnostics.filter((d) => d.severity === "warning");
+  if (warnings.length > 0) {
+    const formatted = formatDiagnostics(warnings, fileName);
+    if (formatted) {
+      console.error(formatted);
+    }
   }
 
   return { ir: result.ir, fileName };
@@ -138,9 +157,16 @@ export async function linkNative(options: LinkOptions): Promise<number> {
 export async function compileLinkAndRun(
   inputPath: string,
   args: readonly string[] = [],
-  options: { cwd?: string; release?: boolean } = {},
+  options: {
+    cwd?: string;
+    release?: boolean;
+    warningsAsErrors?: boolean;
+  } = {},
 ): Promise<number> {
-  const compiled = compileSourceFile(inputPath);
+  const compiled = compileSourceFile(
+    inputPath,
+    options.warningsAsErrors ? { warningsAsErrors: true } : {},
+  );
   if (!compiled) {
     return 1;
   }

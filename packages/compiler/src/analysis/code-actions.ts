@@ -1,7 +1,10 @@
 import type {
+  Expression,
   ImportDeclaration,
   ImportSpecifier,
   Program,
+  Statement,
+  TopLevelDeclaration,
 } from "../ast/nodes.js";
 import type { Diagnostic } from "../diagnostics/diagnostic.js";
 import type { ExportIndexEntry } from "./query.js";
@@ -112,6 +115,30 @@ export function codeActionsAt(
     });
   }
 
+  // Remove unused variable (E0414) when the initializer is side-effect free.
+  for (const d of diagnostics) {
+    if (d.file && d.file !== file) {
+      continue;
+    }
+    if (d.code !== "E0414" || !d.span) {
+      continue;
+    }
+    const name = extractQuotedName(d.message);
+    if (!name || !mod?.ast) {
+      continue;
+    }
+    const edit = removeUnusedVariableEdit(source, mod.ast, name, d.span.start.offset);
+    if (!edit) {
+      continue;
+    }
+    actions.push({
+      title: `Remove unused variable '${name}'`,
+      kind: "quickfix",
+      isPreferred: true,
+      edits: [{ file, edits: [edit] }],
+    });
+  }
+
   // Organize imports (always available when there are imports).
   if (mod?.ast) {
     const organize = organizeImportsEdits(source, mod.ast, diagnostics, file);
@@ -125,6 +152,190 @@ export function codeActionsAt(
   }
 
   return actions;
+}
+
+/**
+ * Remove a simple unused `let`/`const` declaration when its initializer has no calls.
+ */
+export function removeUnusedVariableEdit(
+  source: string,
+  ast: Program,
+  name: string,
+  nameOffset: number,
+): ImportTextEdit | null {
+  const stmt = findVariableDeclaration(ast, name, nameOffset);
+  if (!stmt) {
+    return null;
+  }
+  if (stmt.binding.kind !== "Identifier" || stmt.binding.name !== name) {
+    return null;
+  }
+  if (stmt.initializer && !isSideEffectFree(stmt.initializer)) {
+    return null;
+  }
+  let end = stmt.span.end.offset;
+  if (source[end] === "\r") {
+    end += 1;
+  }
+  if (source[end] === "\n") {
+    end += 1;
+  }
+  return {
+    startOffset: stmt.span.start.offset,
+    endOffset: end,
+    newText: "",
+  };
+}
+
+function findVariableDeclaration(
+  ast: Program,
+  name: string,
+  nameOffset: number,
+): Extract<Statement, { kind: "VariableDeclaration" }> | null {
+  const visitStmts = (
+    stmts: readonly Statement[],
+  ): Extract<Statement, { kind: "VariableDeclaration" }> | null => {
+    for (const stmt of stmts) {
+      if (stmt.kind === "VariableDeclaration") {
+        if (
+          stmt.binding.kind === "Identifier" &&
+          stmt.binding.name === name &&
+          stmt.binding.span.start.offset === nameOffset
+        ) {
+          return stmt;
+        }
+      }
+      const nested = nestedStatements(stmt);
+      if (nested) {
+        const found = visitStmts(nested);
+        if (found) {
+          return found;
+        }
+      }
+    }
+    return null;
+  };
+
+  for (const decl of ast.body) {
+    const body = declarationBody(decl);
+    if (body) {
+      const found = visitStmts(body);
+      if (found) {
+        return found;
+      }
+    }
+  }
+  return null;
+}
+
+function declarationBody(
+  decl: TopLevelDeclaration,
+): readonly Statement[] | null {
+  if (decl.kind === "FunctionDeclaration") {
+    return decl.body;
+  }
+  if (decl.kind === "StructDeclaration") {
+    for (const m of decl.methods) {
+      // searched via nested walk below — flatten methods
+    }
+    const stmts: Statement[] = [];
+    for (const m of decl.methods) {
+      stmts.push(...m.body);
+    }
+    return stmts;
+  }
+  if (decl.kind === "ClassDeclaration") {
+    const stmts: Statement[] = [];
+    for (const m of decl.members) {
+      if (m.kind === "ClassMethod" && m.body) {
+        stmts.push(...m.body);
+      } else if (m.kind === "ConstructorDeclaration") {
+        stmts.push(...m.body);
+      }
+    }
+    return stmts;
+  }
+  return null;
+}
+
+function nestedStatements(stmt: Statement): readonly Statement[] | null {
+  switch (stmt.kind) {
+    case "IfStatement": {
+      const parts = [...stmt.consequent];
+      if (Array.isArray(stmt.alternate)) {
+        parts.push(...stmt.alternate);
+      } else if (stmt.alternate) {
+        parts.push(stmt.alternate);
+      }
+      return parts;
+    }
+    case "WhileStatement":
+    case "ForStatement":
+    case "ForInStatement":
+      return stmt.body;
+    case "SwitchStatement": {
+      const parts: Statement[] = [];
+      for (const c of stmt.cases) {
+        parts.push(...c.body);
+      }
+      return parts;
+    }
+    case "TryStatement": {
+      const parts = [...stmt.tryBlock];
+      if (stmt.catchClause) {
+        parts.push(...stmt.catchClause.body);
+      }
+      if (stmt.finallyBlock) {
+        parts.push(...stmt.finallyBlock);
+      }
+      return parts;
+    }
+    default:
+      return null;
+  }
+}
+
+function isSideEffectFree(expr: Expression): boolean {
+  switch (expr.kind) {
+    case "Identifier":
+    case "StringLiteral":
+    case "IntegerLiteral":
+    case "FloatLiteral":
+    case "BooleanLiteral":
+    case "CharLiteral":
+    case "NullLiteral":
+    case "ThisExpression":
+    case "SuperExpression":
+    case "MissingExpression":
+      return true;
+    case "TemplateLiteral":
+      return expr.expressions.every(isSideEffectFree);
+    case "UnaryExpression":
+      return isSideEffectFree(expr.operand);
+    case "NonNullExpression":
+      return isSideEffectFree(expr.expression);
+    case "BinaryExpression":
+      return isSideEffectFree(expr.left) && isSideEffectFree(expr.right);
+    case "NullCoalescingExpression":
+      return isSideEffectFree(expr.left) && isSideEffectFree(expr.right);
+    case "TypeofExpression":
+      return isSideEffectFree(expr.operand);
+    case "IsExpression":
+      return isSideEffectFree(expr.value);
+    case "MemberExpression":
+      return isSideEffectFree(expr.object);
+    case "IndexExpression":
+      return isSideEffectFree(expr.object) && isSideEffectFree(expr.index);
+    case "ArrayLiteral":
+      return expr.elements.every(isSideEffectFree);
+    case "StructLiteral":
+      return expr.fields.every((f) => isSideEffectFree(f.value));
+    case "AwaitExpression":
+    case "CallExpression":
+    case "NewExpression":
+    case "LambdaExpression":
+      return false;
+  }
 }
 
 function extractQuotedName(message: string): string | null {

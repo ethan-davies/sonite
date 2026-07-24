@@ -7,6 +7,7 @@ import type {
   Expression,
   ImportClause,
   ImportDeclaration,
+  IncompleteCloser,
   LambdaBody,
   Parameter,
   Program,
@@ -33,6 +34,26 @@ export function printProgram(
 ): string {
   const printer = new Printer(resolveFormatOptions(options), comments);
   return printer.printProgram(program);
+}
+
+export function printTopLevelDecl(
+  decl: TopLevelDeclaration,
+  options: Partial<FormatOptions> = {},
+  indent = 0,
+  comments: CommentAttachments = emptyComments(),
+): string {
+  const printer = new Printer(resolveFormatOptions(options), comments);
+  return printer.printTopLevelPublic(decl, indent);
+}
+
+export function printStatementNode(
+  stmt: Statement,
+  options: Partial<FormatOptions> = {},
+  indent = 0,
+  comments: CommentAttachments = emptyComments(),
+): string {
+  const printer = new Printer(resolveFormatOptions(options), comments);
+  return printer.printStatementPublic(stmt, indent);
 }
 
 function emptyComments(): CommentAttachments {
@@ -91,6 +112,16 @@ class Printer {
     return text.length === 0 ? "\n" : text.endsWith("\n") ? text : `${text}\n`;
   }
 
+  /** Public entry for range formatting a top-level declaration. */
+  printTopLevelPublic(decl: TopLevelDeclaration, indent: number): string {
+    return this.printTopLevel(decl, indent);
+  }
+
+  /** Public entry for range formatting a statement. */
+  printStatementPublic(stmt: Statement, indent: number): string {
+    return this.printStatement(stmt, indent);
+  }
+
   private printTopLevel(decl: TopLevelDeclaration, indent: number): string {
     const pad = this.pad(indent);
     const leading = this.leadingLines(decl, pad);
@@ -121,7 +152,13 @@ class Printer {
         const ann = decl.typeAnnotation
           ? `: ${this.printType(decl.typeAnnotation)}`
           : "";
-        body = `${exp}${decl.mutability} ${decl.name.name}${ann} = ${this.printExpr(decl.initializer, indent)};`;
+        const init =
+          decl.initializer.kind === "MissingExpression"
+            ? ""
+            : ` = ${this.printExpr(decl.initializer, indent)}`;
+        const eq =
+          decl.initializer.kind === "MissingExpression" ? " =" : "";
+        body = `${exp}${decl.mutability} ${decl.name.name}${ann}${eq}${init};`;
         break;
       }
       case "StructDeclaration":
@@ -151,9 +188,12 @@ class Printer {
   }
 
   private printImport(decl: ImportDeclaration): string {
-    const src = this.stringLit(decl.source);
     const clause = decl.clause;
+    const incomplete = decl.incomplete;
+    const missingSource = decl.source.raw === "";
+
     if (clause.kind === "NamespaceImport") {
+      const src = this.stringLit(decl.source);
       if (clause.style === "star") {
         const name = clause.localName?.name ?? "_";
         return `import * as ${name} from ${src};`;
@@ -163,7 +203,23 @@ class Printer {
       }
       return `import ${src};`;
     }
-    return this.printNamedImport(clause, src, 0);
+
+    if (missingSource || (incomplete?.includes("}") ?? false)) {
+      const specs = clause.specifiers.map((s) =>
+        s.importedName.name === s.localName.name
+          ? s.importedName.name
+          : `${s.importedName.name} as ${s.localName.name}`,
+      );
+      const inner =
+        specs.length === 0 ? "" : specs.length === 1 ? ` ${specs[0]} ` : ` ${specs.join(", ")} `;
+      const close = incomplete?.includes("}") ? "" : "}";
+      if (missingSource) {
+        return `import {${inner}${close}`.trimEnd();
+      }
+      return `import {${inner}${close} from ${this.stringLit(decl.source)};`;
+    }
+
+    return this.printNamedImport(clause, this.stringLit(decl.source), 0);
   }
 
   private printNamedImport(
@@ -196,26 +252,42 @@ class Printer {
       params: Parameter[];
       returnType: TypeAnnotation;
       body: Statement[] | null;
+      bodyOpened?: boolean;
+      incomplete?: readonly IncompleteCloser[];
     },
     indent: number,
   ): string {
     const exp = decl.exported ? "export " : "";
     const ext = decl.isExtern ? "extern " : "";
     const asyncKw = decl.isAsync ? "async " : "";
-    const tps = this.printTypeParams(decl.typeParams);
-    const params = this.printParamList(decl.params, indent);
-    const ret = this.printType(decl.returnType);
-    const header = `${exp}${ext}${asyncKw}function ${decl.name.name}${tps}${params}: ${ret}`;
-    if (decl.isExtern || decl.body === null) {
+    const tps = this.printTypeParams(decl.typeParams, decl.incomplete);
+    const params = this.printParamList(decl.params, indent, decl.incomplete);
+    const missingRet = decl.returnType.kind === "MissingType";
+    const ret = missingRet ? null : this.printType(decl.returnType);
+    const header =
+      ret === null
+        ? `${exp}${ext}${asyncKw}function ${decl.name.name}${tps}${params}`
+        : `${exp}${ext}${asyncKw}function ${decl.name.name}${tps}${params}: ${ret}`;
+    if (decl.isExtern) {
       return `${header};`;
     }
-    return `${header} ${this.printBlock(decl.body, indent)}`;
+    if (decl.body === null || decl.bodyOpened === false) {
+      // Incomplete function without a body — do not invent `{}` or `;`.
+      return header;
+    }
+    return `${header} ${this.printBlock(decl.body, indent, decl.incomplete)}`;
   }
 
-  private printParamList(params: Parameter[], indent: number): string {
+  private printParamList(
+    params: Parameter[],
+    indent: number,
+    incomplete?: readonly IncompleteCloser[],
+  ): string {
+    const omitClose = incomplete?.includes(")") ?? false;
     const items = params.map((p) => this.printParam(p));
-    const flat = `(${items.join(", ")})`;
-    if (this.fits(flat, indent) || items.length === 0) {
+    const close = omitClose ? "" : ")";
+    const flat = `(${items.join(", ")}${close}`;
+    if (omitClose || this.fits(flat, indent) || items.length === 0) {
       return flat;
     }
     const pad = this.pad(indent);
@@ -231,9 +303,15 @@ class Printer {
     return out;
   }
 
-  private printTypeParams(params: TypeParameter[]): string {
-    if (params.length === 0) {
+  private printTypeParams(
+    params: TypeParameter[],
+    incomplete?: readonly IncompleteCloser[],
+  ): string {
+    if (params.length === 0 && !(incomplete?.includes(">") ?? false)) {
       return "";
+    }
+    if (params.length === 0 && incomplete?.includes(">")) {
+      return "<";
     }
     const inner = params
       .map((p) =>
@@ -242,7 +320,8 @@ class Printer {
           : p.name.name,
       )
       .join(", ");
-    return `<${inner}>`;
+    const close = incomplete?.includes(">") ? "" : ">";
+    return `<${inner}${close}`;
   }
 
   private printStruct(
@@ -447,14 +526,22 @@ class Printer {
     return lines.join("\n");
   }
 
-  private printBlock(statements: Statement[], indent: number): string {
+  private printBlock(
+    statements: Statement[],
+    indent: number,
+    incomplete?: readonly IncompleteCloser[],
+  ): string {
+    const omitClose = incomplete?.includes("}") ?? false;
     if (statements.length === 0) {
-      return "{}";
+      return omitClose ? "{" : "{}";
     }
     const pad = this.pad(indent);
     const lines: string[] = [];
     for (const s of statements) {
       lines.push(this.printStatement(s, indent + 1));
+    }
+    if (omitClose) {
+      return `{\n${lines.join("\n")}`;
     }
     return `{\n${lines.join("\n")}\n${pad}}`;
   }
@@ -470,7 +557,11 @@ class Printer {
           out += `: ${this.printType(stmt.typeAnnotation)}`;
         }
         if (stmt.initializer) {
-          out += ` = ${this.printExpr(stmt.initializer, indent)}`;
+          if (stmt.initializer.kind === "MissingExpression") {
+            out += " =";
+          } else {
+            out += ` = ${this.printExpr(stmt.initializer, indent)}`;
+          }
         }
         body = `${pad}${out};`;
         break;
@@ -702,6 +793,8 @@ class Printer {
         return expr.value ? "true" : "false";
       case "NullLiteral":
         return "null";
+      case "MissingExpression":
+        return "";
       case "CharLiteral":
         return expr.raw;
       case "ThisExpression":
@@ -739,7 +832,7 @@ class Printer {
         return `${this.printExpr(expr.object, indent)}${op}${expr.property.name}`;
       }
       case "ArrayLiteral":
-        return this.printArray(expr.elements, indent);
+        return this.printArray(expr.elements, indent, expr.incomplete);
       case "StructLiteral":
         return this.printStructLiteral(expr, indent);
       case "NewExpression": {
@@ -748,7 +841,7 @@ class Printer {
           expr.typeArgs.length > 0
             ? `<${expr.typeArgs.map((t) => this.printType(t)).join(", ")}>`
             : "";
-        const args = this.printArgList(expr.args, indent);
+        const args = this.printArgList(expr.args, indent, expr.incomplete);
         return `new ${ns}${expr.className.name}${targs}${args}`;
       }
       case "CallExpression":
@@ -758,10 +851,16 @@ class Printer {
     }
   }
 
-  private printArray(elements: Expression[], indent: number): string {
+  private printArray(
+    elements: Expression[],
+    indent: number,
+    incomplete?: readonly IncompleteCloser[],
+  ): string {
+    const omitClose = incomplete?.includes("]") ?? false;
     const items = elements.map((e) => this.printExpr(e, indent + 1));
-    const flat = `[${items.join(", ")}]`;
-    if (this.fits(flat, indent) || items.length <= 1) {
+    const close = omitClose ? "" : "]";
+    const flat = `[${items.join(", ")}${close}`;
+    if (omitClose || this.fits(flat, indent) || items.length <= 1) {
       return flat;
     }
     const pad = this.pad(indent);
@@ -775,6 +874,7 @@ class Printer {
       name: { name: string };
       typeArgs: TypeAnnotation[];
       fields: readonly { name: { name: string }; value: Expression }[];
+      incomplete?: readonly IncompleteCloser[];
     },
     indent: number,
   ): string {
@@ -787,20 +887,36 @@ class Printer {
       (f) => `${f.name.name}: ${this.printExpr(f.value, indent + 1)}`,
     );
     const prefix = `${ns}${expr.name.name}${targs}`;
-    const flat = `${prefix} { ${fields.join(", ")} }`;
-    if (this.fits(flat, indent) || fields.length <= 1) {
-      return flat;
+    const omitClose = expr.incomplete?.includes("}") ?? false;
+    const close = omitClose ? "" : " }";
+    const flat = `${prefix} { ${fields.join(", ")}${close}`;
+    if (omitClose || this.fits(flat, indent) || fields.length <= 1) {
+      return omitClose && fields.length === 0
+        ? `${prefix} {`
+        : omitClose
+          ? `${prefix} { ${fields.join(", ")}`
+          : fields.length === 0
+            ? `${prefix} {}`
+            : `${prefix} { ${fields.join(", ")} }`;
     }
     const pad = this.pad(indent);
     const inner = this.pad(indent + 1);
-    // Trailing commas in multiline struct literals — parser accepts them in field lists.
+    if (omitClose) {
+      return `${prefix} {\n${fields.map((f) => `${inner}${f},`).join("\n")}`;
+    }
     return `${prefix} {\n${fields.map((f) => `${inner}${f},`).join("\n")}\n${pad}}`;
   }
 
-  private printArgList(args: CallArgument[], indent: number): string {
+  private printArgList(
+    args: CallArgument[],
+    indent: number,
+    incomplete?: readonly IncompleteCloser[],
+  ): string {
+    const omitClose = incomplete?.includes(")") ?? false;
     const items = args.map((a) => this.printArg(a, indent + 1));
-    const flat = `(${items.join(", ")})`;
-    if (this.fits(flat, indent) || items.length === 0) {
+    const close = omitClose ? "" : ")";
+    const flat = `(${items.join(", ")}${close}`;
+    if (omitClose || this.fits(flat, indent) || items.length === 0) {
       return flat;
     }
     const pad = this.pad(indent);
@@ -813,6 +929,7 @@ class Printer {
       callee: Expression;
       typeArgs: TypeAnnotation[];
       args: CallArgument[];
+      incomplete?: readonly IncompleteCloser[];
     },
     indent: number,
   ): string {
@@ -824,7 +941,7 @@ class Printer {
       expr.typeArgs.length > 0
         ? `<${expr.typeArgs.map((t) => this.printType(t)).join(", ")}>`
         : "";
-    return `${this.printExpr(expr.callee, indent)}${targs}${this.printArgList(expr.args, indent)}`;
+    return `${this.printExpr(expr.callee, indent)}${targs}${this.printArgList(expr.args, indent, expr.incomplete)}`;
   }
 
   private printMethodChain(
@@ -967,6 +1084,8 @@ class Printer {
         const asyncKw = type.isAsync ? "async " : "";
         return `${asyncKw}(${type.params.map((t) => this.printType(t)).join(", ")}) => ${this.printType(type.returnType)}`;
       }
+      case "MissingType":
+        return "";
     }
   }
 

@@ -76,6 +76,22 @@ describe("LSP protocol helpers", () => {
     expect(diags[0]?.code).toBe("E0001");
   });
 
+  it("maps warning severity for unused diagnostics", () => {
+    const root = writeTempProject({
+      "main.sn": `function main(): void {
+  const unused = 1;
+  print("x");
+}
+`,
+    });
+    const path = join(root, "main.sn");
+    const result = analyzeFile(path);
+    const diags = toLspDiagnostics(result.diagnostics, path);
+    const unused = diags.find((d) => d.code === "E0414");
+    expect(unused).toBeDefined();
+    expect(unused?.severity).toBe(2); // DiagnosticSeverity.Warning
+  });
+
   it("maps completion kinds", () => {
     const items = toCompletionItems([
       { name: "foo", detail: "i32", kind: "variable" },

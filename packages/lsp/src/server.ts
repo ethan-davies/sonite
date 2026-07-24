@@ -2,6 +2,7 @@
 import type { AnalyzeResult, ExportIndexEntry, SemanticModel } from "@sonite/compiler";
 import {
   definitionAt,
+  formatRange,
   formatSource,
   loadFormatOptions,
 } from "@sonite/compiler";
@@ -163,6 +164,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
         ],
       },
       documentFormattingProvider: true,
+      documentRangeFormattingProvider: true,
       semanticTokensProvider: {
         legend: {
           tokenTypes: [...SEMANTIC_TOKEN_TYPES],
@@ -770,6 +772,36 @@ connection.onDocumentFormatting((params, token): TextEdit[] =>
         end: doc.positionAt(source.length),
       },
       newText: result.code,
+    };
+    return [edit];
+  }, []),
+);
+
+connection.onDocumentRangeFormatting((params, token): TextEdit[] =>
+  withRequestGuard("rangeFormatting", token, () => {
+    const filePath = uriToPath(params.textDocument.uri);
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) {
+      return [];
+    }
+    const source = doc.getText();
+    const formatOpts = loadFormatOptions(filePath);
+    const startOffset = doc.offsetAt(params.range.start);
+    const endOffset = doc.offsetAt(params.range.end);
+    const result = formatRange(
+      source,
+      { startOffset, endOffset },
+      { ...formatOpts, fileName: filePath },
+    );
+    if (!result.success || !result.edit) {
+      return [];
+    }
+    const edit: TextEdit = {
+      range: {
+        start: doc.positionAt(result.edit.startOffset),
+        end: doc.positionAt(result.edit.endOffset),
+      },
+      newText: result.edit.newText,
     };
     return [edit];
   }, []),

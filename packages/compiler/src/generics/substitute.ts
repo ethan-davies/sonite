@@ -162,6 +162,8 @@ export function substituteAnnotation(ann: TypeAnnotation, subst: TypeSubst): Typ
       };
       return result;
     }
+    case "MissingType":
+      return ann;
   }
 }
 

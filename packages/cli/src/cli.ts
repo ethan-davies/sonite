@@ -36,18 +36,21 @@ program
   .option("--emit-ir", "also write LLVM IR next to the binary", false)
   .option("--ir-only", "emit LLVM IR only (skip native linking)", false)
   .option("--release", "build with optimizations (LLVM -O2)", false)
+  .option("--warnings-as-errors", "treat warnings as errors", false)
   .action(
     async (options: {
       output?: string;
       emitIr?: boolean;
       irOnly?: boolean;
       release?: boolean;
+      warningsAsErrors?: boolean;
     }) => {
       const buildOpts: {
         output?: string;
         emitIr?: boolean;
         irOnly?: boolean;
         release?: boolean;
+        warningsAsErrors?: boolean;
       } = {};
       if (options.output !== undefined) {
         buildOpts.output = options.output;
@@ -61,6 +64,9 @@ program
       if (options.release) {
         buildOpts.release = true;
       }
+      if (options.warningsAsErrors) {
+        buildOpts.warningsAsErrors = true;
+      }
       process.exitCode = await runBuild(buildOpts);
     },
   );
@@ -72,15 +78,25 @@ program
   )
   .argument("[input]", "path to a .sn source file (default: project entry)")
   .option("--release", "build with optimizations (LLVM -O2)", false)
-  .action(async (input: string | undefined, options: { release?: boolean }) => {
-    const dashIndex = process.argv.indexOf("--");
-    const programArgs = dashIndex >= 0 ? process.argv.slice(dashIndex + 1) : [];
-    const runOpts: { release?: boolean } = {};
-    if (options.release) {
-      runOpts.release = true;
-    }
-    process.exitCode = await runRun(input, programArgs, runOpts);
-  });
+  .option("--warnings-as-errors", "treat warnings as errors", false)
+  .action(
+    async (
+      input: string | undefined,
+      options: { release?: boolean; warningsAsErrors?: boolean },
+    ) => {
+      const dashIndex = process.argv.indexOf("--");
+      const programArgs =
+        dashIndex >= 0 ? process.argv.slice(dashIndex + 1) : [];
+      const runOpts: { release?: boolean; warningsAsErrors?: boolean } = {};
+      if (options.release) {
+        runOpts.release = true;
+      }
+      if (options.warningsAsErrors) {
+        runOpts.warningsAsErrors = true;
+      }
+      process.exitCode = await runRun(input, programArgs, runOpts);
+    },
+  );
 
 program
   .command("fmt")
@@ -88,13 +104,24 @@ program
   .argument("[paths...]", "files, directories, globs, or - for stdin")
   .option("-c, --check", "check formatting without writing", false)
   .option("-w, --write", "write formatted output (default)", false)
-  .action((paths: string[], options: { check: boolean; write: boolean }) => {
-    process.exitCode = runFmt({
-      paths,
-      check: options.check,
-      write: options.write,
-    });
-  });
+  .option(
+    "--changed",
+    "format only files changed in the Git working tree",
+    false,
+  )
+  .action(
+    (
+      paths: string[],
+      options: { check: boolean; write: boolean; changed: boolean },
+    ) => {
+      process.exitCode = runFmt({
+        paths,
+        check: options.check,
+        write: options.write,
+        changed: options.changed,
+      });
+    },
+  );
 
 program
   .command("compile")
@@ -104,10 +131,19 @@ program
     "-o, --output <file>",
     "write LLVM IR to this file (default: <input>.ll)",
   )
-  .action((input: string | undefined, options: { output?: string }) => {
-    process.exitCode = runCompile(input, options.output);
-  });
-
+  .option("--warnings-as-errors", "treat warnings as errors", false)
+  .action(
+    (
+      input: string | undefined,
+      options: { output?: string; warningsAsErrors?: boolean },
+    ) => {
+      process.exitCode = runCompile(
+        input,
+        options.output,
+        options.warningsAsErrors ? { warningsAsErrors: true } : {},
+      );
+    },
+  );
 program
   .command("login")
   .description("Log in to the Sonite registry via device code")

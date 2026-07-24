@@ -23,12 +23,20 @@ export interface ProjectFormat {
   readonly lineWidth: number;
 }
 
+export interface ProjectDiagnostics {
+  readonly unusedImports: "off" | "warn" | "error";
+  readonly unusedVariables: "off" | "warn" | "error";
+  readonly unusedParameters: "off" | "warn" | "error";
+  readonly unreachableCode: "off" | "warn" | "error";
+}
+
 export interface Project {
   readonly root: string;
   readonly manifestPath: string;
   readonly package: ProjectPackage;
   readonly build: ProjectBuild;
   readonly format: ProjectFormat;
+  readonly diagnostics: ProjectDiagnostics;
   /** Version requirements from `[dependencies]` (exact, `^`, or `~`). */
   readonly dependencies: Readonly<Record<string, string>>;
   /** Absolute path to the entry .sn file. */
@@ -113,6 +121,7 @@ export function loadProjectFromManifest(manifestPath: string): Project {
   const outdir = optionalString(buildTable, "outdir") ?? "dist";
   const dependencies = parseDependencies(table);
   const format = parseFormatTable(table);
+  const diagnostics = parseDiagnosticsTable(table);
 
   if (!name.trim()) {
     throw new ProjectError("package.name must not be empty");
@@ -145,6 +154,7 @@ export function loadProjectFromManifest(manifestPath: string): Project {
     package: pkg,
     build: { outdir },
     format,
+    diagnostics,
     dependencies,
     entryPath: resolve(root, entry),
     outdirPath: resolve(root, outdir),
@@ -200,6 +210,57 @@ function parseFormatTable(table: Record<string, unknown>): ProjectFormat {
   }
 
   return { indentWidth, useTabs, lineWidth };
+}
+
+function parseDiagnosticsTable(
+  table: Record<string, unknown>,
+): ProjectDiagnostics {
+  const defaults: ProjectDiagnostics = {
+    unusedImports: "warn",
+    unusedVariables: "warn",
+    unusedParameters: "warn",
+    unreachableCode: "warn",
+  };
+  if (table.diagnostics === undefined) {
+    return defaults;
+  }
+  const diagTable = requireTable(table, "diagnostics");
+  const result = { ...defaults };
+
+  const parseLevel = (
+    key: string,
+    value: unknown,
+  ): "off" | "warn" | "error" => {
+    if (value !== "off" && value !== "warn" && value !== "error") {
+      throw new ProjectError(
+        `project.toml: diagnostics.${key} must be "off", "warn", or "error"`,
+      );
+    }
+    return value;
+  };
+
+  if (diagTable.unused_imports !== undefined) {
+    result.unusedImports = parseLevel("unused_imports", diagTable.unused_imports);
+  }
+  if (diagTable.unused_variables !== undefined) {
+    result.unusedVariables = parseLevel(
+      "unused_variables",
+      diagTable.unused_variables,
+    );
+  }
+  if (diagTable.unused_parameters !== undefined) {
+    result.unusedParameters = parseLevel(
+      "unused_parameters",
+      diagTable.unused_parameters,
+    );
+  }
+  if (diagTable.unreachable_code !== undefined) {
+    result.unreachableCode = parseLevel(
+      "unreachable_code",
+      diagTable.unreachable_code,
+    );
+  }
+  return result;
 }
 
 function parseDependencies(

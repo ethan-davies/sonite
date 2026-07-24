@@ -52,9 +52,12 @@ import type {
   LiteralType,
   MappedType,
   MemberExpression,
+  MissingExpression,
+  MissingType,
   ModuleVariableDeclaration,
   NamedArgument,
   NamedType,
+  IncompleteCloser,
   NewExpression,
   NonNullExpression,
   NullCoalescingExpression,
@@ -134,6 +137,8 @@ export class Parser {
   private readonly tokens: Token[];
   private readonly diagnostics: DiagnosticCollector;
   private current = 0;
+  /** Set when the last `parseTypeParameterList` soft-recovered a missing `>`. */
+  private lastTypeParamsIncomplete = false;
 
   constructor(tokens: Token[], diagnostics: DiagnosticCollector) {
     this.tokens = tokens;
@@ -453,13 +458,13 @@ export class Parser {
     if (this.check(TokenKind.LBrace)) {
       this.advance();
       const specifiers: ImportSpecifier[] = [];
+      const incomplete: IncompleteCloser[] = [];
 
       while (!this.check(TokenKind.RBrace) && !this.check(TokenKind.Eof)) {
-        const nameToken = this.expect(TokenKind.Identifier, "Expected import specifier name");
-        if (!nameToken) {
-          this.synchronizeToTopLevel();
-          return null;
+        if (!this.check(TokenKind.Identifier)) {
+          break;
         }
+        const nameToken = this.advance();
         const importedName: Identifier = {
           kind: "Identifier",
           name: nameToken.lexeme,
@@ -471,8 +476,7 @@ export class Parser {
           this.advance();
           const aliasToken = this.expect(TokenKind.Identifier, "Expected identifier after 'as'");
           if (!aliasToken) {
-            this.synchronizeToTopLevel();
-            return null;
+            break;
           }
           localName = {
             kind: "Identifier",
@@ -496,30 +500,47 @@ export class Parser {
       }
 
       if (!this.expect(TokenKind.RBrace, "Expected '}' after import specifiers")) {
-        this.synchronizeToTopLevel();
-        return null;
+        incomplete.push("}");
       }
-      if (!this.expect(TokenKind.From, "Expected 'from' after import specifiers")) {
-        this.synchronizeToTopLevel();
-        return null;
+
+      let source: StringLiteral | null = null;
+      if (this.check(TokenKind.From)) {
+        this.advance();
+        source = this.parseImportSource();
+      } else if (incomplete.length === 0) {
+        this.diagnostics.error(
+          "Expected 'from' after import specifiers",
+          this.peek().span,
+          "E0103",
+        );
       }
-      const source = this.parseImportSource();
+
       if (!source) {
-        this.synchronizeToTopLevel();
-        return null;
+        // Incomplete import — keep partial AST for formatting; do not invent a path.
+        const end = this.peek().span.end;
+        return {
+          kind: "ImportDeclaration",
+          source: {
+            kind: "StringLiteral",
+            value: "",
+            raw: "",
+            span: this.peek().span,
+          },
+          clause: { kind: "NamedImports", specifiers },
+          span: { start, end },
+          ...(incomplete.length > 0 ? { incomplete } : { incomplete: ["}"] as IncompleteCloser[] }),
+        };
       }
 
       const semicolon = this.expect(TokenKind.Semicolon, "Expected ';' after import");
-      if (!semicolon) {
-        this.synchronizeToTopLevel();
-        return null;
-      }
+      const end = semicolon?.span.end ?? source.span.end;
 
       return {
         kind: "ImportDeclaration",
         source,
         clause: { kind: "NamedImports", specifiers },
-        span: { start, end: semicolon.span.end },
+        span: { start, end },
+        ...(incomplete.length > 0 ? { incomplete } : {}),
       };
     }
 
@@ -1592,37 +1613,54 @@ export class Parser {
       span: nameToken.span,
     };
 
-    const typeParams = this.parseTypeParameterList();
+    const incomplete: IncompleteCloser[] = [];
+
+    let typeParams = this.parseTypeParameterList();
     if (typeParams === null) {
-      this.synchronizeToTopLevel();
-      return null;
+      typeParams = [];
+      incomplete.push(">");
+    } else if (this.lastTypeParamsIncomplete) {
+      incomplete.push(">");
     }
 
     if (!this.expect(TokenKind.LParen, "Expected '(' after function name")) {
-      this.synchronizeToTopLevel();
-      return null;
+      // Soft-recover: emit a partial function for formatting.
+      const end = this.peek().span.end;
+      return {
+        kind: "FunctionDeclaration",
+        exported,
+        isExtern,
+        isAsync,
+        name,
+        typeParams,
+        params: [],
+        returnType: { kind: "MissingType", span: this.peek().span },
+        body: null,
+        bodyOpened: false,
+        span: { start, end },
+        ...(incomplete.length > 0 ? { incomplete } : {}),
+      };
     }
 
-    const params = this.parseParameterList();
-    if (params === null) {
-      this.synchronizeToTopLevel();
-      return null;
-    }
+    const params = this.parseParameterList() ?? [];
 
     if (!this.expect(TokenKind.RParen, "Expected ')' after parameter list")) {
-      this.synchronizeToTopLevel();
-      return null;
+      incomplete.push(")");
     }
 
-    if (!this.expect(TokenKind.Colon, "Expected ':' before return type")) {
-      this.synchronizeToTopLevel();
-      return null;
-    }
-
-    const returnType = this.parseType();
-    if (!returnType) {
-      this.synchronizeToTopLevel();
-      return null;
+    let returnType: TypeAnnotation;
+    if (this.check(TokenKind.Colon)) {
+      this.advance();
+      returnType =
+        this.parseType() ??
+        ({ kind: "MissingType", span: this.peek().span } satisfies MissingType);
+    } else {
+      returnType = { kind: "MissingType", span: this.peek().span };
+      this.diagnostics.error(
+        "Expected ':' before return type",
+        this.peek().span,
+        "E0103",
+      );
     }
 
     for (let i = 0; i < params.length; i += 1) {
@@ -1634,8 +1672,6 @@ export class Parser {
             param.span,
             "E0102",
           );
-          this.synchronizeToTopLevel();
-          return null;
         }
         if (param.defaultValue !== null) {
           this.diagnostics.error(
@@ -1643,17 +1679,12 @@ export class Parser {
             param.span,
             "E0102",
           );
-          this.synchronizeToTopLevel();
-          return null;
         }
       }
     }
 
     if (isExtern) {
-      if (!this.expect(TokenKind.Semicolon, "Expected ';' after extern function declaration")) {
-        this.synchronizeToTopLevel();
-        return null;
-      }
+      this.expect(TokenKind.Semicolon, "Expected ';' after extern function declaration");
       const end = this.previous().span.end;
       return {
         kind: "FunctionDeclaration",
@@ -1665,16 +1696,55 @@ export class Parser {
         params,
         returnType,
         body: null,
+        bodyOpened: false,
         span: { start, end },
+        ...(incomplete.length > 0 ? { incomplete } : {}),
       };
     }
 
-    const body = this.parseBlock();
-    if (!body) {
-      this.synchronizeToTopLevel();
-      return null;
+    if (this.check(TokenKind.LBrace)) {
+      const body = this.parseBlock();
+      if (!body) {
+        const end = this.peek().span.end;
+        return {
+          kind: "FunctionDeclaration",
+          exported,
+          isExtern: false,
+          isAsync,
+          name,
+          typeParams,
+          params,
+          returnType,
+          body: null,
+          bodyOpened: false,
+          span: { start, end },
+          ...(incomplete.length > 0 ? { incomplete } : {}),
+        };
+      }
+      if (body.incomplete) {
+        incomplete.push(...body.incomplete);
+      }
+      return {
+        kind: "FunctionDeclaration",
+        exported,
+        isExtern: false,
+        isAsync,
+        name,
+        typeParams,
+        params,
+        returnType,
+        body: body.statements,
+        bodyOpened: true,
+        span: { start, end: body.end },
+        ...(incomplete.length > 0 ? { incomplete } : {}),
+      };
     }
 
+    // Incomplete function with no body yet (e.g. `function greet(`).
+    const end =
+      returnType.span.end.offset >= name.span.end.offset
+        ? returnType.span.end
+        : this.peek().span.end;
     return {
       kind: "FunctionDeclaration",
       exported,
@@ -1684,29 +1754,42 @@ export class Parser {
       typeParams,
       params,
       returnType,
-      body: body.statements,
-      span: { start, end: body.end },
+      body: null,
+      bodyOpened: false,
+      span: { start, end },
+      ...(incomplete.length > 0 ? { incomplete } : {}),
     };
   }
 
   private parseParameterList(): Parameter[] | null {
     const params: Parameter[] = [];
 
-    if (this.check(TokenKind.RParen)) {
+    if (this.check(TokenKind.RParen) || this.isAtEnd()) {
+      return params;
+    }
+
+    // Soft-recover when the next token cannot start a parameter.
+    if (!this.check(TokenKind.Identifier) && !this.check(TokenKind.This)) {
       return params;
     }
 
     const first = this.parseParameter();
     if (!first) {
-      return null;
+      return params;
     }
     params.push(first);
 
     while (this.check(TokenKind.Comma)) {
       this.advance();
+      if (this.check(TokenKind.RParen) || this.isAtEnd()) {
+        break;
+      }
+      if (!this.check(TokenKind.Identifier) && !this.check(TokenKind.This)) {
+        break;
+      }
       const param = this.parseParameter();
       if (!param) {
-        return null;
+        break;
       }
       params.push(param);
     }
@@ -1721,7 +1804,6 @@ export class Parser {
           param.span,
           "E0102",
         );
-        return null;
       }
     }
 
@@ -1849,7 +1931,11 @@ export class Parser {
     return this.parseExpressionStatement();
   }
 
-  private parseBlock(): { statements: Statement[]; end: { line: number; column: number; offset: number } } | null {
+  private parseBlock(): {
+    statements: Statement[];
+    end: { line: number; column: number; offset: number };
+    incomplete?: IncompleteCloser[];
+  } | null {
     if (!this.expect(TokenKind.LBrace, "Expected '{'")) {
       return null;
     }
@@ -1866,7 +1952,11 @@ export class Parser {
 
     const rbrace = this.expect(TokenKind.RBrace, "Expected '}'");
     const end = rbrace?.span.end ?? this.peek().span.end;
-    return { statements, end };
+    return {
+      statements,
+      end,
+      ...(rbrace ? {} : { incomplete: ["}"] as IncompleteCloser[] }),
+    };
   }
 
   private parseIfStatement(): IfStatement | null {
@@ -2438,7 +2528,11 @@ export class Parser {
       this.advance();
       initializer = this.parseExpression();
       if (!initializer) {
-        return null;
+        // Incomplete RHS (e.g. `const x =`) — keep the declaration for formatting.
+        initializer = {
+          kind: "MissingExpression",
+          span: this.peek().span,
+        } satisfies MissingExpression;
       }
     } else if (binding.kind === "ArrayBindingPattern") {
       this.diagnostics.error(
@@ -2448,12 +2542,20 @@ export class Parser {
       );
       return null;
     } else if (mutability === "const") {
-      this.diagnostics.error(
-        "const declarations must have an initializer",
-        binding.span,
-        "E0102",
-      );
-      return null;
+      // Soft-recover when `const x` has no `=` yet.
+      if (this.isAtEnd() || this.check(TokenKind.Semicolon)) {
+        initializer = {
+          kind: "MissingExpression",
+          span: this.peek().span,
+        } satisfies MissingExpression;
+      } else {
+        this.diagnostics.error(
+          "const declarations must have an initializer",
+          binding.span,
+          "E0102",
+        );
+        return null;
+      }
     } else if (!typeAnnotation) {
       this.diagnostics.error(
         "Expected '=' after variable name",
@@ -3294,6 +3396,7 @@ export class Parser {
       typeArgs,
       args: args.args,
       span: { start, end },
+      ...(args.incomplete ? { incomplete: args.incomplete } : {}),
     };
   }
 
@@ -3482,6 +3585,7 @@ export class Parser {
       kind: "ArrayLiteral",
       elements,
       span: { start, end },
+      ...(rbracket ? {} : { incomplete: ["]"] as IncompleteCloser[] }),
     };
   }
 
@@ -3555,6 +3659,7 @@ export class Parser {
       typeArgs,
       fields,
       span: { start, end },
+      ...(rbrace ? {} : { incomplete: ["}"] as IncompleteCloser[] }),
     };
   }
 
@@ -3630,6 +3735,7 @@ export class Parser {
       args: parsed.args,
       optional,
       span: { start, end: parsed.end },
+      ...(parsed.incomplete ? { incomplete: parsed.incomplete } : {}),
     };
   }
 
@@ -3640,36 +3746,46 @@ export class Parser {
    */
   private parseArgumentList(
     rparenMessage: string,
-  ): { args: CallArgument[]; end: { line: number; column: number; offset: number } } | null {
+  ): {
+    args: CallArgument[];
+    end: { line: number; column: number; offset: number };
+    incomplete?: IncompleteCloser[];
+  } | null {
     const args: CallArgument[] = [];
     let sawNamed = false;
 
-    if (!this.check(TokenKind.RParen)) {
+    if (!this.check(TokenKind.RParen) && !this.isAtEnd()) {
       const first = this.parseCallArgument(sawNamed);
-      if (!first) {
-        return null;
-      }
-      if (first.kind === "NamedArgument") {
-        sawNamed = true;
-      }
-      args.push(first);
-
-      while (this.check(TokenKind.Comma)) {
-        this.advance();
-        const arg = this.parseCallArgument(sawNamed);
-        if (!arg) {
-          return null;
-        }
-        if (arg.kind === "NamedArgument") {
+      if (first) {
+        if (first.kind === "NamedArgument") {
           sawNamed = true;
         }
-        args.push(arg);
+        args.push(first);
+
+        while (this.check(TokenKind.Comma)) {
+          this.advance();
+          if (this.check(TokenKind.RParen) || this.isAtEnd()) {
+            break;
+          }
+          const arg = this.parseCallArgument(sawNamed);
+          if (!arg) {
+            break;
+          }
+          if (arg.kind === "NamedArgument") {
+            sawNamed = true;
+          }
+          args.push(arg);
+        }
       }
     }
 
     const rparen = this.expect(TokenKind.RParen, rparenMessage);
     const end = rparen?.span.end ?? this.peek().span.end;
-    return { args, end };
+    return {
+      args,
+      end,
+      ...(rparen ? {} : { incomplete: [")"] as IncompleteCloser[] }),
+    };
   }
 
   private parseCallArgument(sawNamed: boolean): CallArgument | null {
@@ -4183,31 +4299,53 @@ export class Parser {
   /**
    * Parse `<T, U extends C>` after a declaration name.
    * Returns [] when no `<` is present; null on hard parse failure.
+   * On missing `>`, soft-recovers and sets `lastTypeParamsIncomplete`.
    */
   private parseTypeParameterList(): TypeParameter[] | null {
+    this.lastTypeParamsIncomplete = false;
     if (!this.check(TokenKind.Less)) {
       return [];
     }
     this.advance(); // <
 
     const params: TypeParameter[] = [];
+    if (this.check(TokenKind.Greater) || this.isAtEnd() || this.check(TokenKind.LParen)) {
+      // `function test<` or `function test<>` — soft-recover.
+      if (!this.check(TokenKind.Greater)) {
+        this.diagnostics.error(
+          "Expected '>' after type parameters",
+          this.peek().span,
+          "E0103",
+        );
+        this.lastTypeParamsIncomplete = true;
+      } else {
+        this.advance();
+      }
+      return params;
+    }
+
     const first = this.parseTypeParameter();
     if (!first) {
-      return null;
+      this.lastTypeParamsIncomplete = true;
+      return params;
     }
     params.push(first);
 
     while (this.check(TokenKind.Comma)) {
       this.advance();
+      if (this.check(TokenKind.Greater) || this.isAtEnd() || this.check(TokenKind.LParen)) {
+        break;
+      }
       const param = this.parseTypeParameter();
       if (!param) {
-        return null;
+        break;
       }
       params.push(param);
     }
 
     if (!this.expect(TokenKind.Greater, "Expected '>' after type parameters")) {
-      return null;
+      this.lastTypeParamsIncomplete = true;
+      return params;
     }
     return params;
   }

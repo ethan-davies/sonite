@@ -152,7 +152,7 @@ export function buildExportTables(
           start: { line: 1, column: 1, offset: 0 },
           end: { line: 1, column: 1, offset: 0 },
         },
-        "E0412",
+        "E0413",
       );
       const empty = new Map<string, ExportEntry>();
       pathToTable.set(modulePath, empty);
